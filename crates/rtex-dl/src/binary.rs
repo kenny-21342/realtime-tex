@@ -27,6 +27,9 @@ struct Reader<'a> {
     pos: usize,
 }
 impl<'a> Reader<'a> {
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.pos)
+    }
     fn need(&self, n: usize) -> Result<(), BinError> {
         if self.pos + n > self.b.len() {
             Err(BinError::Truncated(self.pos))
@@ -332,10 +335,17 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                             data,
                         }
                     }
-                    0x23 => Item::Literal {
-                        mode: p.i32().map_err(malformed)? as i64,
-                        data: p.str().map_err(malformed)?,
-                    },
+                    0x23 => {
+                        let mode = p.i32().map_err(malformed)? as i64;
+                        let data = p.str().map_err(malformed)?;
+                        // the position is a later addition: absent in older lists
+                        let at = if p.remaining() >= 8 {
+                            Some((p.i32().map_err(malformed)? as Sp, p.i32().map_err(malformed)? as Sp))
+                        } else {
+                            None
+                        };
+                        Item::Literal { mode, data, at }
+                    }
                     0x24 => {
                         let kind = p.str().map_err(malformed)?;
                         let detail = p.str().map_err(malformed)?;
@@ -465,10 +475,14 @@ fn write_items(out: &mut Writer, items: &[Item]) {
                 p.str(data);
                 out.rec(0x22, &p.0);
             }
-            Item::Literal { mode, data } => {
+            Item::Literal { mode, data, at } => {
                 let mut p = Writer(Vec::new());
                 p.i32(*mode);
                 p.str(data);
+                if let Some((x, y)) = at {
+                    p.i32(*x);
+                    p.i32(*y);
+                }
                 out.rec(0x23, &p.0);
             }
             Item::Unsupported { kind, detail } => {
@@ -498,7 +512,6 @@ fn write_items(out: &mut Writer, items: &[Item]) {
                 p.i32(*y);
                 p.str(data);
                 out.rec(0x28, &p.0);
-                i += 1;
             }
             Item::Image {
                 index,
@@ -707,9 +720,20 @@ mod tests {
                         width: 800,
                         height: 800,
                     },
+                    // graphicx scaling: every record of the group survives the round trip
+                    Item::Matrix { op: "save".into(), x: 1500, y: 2000, data: String::new() },
+                    Item::Matrix { op: "set".into(), x: 1500, y: 2000, data: ".5 0 0 .5".into() },
+                    Item::Image { index: 3, x: 1500, y_top: 1000, width: 800, height: 800 },
+                    Item::Matrix { op: "restore".into(), x: 1500, y: 2000, data: String::new() },
                     Item::Literal {
                         mode: 0,
                         data: "q Q".into(),
+                        at: Some((1600, 2000)),
+                    },
+                    Item::Literal {
+                        mode: 0,
+                        data: "0 g".into(),
+                        at: None,
                     },
                     Item::Unsupported {
                         kind: "leaders".into(),

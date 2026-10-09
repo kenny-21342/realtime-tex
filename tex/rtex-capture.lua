@@ -470,6 +470,7 @@ function C.pic_begin(env)
     if e and not C.manifest_used[key] and e.env == env and (e.state or "") == state and line_begins_env(env) then
       C.manifest_used[key] = true
       C.pic_hit = { key = key, end_line = e.end_line }
+      e.key = key
       return e
     end
     return nil
@@ -510,7 +511,7 @@ function C.shipout(boxnum)
     -- lines or pages is not recorded (never cached)
     if k and not pc.multi and not C.pics[k.key] and not C.pic_bad[k.key] then
       C.pics[k.key] = { env = k.env, page = C.page, x = pc.x, y = pc.y, w = pc.w, h = pc.h, d = pc.d,
-                        page_height = page.page_height, state = k.state }
+                        page_height = page.page_height, state = k.state, items = pc.items, fonts = pc.fonts }
     elseif k and (pc.multi or C.pics[k.key]) then
       C.pics[k.key] = nil
       C.pic_bad[k.key] = true
@@ -565,6 +566,28 @@ function C.finish()
     pf:close()
   end
   texio.write_nl("term and log", string.format("rtex-capture: %d paragraphs, %d units, %d pages written", #paras, #C.units, C.page))
+end
+
+-- PDF literals made by \pdfextension literal keep their text as a token list, which Lua
+-- cannot read (the node's `data` field reads back as the word "data"), so the display list
+-- would carry no operators. rtex-capture.sty routes pgf's literals here: the same whatsit,
+-- made from Lua with a string, which reads back. The PDF is unchanged.
+local literal_subtype = node.subtype("pdf_literal")
+
+-- pgf's axial and radial shadings are form XObjects (box resources) painting `/Sh sh` with a
+-- shading dictionary made from the color specification. rtex-capture.sty records what each
+-- form paints when pgf saves it; the display list names the shading where the form is used.
+-- kind "axial"/"radial"; space, domain, coords, function, extend as PDF text.
+C.shadings = {}
+dl.shadings = C.shadings
+function C.shading(idx, kind, space, domain, coords, func, extend)
+  C.shadings[idx] = json.encode({ kind = kind, space = space, domain = domain, coords = coords, ["function"] = func, extend = extend })
+end
+function C.literal(data)
+  local n = node.new("whatsit", literal_subtype)
+  n.mode = 0
+  n.data = data
+  node.write(n)
 end
 
 return C

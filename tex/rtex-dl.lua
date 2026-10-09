@@ -6,8 +6,14 @@
 --   {"g", font_id, char, glyph_index, x, y_baseline, width, expansion_factor}
 --   {"r", x, y_top, width, height}                      rule
 --   {"c", stack, cmd, data}                             pdf_colorstack whatsit
---   {"l", mode, data}                                   pdf_literal whatsit (host passthrough)
---   {"u", kind, detail}                                 unsupported node (page degraded)
+--   {"l", mode, data, x, y}                             pdf_literal whatsit at (x, baseline y)
+--   {"u", kind, detail}                                 unsupported node (page degraded); a
+--                                                       \useboxresource (pgf shadings, other
+--                                                       form XObjects) is {"u", "box_resource",
+--                                                       "index x top width height"}; a pgf
+--                                                       shading the capture recorded is {"u",
+--                                                       "shading", "index x top width height
+--                                                       depth <spec JSON>"}
 --   {"m", "on"|"off", x}                                math boundary marker
 --   {"i", index, x, y_top, width, height}               image (engine resource index)
 --   {"M", "save"|"set"|"restore", x, y, data}           pdf_save / pdf_setmatrix / pdf_restore:
@@ -52,9 +58,9 @@ end
 
 local RUNNING = -1073741824  -- null_flag: running dimension for rules
 local RS = node.subtypes("rule")
-local RULE_IMAGE, RULE_EMPTY, RULE_USER, RULE_OUTLINE = 2, 3, 4, 9
+local RULE_BOX, RULE_IMAGE, RULE_EMPTY, RULE_USER, RULE_OUTLINE = 1, 2, 3, 4, 9
 for k, v in pairs(RS) do
-  if v == "image" then RULE_IMAGE = k elseif v == "empty" then RULE_EMPTY = k
+  if v == "box" then RULE_BOX = k elseif v == "image" then RULE_IMAGE = k elseif v == "empty" then RULE_EMPTY = k
   elseif v == "user" then RULE_USER = k elseif v == "outline" then RULE_OUTLINE = k end
 end
 
@@ -170,10 +176,13 @@ local function note_pic(st, n, x, baseline, w, h, d)
   if getid(n) == hlist_id and getsubtype(n) == HLIST_INDENT then return false end
   local r = st.pic_seen[id]
   if not r then
-    r = { id = id, x = x, y = baseline, right = x + w, top = baseline - h, bottom = baseline + d, multi = false }
+    r = { id = id, x = x, y = baseline, right = x + w, top = baseline - h, bottom = baseline + d, multi = false,
+          items = {}, fonts = {} }
     st.pic_seen[id] = r
     st.pics[#st.pics + 1] = r
   else
+    -- a picture made of several boxes keeps no fragment (it is never drawn from one)
+    r.items, r.fonts = nil, nil
     if baseline ~= r.y then r.multi = true end
     if x < r.x then r.x = x end
     if x + w > r.right then r.right = x + w end
@@ -183,7 +192,29 @@ local function note_pic(st, n, x, baseline, w, h, d)
   r.w = r.right - r.x
   r.h = r.y - r.top
   r.d = r.bottom - r.y
+  st.pic_rec = r
   return true
+end
+
+-- An item emitted inside a recorded picture, relative to the picture's origin (its left edge
+-- and baseline): the picture cache keeps it, and a later pass that takes the picture from the
+-- cache gets it back at the new position (native drawing of cached pictures).
+local function shift_detail(d, dx, dy)
+  local idx, x, top, rest = d:match("^(%-?%d+) (%-?%d+) (%-?%d+) (.*)$")
+  if not idx then return d end
+  return string.format("%s %d %d %s", idx, tonumber(x) + dx, tonumber(top) + dy, rest)
+end
+local function relative(item, dx, dy)
+  local t = item[1]
+  if t == "g" then return { "g", item[2], item[3], item[4], item[5] + dx, item[6] + dy, item[7], item[8] }
+  elseif t == "r" then return { "r", item[2] + dx, item[3] + dy, item[4], item[5] }
+  elseif t == "l" then return { "l", item[2], item[3], item[4] and item[4] + dx, item[5] and item[5] + dy }
+  elseif t == "M" then return { "M", item[2], item[3] + dx, item[4] + dy, item[5] }
+  elseif t == "m" then return { "m", item[2], item[3] + dx }
+  elseif t == "c" then return { "c", item[2], item[3], item[4] }
+  elseif t == "u" and item[2] == "shading" then return { "u", "shading", shift_detail(item[3], dx, dy) }
+  end
+  return nil -- anything else: the picture keeps no fragment
 end
 
 local function bstr(s)
@@ -230,6 +261,16 @@ function State:bin_rec(tag, payload)
 end
 
 function State:emit(item)
+  local r = self.pic_rec
+  if r and self.pic_in > 0 and r.items then
+    local rel = relative(item, -r.x, -r.y)
+    if rel then
+      r.items[#r.items + 1] = rel
+      if item[1] == "g" then r.fonts[tostring(item[2])] = self.fonts[item[2]] end
+    else
+      r.items, r.fonts = nil, nil
+    end
+  end
   if self.bin then
     local t = item[1]
     if t == "g" then
@@ -247,7 +288,7 @@ function State:emit(item)
     elseif t == "c" then
       local cmd = item[3]; if type(cmd) ~= "number" then cmd = 255 end
       self:bin_rec(0x22, pack("<BBI2", cmd, 0, item[2] or 0) .. bstr(item[4]))
-    elseif t == "l" then self:bin_rec(0x23, pack("<i4", item[2] or 0) .. bstr(item[3]))
+    elseif t == "l" then self:bin_rec(0x23, pack("<i4", item[2] or 0) .. bstr(item[3]) .. (item[4] and pack("<i4i4", item[4], item[5]) or ""))
     elseif t == "u" then self:bin_rec(0x24, bstr(item[2]) .. bstr(type(item[3]) == "table" and "" or item[3]))
     elseif t == "m" then self:bin_rec(0x25, pack("<Bi4", item[2] == "on" and 1 or 0, item[3]))
     elseif t == "i" then self:bin_rec(0x26, pack("<i4i4i4i4i4", item[2] or 0, item[3], item[4], item[5], item[6]))
@@ -478,9 +519,20 @@ hlist_out = function(st, box, left, base_v)
             -- internal PDF); the page is degraded and rendered from the pass PDF. The detail
             -- gives the picture's rectangle (index, x, top, width, height in sp) so a host
             -- can copy it from its rendering of the page when the unit moves live.
-            st:emit({ "u", "cached_picture", string.format("%d %d %d %d %d", idx, cur_h, base_v - h, w, h + d) }); st:flag("pic_cache")
+            local key = st.pic_images[idx]
+            st:emit({ "u", "cached_picture", string.format("%d %d %d %d %d", idx, cur_h, base_v - h, w, h + d) ..
+                     (type(key) == "string" and (" " .. key) or "") }); st:flag("pic_cache")
           else
             st:emit({ "i", idx, cur_h, base_v - h, w, h + d }); st.images = st.images + 1
+          end
+        elseif sub == RULE_BOX then
+          -- \useboxresource: a form XObject (pgf shadings), not a filled rectangle
+          local idx = getfield(n, "index") or -1
+          local sh = M.shadings and M.shadings[idx]
+          if sh then
+            st:emit({ "u", "shading", string.format("%d %d %d %d %d %d %s", idx, cur_h, base_v - h, w, h, d, sh) }); st:flag("shading")
+          else
+            st:emit({ "u", "box_resource", string.format("%d %d %d %d %d", idx, cur_h, base_v - h, w, h + d) }); st:flag("box_resource")
           end
         elseif sub == RULE_EMPTY then
           -- \nullfont / empty rule: occupies space, draws nothing
@@ -504,11 +556,11 @@ hlist_out = function(st, box, left, base_v)
         local sub = getsubtype(n)
         sync_out()
         if sub == ws_colorstack then
-          st:emit({ "c", getfield(n, "stack"), getfield(n, "cmd"), getfield(n, "data") })
+          st:emit({ "c", getfield(n, "stack"), getfield(n, "command"), getfield(n, "data") })
         elseif sub == ws_literal then
-          st:emit({ "l", getfield(n, "mode"), getfield(n, "data") }); st:flag("literal")
+          st:emit({ "l", getfield(n, "mode"), getfield(n, "data"), cur_h, base_v }); st:flag("literal")
         elseif sub == ws_special then
-          st:emit({ "l", -1, getfield(n, "data") }); st:flag("special")
+          st:emit({ "l", -1, getfield(n, "data"), cur_h, base_v }); st:flag("special")
         elseif silent_whatsit(sub) then
           -- bookkeeping whatsits (\write, luaotfload, hyperref) produce no output
         elseif sub == ws_save then
@@ -605,9 +657,19 @@ vlist_out = function(st, box, left, top)
       if sub == RULE_IMAGE then
         local idx = getfield(n, "index")
         if st.pic_images and st.pic_images[idx] then
-          st:emit({ "u", "cached_picture", string.format("%d %d %d %d %d", idx, left, cur_v, w, h + d) }); st:flag("pic_cache")
+          local key = st.pic_images[idx]
+          st:emit({ "u", "cached_picture", string.format("%d %d %d %d %d", idx, left, cur_v, w, h + d) ..
+                   (type(key) == "string" and (" " .. key) or "") }); st:flag("pic_cache")
         else
           st:emit({ "i", idx, left, cur_v, w, h + d }); st.images = st.images + 1
+        end
+      elseif sub == RULE_BOX then
+        local idx = getfield(n, "index") or -1
+        local sh = M.shadings and M.shadings[idx]
+        if sh then
+          st:emit({ "u", "shading", string.format("%d %d %d %d %d %d %s", idx, left, cur_v, w, h, d, sh) }); st:flag("shading")
+        else
+          st:emit({ "u", "box_resource", string.format("%d %d %d %d %d", idx, left, cur_v, w, h + d) }); st:flag("box_resource")
         end
       elseif sub == RULE_EMPTY then
       elseif sub == RULE_USER or sub == RULE_OUTLINE then
@@ -669,11 +731,11 @@ vlist_out = function(st, box, left, top)
     elseif id == whatsit_id then
       local sub = getsubtype(n)
       if sub == ws_colorstack then
-        st:emit({ "c", getfield(n, "stack"), getfield(n, "cmd"), getfield(n, "data") })
+        st:emit({ "c", getfield(n, "stack"), getfield(n, "command"), getfield(n, "data") })
       elseif sub == ws_literal then
-        st:emit({ "l", getfield(n, "mode"), getfield(n, "data") }); st:flag("literal")
+        st:emit({ "l", getfield(n, "mode"), getfield(n, "data"), left, cur_v }); st:flag("literal")
       elseif sub == ws_special then
-        st:emit({ "l", -1, getfield(n, "data") }); st:flag("special")
+        st:emit({ "l", -1, getfield(n, "data"), left, cur_v }); st:flag("special")
       elseif silent_whatsit(sub) then
       elseif sub == ws_save then
         st:emit({ "M", "save", left, cur_v, "" })

@@ -86,7 +86,8 @@ function P.write(c, cached)
   c.pending = nil
   if not p then return end
   local n = img.node(p.img)
-  if n.index and cached then cached[n.index] = true end
+  -- the entry's key (file:line) when the caller gave one: the display list names it
+  if n.index and cached then cached[n.index] = p.entry.key or true end
   node.write(n)
 end
 

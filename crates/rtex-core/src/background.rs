@@ -34,6 +34,7 @@ impl Clone for CaptureResult {
             log: self.log.clone(),
             wall: self.wall,
             exit_ok: self.exit_ok,
+            pic_fragments: self.pic_fragments.clone(),
         }
     }
 }
