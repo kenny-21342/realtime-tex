@@ -44,7 +44,7 @@ fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
 }
 
 /// Lowercase ASCII words delimited by single spaces, outside math, braces and brackets (option
-/// lists: `\addplot[mark size=4pt]`), not part of a control sequence: editing them cannot break
+/// lists: `\draw[line width=1pt]`), not part of a control sequence: editing them cannot break
 /// the paragraph's syntax.
 fn safe_words(par: &str) -> Vec<(usize, usize)> {
     let b = par.as_bytes();

@@ -83,8 +83,8 @@ fn a_persistent_error_ends_the_run() {
 /// pgf node names are global: a picture can use a node named in an earlier picture. When the
 /// picture cache drew the first picture from an earlier PDF its body did not run, the name was
 /// never defined, and a later picture the cache does not take (here: it holds a `\ref`) failed
-/// with "No shape named `p' is known" on every pass after the first (phy-hl-notes: a pgfplots
-/// axis `name=axis1` used by the next picture).
+/// with "No shape named `p' is known" on every pass after the first (the common case: a
+/// pgfplots axis named in one picture and used to place the next one).
 #[test]
 fn a_node_named_in_one_picture_and_used_in_another() {
     let Some(s) = open(

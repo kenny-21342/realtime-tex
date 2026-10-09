@@ -893,8 +893,8 @@ mod tests {
                 .map(|p| p.cacheable)
                 .collect()
         };
-        // phy-hl-notes: a pgfplots axis named in one picture, the next one placed below it
-        let doc = "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\begin{axis}[\n    name=axis1,\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\begin{axis}[\n    at={(axis1.below south west)},\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end{document}\n";
+        // a pgfplots axis named in one picture, the next one placed below it
+        let doc = "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\begin{axis}[\n    name=upper,\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\begin{axis}[\n    at={(upper.below south west)},\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end{document}\n";
         assert_eq!(cacheable(doc), vec![false, false, true]);
         // a node, used with an anchor, `-|` and positioning's `of`
         for using in ["\\draw (p.east) -- ++(1,0);", "\\draw (0,0) -| p;", "\\node[right=of p] {x};", "\\draw (p) -- (1,0);"] {
