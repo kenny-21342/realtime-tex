@@ -17,12 +17,14 @@ Branch `kenny/main` is the working branch (the fork's default); `main` mirrors u
    the first cloud run answers (see below).
 2. `crates/rtex-core/tests/mutation.rs`: random-edit correctness test (env vars documented in its header,
    plus `RTEX_MUTATION_NO_PICCACHE`).
-3. `scripts/fixtures-verify.sh`, `scripts/fixtures-mutation.sh`, `scripts/serve_convergence.py`, `scripts/cloud-setup.sh`.
+3. `scripts/fixtures-verify.sh`, `scripts/fixtures-mutation.sh`, `scripts/serve_convergence.py`, `scripts/cloud-setup.sh` (light), `scripts/cloud-texlive.sh`.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by
-`scripts/cloud-setup.sh` into `/opt/texlive` (setup script of the environment; log in `/var/log/rtex-setup.log`).
-Start every shell with `. /etc/profile.d/rtex-texlive.sh` if `lualatex` is not on PATH.
+`scripts/cloud-texlive.sh` into `/opt/texlive`. The environment's setup script is only the light `scripts/cloud-setup.sh`
+(a TeX Live install inside the setup script exceeded its ~5 minute budget and the session failed to start). At the start of a
+session run, from this repo's root: `nohup bash scripts/cloud-texlive.sh > /tmp/texlive-install.log 2>&1 &` and poll the log until it
+prints `TEXLIVE READY`. Then `. /etc/profile.d/rtex-texlive.sh` in each shell.
 Foreground commands are capped at 10 minutes: run `cargo test`, verify and mutation runs with
 `run_in_background` and poll the output files.
 
