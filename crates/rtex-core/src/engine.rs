@@ -320,7 +320,11 @@ impl FastServer {
                     timeout
                 );
             }
-            let ms = remaining.as_millis().min(u16::MAX as u128) as u16;
+            // Short slices instead of one long blocking poll: on macOS a blocking poll on the
+            // response FIFO is not reliably woken by a write, so replies were only noticed when
+            // the watchdog interval expired (round trips of exactly the timeout) and the server
+            // was killed. Measured: boundary_change_and_preamble_change fails 3/3 without, passes 3/3 with.
+            let ms = remaining.as_millis().min(2) as u16;
             let mut fds = [PollFd::new(self.resp.get_ref().as_fd(), PollFlags::POLLIN)];
             let n = poll(&mut fds, PollTimeout::from(ms))?;
             if n > 0 {
