@@ -3027,7 +3027,9 @@ fn deliver_layout(
         }
     } else if aux_stable && errors == 0 {
         Convergence::Converged
-    } else if !aux_stable && passes >= s.cfg.max_passes {
+    } else if (!aux_stable && passes >= s.cfg.max_passes) || (aux_stable && errors > 0) {
+        // the run is over: either out of passes, or stable with errors that another pass over
+        // the same input would repeat. `Converging` here would promise a pass that never runs.
         Convergence::PassLimitReached {
             passes: passes,
             reasons: reasons.clone(),

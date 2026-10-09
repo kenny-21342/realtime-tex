@@ -10,8 +10,8 @@ buffers, repeating while the aux family changes or the log asks for a rerun, up 
 | State | Meaning |
 |---|---|
 | `Converged` | aux family unchanged, no rerun request, no compile errors, and no edits since the snapshot |
-| `Converging{pass, reasons}` | a further pass is needed (aux still changing, errors present) and will run |
-| `PassLimitReached{passes, reasons}` | `max_passes` exhausted without stabilizing — **never reported as converged** |
+| `Converging{pass, reasons}` | a further pass is needed (aux still changing) and will run |
+| `PassLimitReached{passes, reasons}` | the run ended without converging: `max_passes` exhausted, or the aux family is stable but the log has errors (another pass over the same input would repeat them; a new run starts when an edit needs one or the host calls `request_layout`) — **never reported as converged** |
 | `Stale{pending_since}` | edits arrived after the snapshot; another pass is already scheduled |
 
 `LayoutUpdate.compile`:

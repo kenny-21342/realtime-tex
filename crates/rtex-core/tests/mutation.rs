@@ -43,11 +43,12 @@ fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
-/// Lowercase ASCII words delimited by single spaces, outside math and braces, not part of a
-/// control sequence: editing them cannot break the paragraph's syntax.
+/// Lowercase ASCII words delimited by single spaces, outside math, braces and brackets (option
+/// lists: `\addplot[mark size=4pt]`), not part of a control sequence: editing them cannot break
+/// the paragraph's syntax.
 fn safe_words(par: &str) -> Vec<(usize, usize)> {
     let b = par.as_bytes();
-    let (mut depth, mut dollars) = (0i32, 0usize);
+    let (mut depth, mut brackets, mut dollars) = (0i32, 0i32, 0usize);
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
@@ -55,6 +56,8 @@ fn safe_words(par: &str) -> Vec<(usize, usize)> {
         match c {
             b'{' => depth += 1,
             b'}' => depth -= 1,
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
             b'$' => dollars += 1,
             b'\\' => {
                 // skip the control sequence / escaped character
@@ -66,7 +69,7 @@ fn safe_words(par: &str) -> Vec<(usize, usize)> {
             }
             _ => {}
         }
-        if c.is_ascii_lowercase() && depth == 0 && dollars % 2 == 0 && (i == 0 || b[i - 1] == b' ')
+        if c.is_ascii_lowercase() && depth == 0 && brackets <= 0 && dollars % 2 == 0 && (i == 0 || b[i - 1] == b' ')
         {
             let s = i;
             while i < b.len() && b[i].is_ascii_lowercase() {
@@ -84,6 +87,14 @@ fn safe_words(par: &str) -> Vec<(usize, usize)> {
 
 /// A random mutation of the paragraph at `base` (absolute byte offset of `par`): (name, edit).
 fn mutate(rng: &mut Rng, par: &str, base: usize) -> Option<(&'static str, Edit)> {
+    // picture code in a paragraph (an inline tikzpicture or plot) is not text: a word there is
+    // a key or a coordinate name
+    if ["\\begin{tikzpicture}", "\\tikz", "\\begin{axis}", "\\addplot", "\\draw", "\\begin{circuitikz}"]
+        .iter()
+        .any(|k| par.contains(k))
+    {
+        return None;
+    }
     let words = safe_words(par);
     if words.len() < 3 {
         return None;
@@ -130,6 +141,8 @@ struct State {
     eligible: Vec<ParaId>,
     versions: Option<Versions>,
     converged: bool,
+    /// The run ended (`Converged` or `PassLimitReached`): no further pass comes on its own.
+    ended: bool,
     // keyed by (edit, paragraph): one edit can touch several spans (a split), each answers on its own
     updates: HashMap<(u64, ParaId), (ParaId, String, Vec<String>, bool, DisplayList)>,
     layouts: u32,
@@ -151,7 +164,7 @@ impl State {
             Event::Diagnostics { source, items } => format!(
                 "Diagnostics {source}: {} item(s){}",
                 items.len(),
-                items.first().map(|d| format!(", first: {}", serde_json::to_string(d).unwrap_or_default().chars().take(300).collect::<String>())).unwrap_or_default()
+                items.iter().find(|d| d.severity == "error").or(items.first()).map(|d| format!(", first error (or item): {}", serde_json::to_string(d).unwrap_or_default().chars().take(300).collect::<String>())).unwrap_or_default()
             ),
             Event::EngineState { engine_generation, state, reason } => format!("EngineState gen {engine_generation} {state} {reason:?}"),
             Event::BackgroundScheduled { par_id, reasons, edit_id } => format!("BackgroundScheduled par {par_id:?} edit {edit_id} reasons {reasons:?}"),
@@ -191,6 +204,7 @@ impl State {
                 self.kinds = pl.iter().map(|p| (p.par_id, p.kind.clone())).collect();
                 self.eligible = eligible_paragraphs;
                 self.converged = matches!(convergence, Convergence::Converged);
+                self.ended = matches!(convergence, Convergence::Converged | Convergence::PassLimitReached { .. });
                 self.versions = Some(versions);
                 self.layouts += 1;
             }
@@ -345,6 +359,7 @@ fn random_edits_are_never_served_wrong() {
         eligible: vec![],
         versions: None,
         converged: false,
+        ended: false,
         updates: HashMap::new(),
         layouts: 0,
         log: Default::default(),
@@ -402,8 +417,11 @@ fn random_edits_are_never_served_wrong() {
         let before = st.layouts;
         s.request_layout();
         let ok = st.pump(&s, wait, |st| {
-            st.layouts > before && st.converged && st.versions.as_ref().map(|v| v.source_revision >= rev).unwrap_or(false)
+            st.layouts > before && st.ended && st.versions.as_ref().map(|v| v.source_revision >= rev).unwrap_or(false)
         });
+        if ok && !st.converged {
+            panic!("{}", st.dump(&s, "the clean pass ended without converging"));
+        }
         if !ok {
             panic!("{}", st.dump(&s, &format!("the clean pass did not converge (waited {} s for source revision {rev:?}, layouts before request {before})", wait.as_secs())));
         }
