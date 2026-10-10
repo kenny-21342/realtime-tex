@@ -167,3 +167,38 @@ fn hidden_global_state_demotes_the_unit() {
     assert!(demoted.iter().any(|r| r.contains("compiled again")), "{demoted:?}");
     s.close();
 }
+
+/// A pdflscape landscape page carries `/Rotate 90` in its page attributes: viewers show it turned.
+/// The page list used to say nothing, so hosts drew it upright (stress-test document, p20). It now
+/// carries `rotate`. Its rows are also typeset inside a rotated box: they keep the box's own
+/// coordinates and no record ties them to the matrix, so the page was drawn with the table off
+/// the page while it claimed to be exact. Such rows flag the page (`transformed_rows`).
+#[test]
+fn landscape_pages_say_they_are_rotated() {
+    let Some(s) = open(
+        "landscape",
+        "\\documentclass{article}\n\\usepackage{pdflscape}\n\\begin{document}\nPortrait page.\n\\begin{landscape}\nA wide table goes here.\n\\end{landscape}\nPortrait again.\n\\end{document}\n",
+    ) else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut rotate = std::collections::BTreeMap::new();
+    let mut done = false;
+    while !done {
+        assert!(Instant::now() < deadline, "no converged layout");
+        for e in s.poll(Duration::from_millis(100)) {
+            if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
+                for p in pages_changed {
+                    let flagged = p.dl.flags_map().contains_key("transformed_rows");
+                    rotate.insert(p.page, (p.dl.rotate, flagged, p.exact));
+                }
+                done |= matches!(convergence, Convergence::Converged);
+            }
+        }
+    }
+    assert_eq!(
+        rotate.into_iter().collect::<Vec<_>>(),
+        vec![(1, (0, false, true)), (2, (90, true, false)), (3, (0, false, true))]
+    );
+    s.close();
+}

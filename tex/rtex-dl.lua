@@ -261,6 +261,16 @@ function State:bin_rec(tag, payload)
 end
 
 function State:emit(item)
+  -- the transformation state (pdf_save / pdf_setmatrix / pdf_restore): a row that starts
+  -- under a matrix (a landscape page's table, a rotated \parbox) is drawn turned, but rows keep
+  -- the coordinates of the untransformed box and no record ties them to the matrix
+  if item[1] == "M" then
+    local ms = self.mstack
+    if not ms then ms = {}; self.mstack = ms end
+    if item[2] == "save" then ms[#ms + 1] = self.mactive or false
+    elseif item[2] == "set" then self.mactive = true
+    else self.mactive = ms[#ms] or false; ms[#ms] = nil end
+  end
   local r = self.pic_rec
   if r and self.pic_in > 0 and r.items then
     local rel = relative(item, -r.x, -r.y)
@@ -810,6 +820,7 @@ function State:emit_virtual(f, c, x, y, ef, depth)
 end
 
 function State:begin_line(n, par, line, x, baseline, w, h, d, unit)
+  if self.mactive then self:flag("transformed_rows") end
   local gs = getfield(n, "glue_set")
   if self.bin then
     self.nlines = self.nlines + 1

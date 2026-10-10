@@ -35,7 +35,10 @@ Records: u8 tag, u32 payload_length, payload   (unknown tags must be skipped)
                 i32 squeeze, i32 designsize, str filename, str psname, str name, str fullname, str format
                 kind: 0 unknown, 1 opentype, 2 truetype, 3 type1, 4 type3, 5 virtual (never emitted: expanded)
                 slant/extend/squeeze in thousandths (extend 1000 = none; 0 = unset)
-  0x03 FLAG     str key, i32 value            degradation flags (page is Degraded when any is present)
+  0x03 FLAG     str key, i32 value            degradation flags (page is Degraded when any is present);
+                `transformed_rows`: rows typeset inside a transformed box (a landscape page's
+                table, a rotated \parbox) keep the box's own coordinates, and no record ties them
+                to the MATRIX that turns them: such a page is drawn from its PDF
   0x10 LINE     i32 par, i32 line_index, i32 x, i32 baseline_y, i32 width, i32 height, i32 depth,
                 f64 glue_set, u8 glue_sign, u8 glue_order
   0x12 LINE_UNIT i32 unit, i32 row          (page lists; directly after LINE) owning unit and row index
@@ -64,6 +67,9 @@ Records: u8 tag, u32 payload_length, payload   (unknown tags must be skipped)
   0x29 PICTURE  str key, i32 x, i32 top, i32 width, i32 height
                 a picture this page draws from the picture cache's stored drawing (its
                 `cached_picture` item was replaced): where it is, by its cache key
+  0x2A ROTATE   i32 degrees                  the page's /Rotate (90, 180 or 270, clockwise) from
+                the page attributes at shipout (pdflscape): coordinates stay those of the
+                unrotated page; hosts turn the whole page as viewers do. Absent when 0
   0xFF END
 
 In unit lists the META record's `origin_y` slot carries the number of insert nodes (footnotes,
@@ -151,6 +157,6 @@ glyph origins) and `scripts/gfx_shading_check.py` samples shadings against MuPDF
 "h","d","gs","gsign","gorder","items":[["g",font,char,index,x,y,w,ef],["r",x,y_top,w,h],
 ["c",stack,cmd,data],["l",mode,data,x,y],["u",kind,detail],["m","on"|"off",x],["i",index,x,y_top,w,h],
 ["M","save"|"set"|"restore",x,y,data]]}],
-"other":[…],"flags":{…},"pictures":[{"key","x","top","width","height"}],"glyphs":n,"inserts":n,"images_info":{index:{file,page,pages}},"width","height","depth","page","page_width","page_height","origin"}`;
+"other":[…],"flags":{…},"pictures":[{"key","x","top","width","height"}],"glyphs":n,"inserts":n,"images_info":{index:{file,page,pages}},"width","height","depth","page","page_width","page_height","origin","rotate"}` (`rotate` only when not 0);
 page lines also carry `"unit"` and `"row"`).
 Both encodings carry the same information; the binary one is what the engine emits.

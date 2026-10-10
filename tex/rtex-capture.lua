@@ -499,12 +499,25 @@ end
 -- not listed in images_info: hosts never see a cached picture as an image
 function C.pic_write() P.write(C.picctl, C.cache_images) end
 
-function C.shipout(boxnum)
+-- The page's /Rotate (degrees clockwise, 0, 90, 180 or 270) from the page attributes in force
+-- at shipout (\pdfvariable pageattr; pdflscape adds /Rotate 90 for a landscape page). Viewers
+-- turn the page; the display list says so (`rotate`). The last /Rotate wins, as in the PDF.
+local function page_rotate(attrs)
+  local r
+  for v in tostring(attrs or ""):gmatch("/Rotate%s*(%-?%d+)") do r = tonumber(v) end
+  r = r and r % 360 or 0
+  return (r % 90 == 0) and r or 0
+end
+C.page_rotate = page_rotate
+
+function C.shipout(boxnum, pageattr)
   C.page = C.page + 1
   local b = tex.box[boxnum]
   if not b then return end
   local page = dl.page(b, C.attr_par, C.attr_line, C.page, nil, C.attr_unit, is_insert,
                        { attr_pic = C.attr_pic, pic_images = C.cache_images })
+  local rot = page_rotate(pageattr)
+  if rot ~= 0 then page.rotate = rot end
   for _, pc in ipairs(page.pics or {}) do
     local k = C.pic_keys[pc.id]
     -- one box per picture (several boxes on one baseline are joined); a picture broken over

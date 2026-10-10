@@ -477,7 +477,9 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
         let page_no = pdf_page.number as i64;
         let dl = cap.page(page_no)?;
         let dec_quantum = 10f64.powi(-(pdf_page.decimals.max(1) as i32));
-        let rep = compare_page(&dl, pdf_page, &[], dec_quantum);
+        // glyphs under a transformation (rotated or scaled text: pdflscape, \rotatebox) sit
+        // where the PDF puts them only once the transformation is applied
+        let rep = compare_page(&with_transforms_applied(&dl), pdf_page, &[], dec_quantum);
         // TJ quantum for the largest text size on the page
         let max_size = pdf_page.glyphs.iter().map(|g| g.size).fold(0.0, f64::max);
         let tj_quantum = max_size / 1000.0;
@@ -489,73 +491,28 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
             .chain(dl.other.iter())
             .filter(|i| matches!(i, Item::Color { .. }))
             .count();
-        // image rectangles with the PDF transformation state applied: graphicx scales (and
-        // rotates) bitmap images with save / setmatrix / restore around the image. The affine map
-        // p' = M p + t is tracked in TeX coordinates (a pure scale about a point has the same
-        // form in both orientations; rotations are approximated by their bounding box).
+        // image rectangles with the PDF transformation state applied (graphicx scales and
+        // rotates bitmap images with save / setmatrix / restore around the image)
         let dl_images: Vec<(f64, f64, f64, f64)> = {
             let mut out = Vec::new();
-            let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-            let mut stack: Vec<[f64; 6]> = Vec::new();
-            let mut cur = identity;
-            let items = dl
-                .other
-                .iter()
-                .chain(dl.lines.iter().flat_map(|l| l.items.iter()));
-            for it in items {
-                match it {
-                    Item::Matrix { op, x, y, data } => match op.as_str() {
-                        "save" => stack.push(cur),
-                        "restore" => cur = stack.pop().unwrap_or(identity),
-                        _ => {
-                            let v: Vec<f64> = data
-                                .split_whitespace()
-                                .filter_map(|t| t.parse().ok())
-                                .collect();
-                            if v.len() == 4 {
-                                let (a2, b2, c2, d2) = (v[0], v[1], v[2], v[3]);
-                                let (px, py) = (*x as f64, *y as f64);
-                                // T2(p) = M2 p + (P - M2 P); T = T1 ∘ T2
-                                let [a1, b1, c1, d1, tx1, ty1] = cur;
-                                let t2x = px - (a2 * px + c2 * py);
-                                let t2y = py - (b2 * px + d2 * py);
-                                cur = [
-                                    a1 * a2 + c1 * b2,
-                                    b1 * a2 + d1 * b2,
-                                    a1 * c2 + c1 * d2,
-                                    b1 * c2 + d1 * d2,
-                                    a1 * t2x + c1 * t2y + tx1,
-                                    b1 * t2x + d1 * t2y + ty1,
-                                ];
-                            }
-                        }
-                    },
-                    Item::Image {
-                        x,
-                        y_top,
-                        width,
-                        height,
-                        ..
-                    } => {
-                        let [a, b, c, d, tx, ty] = cur;
-                        let tr = |px: f64, py: f64| (a * px + c * py + tx, b * px + d * py + ty);
-                        let (x0, y0) = (*x as f64, *y_top as f64);
-                        let (x1, y1) = (x0 + *width as f64, y0 + *height as f64);
-                        let pts = [tr(x0, y0), tr(x1, y0), tr(x0, y1), tr(x1, y1)];
-                        let minx = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-                        let maxx = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-                        let miny = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-                        let maxy = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-                        out.push((
-                            minx / rtex_dl::SP_PER_BP,
-                            pdf_page.height - maxy / rtex_dl::SP_PER_BP,
-                            (maxx - minx) / rtex_dl::SP_PER_BP,
-                            (maxy - miny) / rtex_dl::SP_PER_BP,
-                        ));
-                    }
-                    _ => {}
+            walk_transforms(&dl, |it, [a, b, c, d, tx, ty]| {
+                if let Item::Image { x, y_top, width, height, .. } = it {
+                    let tr = |px: f64, py: f64| (a * px + c * py + tx, b * px + d * py + ty);
+                    let (x0, y0) = (*x as f64, *y_top as f64);
+                    let (x1, y1) = (x0 + *width as f64, y0 + *height as f64);
+                    let pts = [tr(x0, y0), tr(x1, y0), tr(x0, y1), tr(x1, y1)];
+                    let minx = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                    let maxx = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+                    let miny = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+                    let maxy = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+                    out.push((
+                        minx / rtex_dl::SP_PER_BP,
+                        pdf_page.height - maxy / rtex_dl::SP_PER_BP,
+                        (maxx - minx) / rtex_dl::SP_PER_BP,
+                        (maxy - miny) / rtex_dl::SP_PER_BP,
+                    ));
                 }
-            }
+            });
             out
         };
         let images_matched = dl_images
@@ -824,4 +781,69 @@ fn pic_cache_check(
         );
     }
     Ok(rep)
+}
+
+/// Calls `f` for every item of `dl` (its `other` items, then its rows) with the affine map in
+/// force there, [a, b, c, d, tx, ty] (x' = a·x + c·y + tx, y' = b·x + d·y + ty) in TeX
+/// coordinates (sp, y down). MATRIX records: `set` applies "a b c d", given in PDF orientation
+/// (y up), about the point (x, y) until the matching `restore`.
+fn walk_transforms<'a>(dl: &'a DisplayList, mut f: impl FnMut(&'a Item, [f64; 6])) {
+    let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut stack: Vec<[f64; 6]> = Vec::new();
+    let mut cur = identity;
+    for it in dl.other.iter().chain(dl.lines.iter().flat_map(|l| l.items.iter())) {
+        if let Item::Matrix { op, x, y, data } = it {
+            match op.as_str() {
+                "save" => stack.push(cur),
+                "restore" => cur = stack.pop().unwrap_or(identity),
+                _ => {
+                    let v: Vec<f64> = data.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                    if v.len() == 4 {
+                        // y down: the matrix [a b c d] of the PDF becomes [a -b -c d]
+                        let (a2, b2, c2, d2) = (v[0], -v[1], -v[2], v[3]);
+                        let (px, py) = (*x as f64, *y as f64);
+                        // T2(p) = M2 p + (P - M2 P); T = T1 ∘ T2
+                        let [a1, b1, c1, d1, tx1, ty1] = cur;
+                        let t2x = px - (a2 * px + c2 * py);
+                        let t2y = py - (b2 * px + d2 * py);
+                        cur = [
+                            a1 * a2 + c1 * b2,
+                            b1 * a2 + d1 * b2,
+                            a1 * c2 + c1 * d2,
+                            b1 * c2 + d1 * d2,
+                            a1 * t2x + c1 * t2y + tx1,
+                            b1 * t2x + d1 * t2y + ty1,
+                        ];
+                    }
+                }
+            }
+        }
+        f(it, cur);
+    }
+}
+
+/// `dl` with every glyph moved by the transformation in force at it (glyph origins only; the
+/// comparison with the PDF matches origins).
+fn with_transforms_applied(dl: &DisplayList) -> DisplayList {
+    let mut moved: Vec<(i64, i64)> = Vec::new();
+    let mut any = false;
+    walk_transforms(dl, |it, [a, b, c, d, tx, ty]| {
+        if let Item::Glyph { x, y, .. } = it {
+            let (px, py) = (*x as f64, *y as f64);
+            any |= [a, b, c, d, tx, ty] != [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+            moved.push(((a * px + c * py + tx).round() as i64, (b * px + d * py + ty).round() as i64));
+        }
+    });
+    let mut out = dl.clone();
+    if !any {
+        return out;
+    }
+    let mut k = 0;
+    for it in out.other.iter_mut().chain(out.lines.iter_mut().flat_map(|l| l.items.iter_mut())) {
+        if let Item::Glyph { x, y, .. } = it {
+            (*x, *y) = moved[k];
+            k += 1;
+        }
+    }
+    out
 }

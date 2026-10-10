@@ -83,9 +83,12 @@ LuaTeX only; no pdfTeX/XeTeX.
 renderer. Type1 fonts (classic Computer Modern math without `unicode-math`) are named by file and
 character code and must be rasterized by the host (the built-in verification rasterizer skips
 them). Pages containing `\pdfliteral`/`\special` drawing, non-left-to-right text, `\vadjust`
-material, unknown whatsits or unexpanded virtual-font commands are marked *Degraded* and come
-with a PDF fallback path; TikZ/PGF pictures therefore render through the PDF fallback, not the
-display list.
+material, unknown whatsits, unexpanded virtual-font commands or rows typeset inside a transformed
+box (a pdflscape landscape table, a rotated `\parbox`: `transformed_rows`) are marked *Degraded*
+and come with a PDF fallback path. TikZ/PGF pictures (literals and shadings) are drawn from the
+display list's native drawing operations (docs/DISPLAY_LIST.md, "Native drawing"); tiling patterns
+and soft masks still fall back to the PDF. A page's `/Rotate` (pdflscape) is reported as
+`rotate`: hosts turn the page.
 
 **Bibliographies and indices.** `biber` and `bibtex` run automatically; `makeindex`, `xindy` and
 glossaries do not (documented hook point: `background.rs::run_pass`).

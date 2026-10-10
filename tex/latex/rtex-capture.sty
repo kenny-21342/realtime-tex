@@ -10,7 +10,9 @@
 \AddToHook{begindocument/end}{\directlua{rtex_capture.begin_document()}}
 \AddToHook{para/begin}{\directlua{rtex_capture.parbegin()}}
 \AddToHook{para/after}{\directlua{rtex_capture.parafter()}}
-\AddToHook{shipout/before}{\directlua{rtex_capture.shipout(\number\ShipoutBox)}}
+% the page attributes in force at shipout (pdflscape's /Rotate 90 is set there)
+\AddToHook{shipout/before}{\directlua{rtex_capture.shipout(\number\ShipoutBox,
+  "\luaescapestring{\the\pdfvariable pageattr}")}}
 \AddToHook{cmd/@outputpage/before}{\directlua{rtex_capture.output_begin()}}
 \AddToHook{cmd/@outputpage/after}{\directlua{rtex_capture.output_end()}}
 \AddToHook{cmd/@afterheading/before}{\directlua{rtex_capture.afterheading()}}

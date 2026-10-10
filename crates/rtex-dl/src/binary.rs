@@ -262,6 +262,9 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                     },
                 );
             }
+            0x2A => {
+                dl.rotate = p.i32().map_err(malformed)? as i64;
+            }
             0x29 => {
                 let key = p.str().map_err(malformed)?;
                 dl.pictures.push(crate::PictureSpot {
@@ -600,6 +603,11 @@ pub fn encode(dl: &DisplayList) -> Vec<u8> {
         p.str(&im.file);
         body.rec(0x27, &p.0);
     }
+    if dl.rotate != 0 {
+        let mut p = Writer(Vec::new());
+        p.i32(dl.rotate);
+        body.rec(0x2A, &p.0);
+    }
     for pic in &dl.pictures {
         let mut p = Writer(Vec::new());
         p.str(&pic.key);
@@ -767,6 +775,7 @@ mod tests {
             }],
             flags: serde_json::json!({"literal": 1}),
             pictures: vec![crate::PictureSpot { key: "main.tex:12".into(), x: 100, top: 200, width: 3000, height: 1500 }],
+            rotate: 90,
             glyphs: 3,
             width: 5000,
             height: 700,

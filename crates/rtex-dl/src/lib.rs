@@ -365,6 +365,11 @@ pub struct DisplayList {
     pub page_height: Option<Sp>,
     #[serde(default)]
     pub origin: Option<(Sp, Sp)>,
+    /// The page's `/Rotate` in degrees clockwise (90, 180 or 270; 0 when absent), from the page
+    /// attributes in force at shipout (`\pdfvariable pageattr`, pdflscape's landscape pages).
+    /// Coordinates are those of the unrotated page; viewers turn the whole page, so should hosts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotate: i64,
     /// Pictures this page draws from the picture cache's stored drawings (their `cached_picture`
     /// items were replaced by the drawing): where each is, by its cache key. A host that copies
     /// a cached picture into a live unit takes its pixels from here.
