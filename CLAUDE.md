@@ -11,25 +11,26 @@ Branch `kenny/main` is the working branch (the fork's default); `main` mirrors u
 - Report status checked against the disk, not remembered. Log `uptime` next to any timing.
 - Commit messages end with `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.
 
-## Local changes on top of upstream 25b3f8f
-1. `crates/rtex-core/src/engine.rs`: poll the response FIFO in 2 ms slices (macOS `poll()` is not woken by a
-   FIFO write; without it the 5 s watchdog kills the server). **Linux does not need it** (2026-10-09 cloud run:
-   all tests pass 3/3 without it; strace shows the blocking poll woken by the write in 0.3-137 ms). Kept
-   unconditionally: harmless on Linux.
-2. `crates/rtex-core/tests/mutation.rs`: random-edit correctness test (env vars documented in its header,
+## Local changes on top of upstream e35f869
+Upstream (Henry's refactor) was merged in on 2026-10-10. The merge PR describes, fix by fix, which side's
+version was kept where both changed the same thing. The old 2 ms FIFO poll slices are gone: upstream's
+response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on every platform.
+1. `crates/rtex-core/tests/mutation.rs`: random-edit correctness test (env vars documented in its header,
    plus `RTEX_MUTATION_NO_PICCACHE`, `RTEX_MUTATION_WAIT`). It edits text only (no option lists, no picture code),
    prints the session state and last events when a clean pass does not converge, and fails (instead of a
    silent `ok`) when `RTEX_MUTATION_PROJECT` is set but TeX Live is missing.
-3. Fixes for the math/phy "clean pass did not converge" hangs (`tests/regressions.rs` reproduces both):
-   - `session.rs`: a final pass with a stable aux family but compile errors ends as `PassLimitReached`
-     (it said `Converging`, promising a pass that never ran; docs/CONVERGENCE.md).
+2. Fixes for the math/phy "clean pass did not converge" hangs (`tests/regressions.rs` reproduces both):
+   - `session/passes.rs`: a final pass with a stable aux family but compile errors ends as `PassLimitReached`
+     (it said `Converging`, promising a pass that never ran; docs/how-it-works.md).
    - `piccache.rs`: pictures linked by a pgf node name (one names a node, another uses it) are not cached.
-4. `scripts/fixtures-verify.sh`, `scripts/fixtures-mutation.sh`, `scripts/serve_convergence.py`, `scripts/cloud-setup.sh` (light), `scripts/cloud-texlive.sh`.
-
-5. Native TikZ drawing (merged, PR #2): pgf literals, shadings and cached pictures drawn from the display list
-   (`crates/rtex-dl/src/gfx.rs`, `LayoutUpdate.pages_changed[].native`, docs/DISPLAY_LIST.md "Native drawing"),
+3. `scripts/fixtures-verify.sh`, `scripts/fixtures-mutation.sh`, `scripts/serve_convergence.py`, `scripts/cloud-setup.sh` (light), `scripts/cloud-texlive.sh`.
+4. Native TikZ drawing: pgf literals, shadings and cached pictures drawn from the display list
+   (`crates/rtex-dl/src/gfx.rs`, `LayoutUpdate.pages_changed[].native`, docs/display-list.md "Native drawing"),
    checked against MuPDF by `scripts/gfx_compare.py` / `scripts/gfx_shading_check.py` (inputs from the
-   `gfx_dump` and `native_session` examples). Tiling patterns still fall back to the PDF.
+   `gfx_dump` and `native_session` examples).
+5. Session: pass timeout (`pass_timeout_ms`), relative fast-path budget (`fast_budget_factor` on top of
+   upstream's 50 ms floor), warm start of the background build, diagnostics for fatal passes, page `rotate`
+   and `color_base` in the display list.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by
