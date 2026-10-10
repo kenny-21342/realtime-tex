@@ -25,3 +25,6 @@ hex.workspace = true
 nix.workspace = true
 clap.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

@@ -373,3 +373,41 @@ fn live_results_name_reused_images() {
     assert_eq!(files, vec![f("b.png"), f("a.png")], "the second compile's images");
     s.close();
 }
+
+/// A standby engine loads the preamble while the user types, so a background pass costs the
+/// body only. The pass compared the standby's preamble hash (its `\input` files inlined) with
+/// one of the raw preamble text: for a preamble that `\input`s a file they never matched, and
+/// every pass started from scratch (the stress-test document: 19-20 s a pass instead of 14-15).
+#[test]
+fn a_preamble_with_inputs_uses_the_standby() {
+    if TexLive::discover().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-regr-{}-standby", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("main.tex"),
+        "\\documentclass{article}\n\\input{setup}\n\\begin{document}\nA paragraph to edit.\n\nAnother one.\n\\end{document}\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("setup.tex"), "\\usepackage{amsmath}\n").unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.debounce = Duration::from_millis(50);
+    let s = Session::open(cfg).unwrap();
+    let mut o = rtex_core::replay::Observer::new();
+    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    let before = s.background_passes();
+    let at = s.document_text("main.tex").unwrap().find("to edit").unwrap();
+    let r = s
+        .apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "quickly ".into() })
+        .unwrap();
+    // give the standby time to load its preamble before the pass is asked for
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(o.settle(&s, r.source_revision, Duration::from_secs(120)), "no settled layout");
+    let after = s.background_passes();
+    assert!(after.0 > before.0, "no warm pass after the edit: before {before:?}, after {after:?}");
+    s.close();
+}

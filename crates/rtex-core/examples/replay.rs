@@ -25,7 +25,8 @@
 //! compile status, pages, and the verdict of the last result served for each edited paragraph
 //! against the settled layout (`rtex_core::replay`, as in tests/mutation.rs). Writes
 //! DIR/report.json and prints a summary; exits 1 if any served result was wrong.
-//! REPLAY_EVENTS=1 prints the session's events at every settle.
+//! REPLAY_EVENTS=1 prints the session's events at every settle. Experiment switches:
+//! REPLAY_NO_PICCACHE=1, REPLAY_COLD_BACKGROUND=1 (no standby engine), REPLAY_BUDGET_MS=<ms>.
 use anyhow::{anyhow, bail, Context, Result};
 use rtex_core::replay::{edit_at, has_picture_code, safe_words, Observer, Rng, Verdict};
 use rtex_core::session::CompileStatus;
@@ -41,6 +42,7 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(1800);
 const FAST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> Result<()> {
+    env_logger::init();
     let a: Vec<String> = std::env::args().skip(1).collect();
     let mode = a.first().cloned().unwrap_or_default();
     let mut opt: HashMap<String, String> = HashMap::new();
@@ -145,6 +147,16 @@ impl Run {
         let t0 = Instant::now();
         let mut cfg = SessionConfig::new(project, main.to_string());
         cfg.build_dir = build.to_path_buf();
+        // experiment switches: REPLAY_NO_PICCACHE, REPLAY_COLD_BACKGROUND, REPLAY_BUDGET_MS
+        if std::env::var("REPLAY_NO_PICCACHE").is_ok() {
+            cfg.picture_cache = false;
+        }
+        if std::env::var("REPLAY_COLD_BACKGROUND").is_ok() {
+            cfg.warm_background = false;
+        }
+        if let Some(ms) = std::env::var("REPLAY_BUDGET_MS").ok().and_then(|v| v.parse().ok()) {
+            cfg.fast_budget = Duration::from_millis(ms);
+        }
         let s = Session::open(cfg)?;
         let mut o = Observer::new();
         let opened_ms = t0.elapsed().as_secs_f64() * 1e3;

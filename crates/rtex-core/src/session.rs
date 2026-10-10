@@ -330,6 +330,10 @@ struct Shared {
     shutdown: AtomicBool,
     /// A background pass is compiling right now: fast-path timings are not budget evidence.
     bg_running: AtomicBool,
+    /// Background passes run in a prepared standby engine (preamble already loaded) / started
+    /// from scratch: `Session::background_passes`.
+    bg_warm: AtomicU64,
+    bg_cold: AtomicU64,
     /// Background passes are deferred while paused (benchmarks, host-controlled quiet periods).
     bg_paused: AtomicBool,
     bg_pending_while_paused: AtomicBool,
@@ -453,6 +457,8 @@ impl Session {
             bg_signal: unbounded(),
             shutdown: AtomicBool::new(false),
             bg_running: AtomicBool::new(false),
+            bg_warm: AtomicU64::new(0),
+            bg_cold: AtomicU64::new(0),
             bg_paused: AtomicBool::new(false),
             bg_pending_while_paused: AtomicBool::new(false),
             cfg,
@@ -501,6 +507,12 @@ impl Session {
             requeued: Mutex::new(std::collections::VecDeque::new()),
             threads,
         })
+    }
+
+    /// Background passes so far: (warm, cold). A warm pass runs in a standby engine that loaded
+    /// the preamble while the user typed; a cold one loads it first.
+    pub fn background_passes(&self) -> (u64, u64) {
+        (self.shared.bg_warm.load(Ordering::SeqCst), self.shared.bg_cold.load(Ordering::SeqCst))
     }
 
     pub fn versions(&self) -> Versions {
@@ -2668,7 +2680,9 @@ fn run_background_pass_inner(s: &Shared) {
                 true,
             );
         }
+        let t_absorb = Instant::now();
         absorb(cap);
+        log::debug!("background pass {pass}: picture cache absorb {} ms", t_absorb.elapsed().as_millis());
         pass_started = Instant::now();
     };
     let result = if s.cfg.warm_background {
@@ -2676,10 +2690,9 @@ fn run_background_pass_inner(s: &Shared) {
         // typed, then the one started when the previous pass was released (its preamble loads
         // while the body is typeset). Two snapshot directories alternate so a loading standby
         // never rewrites the files a running one reads.
-        let pre_hash = texts
-            .get(&s.cfg.main_file)
-            .and_then(|t| crate::split_preamble(t))
-            .map(|(p, _)| crate::document::hash_str(p));
+        // the standby's own hash (write_body_snapshot): the preamble with its \input files
+        // inlined; the raw preamble text never matched one that \inputs files
+        let pre_hash = standby_preamble_hash(&texts, &s.cfg.main_file);
         let mut runner = |_pass: u32| -> Result<crate::capture::CaptureResult> {
             let ready = {
                 let mut slot = s.standby.lock();
@@ -2688,13 +2701,24 @@ fn run_background_pass_inner(s: &Shared) {
                         if Some(w.preamble_hash) == pre_hash && w.is_alive() {
                             Some(w)
                         } else {
+                            log::debug!(
+                                "background pass: standby discarded (preamble {}, alive {})",
+                                if Some(w.preamble_hash) == pre_hash { "same" } else { "changed" },
+                                w.is_alive()
+                            );
                             w.kill();
                             None
                         }
                     }
-                    None => None,
+                    None => {
+                        log::debug!("background pass: no standby");
+                        None
+                    }
                 }
             };
+            let warm = ready.is_some();
+            if warm { &s.bg_warm } else { &s.bg_cold }.fetch_add(1, Ordering::SeqCst);
+            let t_pass = Instant::now();
             let w = match ready {
                 Some(w) => w,
                 None => {
@@ -2731,7 +2755,14 @@ fn run_background_pass_inner(s: &Shared) {
             ) {
                 *s.standby.lock() = Some(next);
             }
+            let t_run = Instant::now();
             let mut cap = w.run(&s.cfg.project_root, &texts, &s.cfg.main_file)?;
+            log::debug!(
+                "background pass: {} standby, waited/spawned {} ms, engine run {} ms",
+                if warm { "warm" } else { "cold" },
+                (t_run - t_pass).as_millis(),
+                t_run.elapsed().as_millis()
+            );
             cap.pic_fragments = pic_fragments.lock().unwrap().clone();
             finished(&cap);
             Ok(cap)
@@ -2838,7 +2869,28 @@ fn layout_failed(s: &Shared, t0: Instant, rev: Revision, msg: String) {
 /// run that is not stable yet (another pass follows); the layout is usable, its convergence is
 /// `Converging`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn deliver_layout(
+    s: &Shared,
+    t0: Instant,
+    cap: &crate::capture::CaptureResult,
+    passes: u32,
+    aux_stable: bool,
+    spans: Vec<SnapshotSpan>,
+    rev: Revision,
+    provisional: bool,
+) {
+    let t = Instant::now();
+    deliver_layout_inner(s, t0, cap, passes, aux_stable, spans, rev, provisional);
+    log::debug!(
+        "background pass {passes}: layout delivered in {} ms ({} pages, provisional {provisional})",
+        t.elapsed().as_millis(),
+        cap.json.pages
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_layout_inner(
     s: &Shared,
     t0: Instant,
     cap: &crate::capture::CaptureResult,
