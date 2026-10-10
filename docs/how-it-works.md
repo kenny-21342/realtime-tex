@@ -77,8 +77,8 @@ it. While the document is typeset, it records, for every unit:
   broken the pages and placed the floats.
 - **The page contents**: a display list per page (see [display-list.md](display-list.md)).
 
-It also runs `biber` or `bibtex` and `makeindex` (or the program imakeidx asks for) when the
-document needs them. The pass repeats until the auxiliary files stop changing, which is what
+It also runs `biber` or `bibtex`, `makeindex` (or the program imakeidx asks for) and the
+glossaries' `makeindex` runs (what `makeglossaries` does) when the document needs them. The pass repeats until the auxiliary files stop changing, which is what
 makes cross-references and the table of contents settle. That usually takes one or two runs,
 and at most five. See [Convergence](#convergence) below.
 

@@ -255,8 +255,15 @@ pub fn load_project_files(
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
     use anyhow::Context;
     let mut files = std::collections::BTreeMap::new();
-    let main_text =
-        std::fs::read_to_string(root.join(main)).with_context(|| format!("reading {main}"))?;
+    let bytes = std::fs::read(root.join(main)).with_context(|| format!("reading {main}"))?;
+    let main_text = String::from_utf8(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "{main} is not UTF-8 (invalid byte at offset {}): rtex reads UTF-8 sources, \
+             LuaLaTeX's own input encoding. An 8-bit file (luainputenc) can be converted, e.g. \
+             `iconv -f latin1 -t utf-8`, then luainputenc dropped",
+            e.utf8_error().valid_up_to()
+        )
+    })?;
     let mut queue = input_targets(&main_text);
     files.insert(main.to_string(), main_text);
     while let Some(rel) = queue.pop() {

@@ -133,6 +133,55 @@ fn makeindex_runs_between_passes() {
 }
 
 #[test]
+fn makeglossaries_runs_between_passes() {
+    let have_glossaries = std::process::Command::new("kpsewhich")
+        .arg("glossaries.sty")
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    if !have_glossaries {
+        eprintln!("SKIP: no glossaries.sty");
+        return;
+    }
+    let main = "\\documentclass{article}\n\\usepackage[acronym]{glossaries}\n\\makeglossaries\n\
+                \\newglossaryentry{zebra}{name={zebra},description={A striped animal}}\n\
+                \\newacronym{gcd}{GCD}{greatest common divisor}\n\
+                \\begin{document}\nA \\gls{zebra} and the \\gls{gcd}.\n\
+                \\printglossaries\n\\end{document}\n";
+    let Some((s, _project, build)) = session("makeglossaries", &[("main.tex", main)]) else {
+        return;
+    };
+    match wait_converged(&s) {
+        Event::LayoutUpdate { convergence, .. } => {
+            assert!(
+                matches!(convergence, Convergence::Converged),
+                "{convergence:?}"
+            )
+        }
+        _ => unreachable!(),
+    }
+    let read = |ext: &str| -> Vec<String> {
+        ["pass-0", "pass-1", "pass-2"]
+            .iter()
+            .filter_map(|d| {
+                std::fs::read_to_string(build.join("bg").join(d).join(format!("main.{ext}"))).ok()
+            })
+            .collect()
+    };
+    // the main glossary and the acronym list, each built with the style glossaries wrote
+    assert!(
+        read("gls").iter().any(|t| t.contains("zebra")),
+        "no glossary written: {:?}",
+        read("gls")
+    );
+    assert!(
+        read("acr").iter().any(|t| t.contains("gcd")),
+        "no acronym list written: {:?}",
+        read("acr")
+    );
+}
+
+#[test]
 fn glossaries_first_use_does_not_leak_between_live_compiles() {
     // \gls sets the entry's first-use switch globally: compiled live, the first compile would
     // leave it set in the server and every later one would print the short form where the

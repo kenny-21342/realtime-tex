@@ -9,6 +9,15 @@ From kenny-21342/realtime-tex (merged with this release's work):
   dashes, clips, opacity, axial and radial shadings, transformed node text, and cached pictures
   through their stored drawing. Hosts draw them without the PDF. Checked against MuPDF
   (`scripts/gfx_compare.py`, `scripts/gfx_shading_check.py`).
+- **Tiling patterns drawn natively.** Fills with pgf's `patterns` / `patterns.meta` patterns
+  (coloured and uncoloured) name their cell (`Paint.pattern`, `NativePage.patterns`); the page
+  list carries the declarations (`patterns`, binary PATTERN record), cached pictures included.
+- **Glossaries built between passes.** `\makeglossaries` lists (glossary, acronyms, custom
+  glossaries) are built as makeglossaries builds them (makeindex with glossaries' style;
+  makeglossaries-lite for xindy styles), and a changed list brings another pass.
+- **`\input` files that do not exist yet** (or are not UTF-8) are no longer compiled as empty
+  files: TeX reports a missing file, and one created later is read. A main file that is not
+  UTF-8 is refused with a message that says so.
 - **Landscape pages are reported turned** (`rotate`, binary ROTATE record) instead of being
   degraded; rows inside a rotated box are flagged `transformed_rows`.
 - **Colour stacks across pages.** A page starting inside a colour group records the stacks it

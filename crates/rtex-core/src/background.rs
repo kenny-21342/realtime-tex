@@ -225,6 +225,14 @@ fn aux_signature(out_dir: &Path, jobname: &str) -> u64 {
             without_dir(&b, &forms).hash(&mut h);
         }
     }
+    // the glossaries' lists, as makeindex left them
+    let aux = std::fs::read_to_string(out_dir.join(format!("{jobname}.aux"))).unwrap_or_default();
+    for g in glossaries(&aux).lists {
+        if let Ok(b) = std::fs::read(out_dir.join(format!("{jobname}.{}", g.out))) {
+            g.out.hash(&mut h);
+            without_dir(&b, &forms).hash(&mut h);
+        }
+    }
     for ext in ["aux", "toc", "lof", "lot", "out", "bcf", "bbl", "idx"] {
         if let Ok(b) = std::fs::read(out_dir.join(format!("{jobname}.{ext}"))) {
             let b = without_dir(&b, &forms);
@@ -451,6 +459,7 @@ pub fn run_pass_with_runner(
             bib_ran = true;
         }
         run_makeindex(tl, snapshot_dir, out_dir, &jobname, &mut indexed);
+        run_makeglossaries(tl, out_dir, &jobname, &mut indexed);
         let sig_after = aux_signature(out_dir, &jobname);
         // a bibliography run that changed nothing (same .bbl) needs no extra pass: the .bbl is
         // part of the signature
@@ -472,6 +481,134 @@ pub fn run_pass_with_runner(
         bib_ran,
         aux_stable: stable,
     })
+}
+
+/// A glossary list `\makeglossaries` declares in the `.aux` (`\@newglossary{name}{log}{out}{in}`:
+/// file extensions).
+#[derive(Debug, Clone, PartialEq)]
+struct GlossaryList {
+    log: String,
+    out: String,
+    input: String,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Glossaries {
+    lists: Vec<GlossaryList>,
+    /// `\@istfilename`: the makeindex (`.ist`) or xindy (`.xdy`) style glossaries wrote.
+    style: Option<String>,
+    /// `\@glsorder{letter}`: letter ordering (makeindex `-l`).
+    letter: bool,
+}
+
+/// What the glossaries package wrote into the `.aux` for makeglossaries.
+fn glossaries(aux: &str) -> Glossaries {
+    let mut g = Glossaries::default();
+    let groups = |at: usize, n: usize| -> Option<Vec<String>> {
+        let mut out = Vec::with_capacity(n);
+        let mut i = at;
+        for _ in 0..n {
+            let (v, next) = brace_group(aux, i)?;
+            out.push(v);
+            i = next;
+        }
+        Some(out)
+    };
+    for (i, _) in aux.match_indices("\\@newglossary") {
+        if let Some(v) = groups(i + "\\@newglossary".len(), 4) {
+            g.lists.push(GlossaryList {
+                log: v[1].clone(),
+                out: v[2].clone(),
+                input: v[3].clone(),
+            });
+        }
+    }
+    // the first with an argument (`\providecommand\@istfilename[1]{}` comes before it)
+    let first = |cs: &str| {
+        aux.match_indices(cs)
+            .find_map(|(i, _)| groups(i + cs.len(), 1))
+            .map(|v| v[0].clone())
+    };
+    g.style = first("\\@istfilename");
+    g.letter = first("\\@glsorder").is_some_and(|v| v == "letter");
+    g
+}
+
+/// Build the glossaries' lists (`glossaries`, `\makeglossaries`), as makeglossaries would:
+/// makeindex with the `.ist` the package wrote for each list whose entries changed since they
+/// were last built (`indexed`, by input file) or whose output is missing; a xindy style goes
+/// through makeglossaries-lite. The outputs are part of the aux signature, so a changed list
+/// brings another pass.
+fn run_makeglossaries(
+    tl: &TexLive,
+    out_dir: &Path,
+    jobname: &str,
+    indexed: &mut BTreeMap<String, u64>,
+) {
+    use std::hash::{Hash, Hasher};
+    let Ok(aux) = std::fs::read_to_string(out_dir.join(format!("{jobname}.aux"))) else {
+        return;
+    };
+    let g = glossaries(&aux);
+    let Some(style) = g.style.clone() else {
+        return;
+    };
+    let mut stale = Vec::new();
+    for l in &g.lists {
+        let input = format!("{jobname}.{}", l.input);
+        let Ok(bytes) = std::fs::read(out_dir.join(&input)) else {
+            continue;
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        let hash = h.finish();
+        let out = out_dir.join(format!("{jobname}.{}", l.out));
+        if indexed.get(&input) != Some(&hash) || !out.exists() {
+            stale.push((l, input, hash));
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+    let run = |program: &str, args: Vec<String>| {
+        let mut cmd = Command::new(program);
+        cmd.current_dir(out_dir).args(&args);
+        if let Some(d) = &tl.bin_dir {
+            crate::paths::prepend_bin_dir(&mut cmd, d);
+        }
+        match cmd.output() {
+            Ok(out) if !out.status.success() => log::warn!(
+                "{program} {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => log::warn!("running {program}: {e}"),
+            _ => {}
+        }
+    };
+    if style.ends_with(".xdy") {
+        run("makeglossaries-lite", vec![jobname.to_string()]);
+    } else {
+        for (l, input, _) in &stale {
+            let mut args = vec!["-q".to_string()];
+            if g.letter {
+                args.push("-l".into());
+            }
+            args.extend([
+                "-s".into(),
+                style.clone(),
+                "-t".into(),
+                format!("{jobname}.{}", l.log),
+                "-o".into(),
+                format!("{jobname}.{}", l.out),
+                input.clone(),
+            ]);
+            run("makeindex", args);
+        }
+    }
+    for (_, input, hash) in stale {
+        indexed.insert(input, hash);
+    }
 }
 
 /// Index programs a document may ask for (imakeidx `program=`); anything else runs makeindex.
@@ -905,6 +1042,24 @@ mod tests {
         assert!(!dir.join("snap/main.aux").exists());
         // a second snapshot (files already present) is fine too
         write_snapshot(&project, &files, &dir.join("snap")).unwrap();
+    }
+
+    #[test]
+    fn glossaries_read_from_the_aux() {
+        let aux = "\\relax\n\\providecommand\\@newglossary[4]{}\n\\@newglossary{main}{glg}{gls}{glo}\n\\@newglossary{acronym}{alg}{acr}{acn}\n\\providecommand\\@glsorder[1]{}\n\\providecommand\\@istfilename[1]{}\n\\@istfilename{main.ist}\n\\@glsorder{letter}\n";
+        let g = glossaries(aux);
+        assert_eq!(g.lists.len(), 2);
+        assert_eq!(
+            g.lists[1],
+            GlossaryList {
+                log: "alg".into(),
+                out: "acr".into(),
+                input: "acn".into()
+            }
+        );
+        assert_eq!(g.style.as_deref(), Some("main.ist"));
+        assert!(g.letter);
+        assert_eq!(glossaries("\\relax\n"), Glossaries::default());
     }
 
     #[test]

@@ -992,3 +992,81 @@ fn a_reopened_session_starts_from_its_last_layout() {
     assert!(!provisional, "a layout of other sources was shown");
     s.close();
 }
+
+/// A file the document starts to `\input` before it exists used to be remembered as an empty
+/// buffer, and every later pass compiled that empty text from the snapshot: TeX never reported
+/// the file missing, and once created on disk it never showed up.
+#[test]
+fn an_input_created_after_it_is_named_is_read() {
+    let main = "\\documentclass{article}\n\\begin{document}\nFirst.\n\\end{document}\n";
+    let Some(s) = open("late-input", main) else {
+        return;
+    };
+    let project = std::env::temp_dir()
+        .join(format!("rtex-regr-{}-late-input", std::process::id()))
+        .join("project");
+    final_layout(&s, 120, Duration::from_millis(200));
+    let at = main.find("First.").unwrap() + "First.".len();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "\n\\input{later}\n".into(),
+        },
+    )
+    .unwrap();
+    let (_, _, errors, _) = final_layout(&s, 120, Duration::from_millis(200));
+    assert!(
+        errors.iter().any(|e| e.contains("later")),
+        "the missing file is not reported: {errors:?}"
+    );
+    std::fs::write(project.join("later.tex"), "Written later.\n").unwrap();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: " Again.".into(),
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut text = String::new();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no layout with the new file: {text}"
+        );
+        let mut done = false;
+        for e in s.poll(Duration::from_millis(100)) {
+            if let Event::LayoutUpdate {
+                pages_changed,
+                convergence,
+                ..
+            } = e
+            {
+                for p in pages_changed.iter().filter(|p| p.page == 1) {
+                    text =
+                        p.dl.lines
+                            .iter()
+                            .flat_map(|l| l.items.iter())
+                            .filter_map(|i| match i {
+                                rtex_dl::Item::Glyph { char, .. } => char::from_u32(*char as u32),
+                                _ => None,
+                            })
+                            .collect();
+                }
+                done |= !matches!(&convergence, Convergence::Converging { .. });
+            }
+        }
+        if done && text.contains("Again") {
+            break;
+        }
+    }
+    assert!(
+        text.contains("Writtenlater"),
+        "the file's text is not on the page: {text}"
+    );
+    s.close();
+}

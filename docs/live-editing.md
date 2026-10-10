@@ -87,14 +87,18 @@ the document. A 10-line paragraph takes about 2 ms, a one-liner a third of a mil
 - **A LaTeX kernel from 2021 or later.** rtex uses the kernel's paragraph and shipout hooks.
 - **Bibliographies and indexes:** `biber`, `bibtex` and `makeindex` run automatically when the
   document needs them. With imakeidx, the `program=` and `options=` you give are used, and
-  `.ist` files in the project are found. `xindy` and `makeglossaries` are not run automatically.
-  glossaries' `\printnoidxglossaries` needs no external tool and works.
+  `.ist` files in the project are found. With glossaries' `\makeglossaries`, every list the
+  document declares (the main glossary, acronyms, your own `\newglossary`) is built the way
+  `makeglossaries` builds it: makeindex with the style glossaries writes, or
+  `makeglossaries-lite` for a xindy style. `\printnoidxglossaries` needs no external tool.
 - **Multi-file projects:** files reached through `\input`, `\include` and `\subfile` are
   followed. A file name built from a macro (`\input{\chapterdir/x}`), `\includeonly` and
   `\import` are not followed.
 - **Platforms:** Linux, macOS and Windows.
-- **UTF-8 sources.** A project with a file that is not UTF-8 (Latin-1 bytes) does not open; the
-  error names the file.
+- **UTF-8 sources.** A main file that is not UTF-8 (Latin-1 bytes, `luainputenc`) does not open;
+  the error names the file and the first bad byte. Convert it (`iconv -f latin1 -t utf-8`) and
+  drop luainputenc. An `\input` file that is not UTF-8 is compiled from disk as it is, as
+  lualatex reads it, but is not edited live.
 
 ## Rendering
 

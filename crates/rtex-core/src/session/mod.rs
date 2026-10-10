@@ -1000,12 +1000,9 @@ impl Session {
                 }
                 let Ok(text) = std::fs::read_to_string(self.shared.cfg.project_root.join(&rel))
                 else {
-                    // missing on disk: remember it as empty so we do not retry on every edit;
-                    // the compiler reports it
-                    files.insert(
-                        rel,
-                        FileBuf::with_block_envs("", &mut self.shared.ids.lock(), 1, envs.clone()),
-                    );
+                    // missing on disk (or not UTF-8): not tracked, as when the session opened.
+                    // A pass's snapshot copies what is on disk, so TeX reports a missing file
+                    // and reads one created later; the next edit retries it.
                     continue;
                 };
                 let rev = self.shared.source_revision.load(Ordering::SeqCst);
