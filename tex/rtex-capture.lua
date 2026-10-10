@@ -373,18 +373,33 @@ function C.post_linebreak(head, groupcode)
   return true
 end
 
-C.images = {}
--- `cache`: the name of luatex.def's macro for this file and attributes, `\useimageresource <n>`
--- (n is the image's index whether it was saved now or by an earlier inclusion).
-function C.image(index, file, page, pages, cache)
+-- The image a graphicx inclusion placed: `boxnum` holds luatex.def's cached \useimageresource
+-- (see rtex-capture.sty); its rule's index is the IMAGE items' index. `last`/`lastpages`:
+-- \lastsavedimageresource{index,pages}, which describe this image only if it was saved just now
+-- (the cached macro names the same resource number).
+local IMAGE_RULE = (function()
+  for k, v in pairs(node.subtypes("rule")) do if v == "image" then return k end end
+end)()
+local function image_index(last, lastpages, cache, boxnum)
   local ok, body = pcall(token.get_macro, cache or "")
-  local cached = ok and body and tonumber(tostring(body):match("(%d+)%s*$"))
-  if cached and cached ~= index then
-    -- an image saved earlier: \lastsavedimageresource* describe another one
-    local known = C.images[tostring(cached)]
-    index, pages = cached, known and known.pages or nil
+  local resource = ok and body and tonumber(tostring(body):match("(%d+)%s*$"))
+  local idx
+  local b = boxnum and tex.box[boxnum]
+  if b then
+    for n in node.traverse(b.head) do
+      if n.id == node.id("rule") and n.subtype == IMAGE_RULE then idx = n.index end
+    end
   end
-  C.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1, pages = pages }
+  local fresh = resource == nil or resource == last
+  return idx or resource or last, fresh and lastpages or nil
+end
+
+C.images = {}
+function C.image(last, file, page, lastpages, cache, boxnum)
+  local index, pages = image_index(last, lastpages, cache, boxnum)
+  local known = C.images[tostring(index)]
+  C.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1,
+                                pages = pages or (known and known.pages) or nil }
 end
 
 -- Rows of a paragraph unit that come from a deeper paragraph (nest >= 2) reached through

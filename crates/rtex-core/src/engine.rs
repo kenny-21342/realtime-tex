@@ -205,7 +205,7 @@ impl FastServer {
                     "\\input{{rtex-serve-patches}}\n",
                     "\\directlua{{rtex_serve = dofile(kpse.find_file(\"rtex-serve.lua\", \"lua\") or \"rtex-serve.lua\") rtex_serve.init(\\number\\rtexbox, \\rtexcountnum, \\number\\rtexcct)}}\n",
                     // image resource index -> file mapping for IMAGE display-list items
-                    "\\makeatletter\\IfPackageLoadedTF{{graphicx}}{{\\AddToHook{{cmd/Gin@setfile/after}}{{\\directlua{{rtex_serve.image(\\number\\lastsavedimageresourceindex,\"\\luaescapestring{{\\Gin@base\\Gin@ext}}\",\"\\luaescapestring{{\\Gin@page}}\",\\number\\lastsavedimageresourcepages,\"\\luaescapestring{{\\Gin@base\\Gin@ext\\space image\\ifdefined\\Gin@attr@hash\\Gin@attr@hash\\fi}}\")}}}}}}{{}}\\makeatother\n",
+                    "\\makeatletter\\newbox\\rtex@imgbox\\IfPackageLoadedTF{{graphicx}}{{\\AddToHook{{cmd/Gin@setfile/after}}{{\\setbox\\rtex@imgbox\\hbox{{\\csname\\Gin@base\\Gin@ext\\space image\\ifdefined\\Gin@attr@hash\\Gin@attr@hash\\fi\\endcsname}}\\directlua{{rtex_serve.image(\\number\\lastsavedimageresourceindex,\"\\luaescapestring{{\\Gin@base\\Gin@ext}}\",\"\\luaescapestring{{\\Gin@page}}\",\\number\\lastsavedimageresourcepages,\"\\luaescapestring{{\\Gin@base\\Gin@ext\\space image\\ifdefined\\Gin@attr@hash\\Gin@attr@hash\\fi}}\",\\number\\rtex@imgbox)}}}}}}{{}}\\makeatother\n",
                     "\\loop\\rtexstep\\ifnum\\rtexcontinue>0 \\repeat\n\\end{{document}}\n"
                 ),
                 preamble_file.display()

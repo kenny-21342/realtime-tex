@@ -355,18 +355,34 @@ function S.begin_compile(req_id, ctx_id, source, pics)
   S.current.t_printed = gettime()
 end
 
--- graphicx hook (driver): image resource index -> file. `cache`: the name of luatex.def's macro
--- for this file, `\useimageresource <n>`: a repeated image is not saved again, so
--- \lastsavedimageresourceindex names another one (rtex-capture.lua, C.image)
-S.images = {}
-function S.image(index, file, page, pages, cache)
+-- graphicx hook (driver): image index -> file, as in rtex-capture.lua (C.image): the index of
+-- the image rule luatex.def's cached \useimageresource puts in a scratch box
+-- The image a graphicx inclusion placed: `boxnum` holds luatex.def's cached \useimageresource
+-- (see rtex-capture.sty); its rule's index is the IMAGE items' index. `last`/`lastpages`:
+-- \lastsavedimageresource{index,pages}, which describe this image only if it was saved just now
+-- (the cached macro names the same resource number).
+local IMAGE_RULE = (function()
+  for k, v in pairs(node.subtypes("rule")) do if v == "image" then return k end end
+end)()
+local function image_index(last, lastpages, cache, boxnum)
   local ok, body = pcall(token.get_macro, cache or "")
-  local cached = ok and body and tonumber(tostring(body):match("(%d+)%s*$"))
-  if cached and cached ~= index then
-    local known = S.images[tostring(cached)]
-    index, pages = cached, known and known.pages or nil
+  local resource = ok and body and tonumber(tostring(body):match("(%d+)%s*$"))
+  local idx
+  local b = boxnum and tex.box[boxnum]
+  if b then
+    for n in node.traverse(b.head) do
+      if n.id == node.id("rule") and n.subtype == IMAGE_RULE then idx = n.index end
+    end
   end
-  S.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1, pages = pages }
+  local fresh = resource == nil or resource == last
+  return idx or resource or last, fresh and lastpages or nil
+end
+S.images = {}
+function S.image(last, file, page, lastpages, cache, boxnum)
+  local index, pages = image_index(last, lastpages, cache, boxnum)
+  local known = S.images[tostring(index)]
+  S.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1,
+                                pages = pages or (known and known.pages) or nil }
   S.images_used = true
 end
 

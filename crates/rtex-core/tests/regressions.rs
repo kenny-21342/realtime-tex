@@ -269,11 +269,13 @@ fn shipout_background_material_degrades_the_page() {
 /// A repeated `\includegraphics` reuses the image luatex.def saved the first time and saves
 /// nothing, so `\lastsavedimageresourceindex` names the last image saved, another file: its
 /// index was recorded as that file (or not at all), and hosts had no source, or the wrong one,
-/// for it (stress-test document: an image included 16 times).
+/// for it (stress-test document: an image included 16 times). And that number counts box
+/// resources too (TikZ saves its shadings as box resources at load), while IMAGE items carry the
+/// image's own index: with TikZ loaded no image of a page had a source.
 #[test]
 fn repeated_images_keep_their_files() {
     const PNG: &[u8] = TINY_PNG;
-    let doc = "\\documentclass{article}\n\\usepackage{graphicx}\n\\begin{document}\n\\includegraphics[width=1cm]{a.png}\n\\includegraphics[width=1cm]{b.png}\n\\includegraphics[width=1cm]{a.png}\n\\end{document}\n";
+    let doc = "\\documentclass{article}\n\\usepackage{graphicx,tikz}\n\\begin{document}\n\\includegraphics[width=1cm]{a.png}\n\\includegraphics[width=1cm]{b.png}\n\\includegraphics[width=1cm]{a.png}\n\\end{document}\n";
     if TexLive::discover().is_err() {
         return;
     }
@@ -324,7 +326,7 @@ const TINY_PNG: &[u8] = &[
 /// wrong files (same cause as `repeated_images_keep_their_files`).
 #[test]
 fn live_results_name_reused_images() {
-    let doc = "\\documentclass{article}\n\\usepackage{graphicx}\n\\begin{document}\nTwo images \\includegraphics[width=1cm]{a.png} and \\includegraphics[width=1cm]{b.png} in a paragraph.\n\nAnother paragraph.\n\\end{document}\n";
+    let doc = "\\documentclass{article}\n\\usepackage{graphicx,tikz}\n\\begin{document}\nTwo images \\includegraphics[width=1cm]{a.png} and \\includegraphics[width=1cm]{b.png} in a paragraph.\n\nAnother paragraph.\n\\end{document}\n";
     if TexLive::discover().is_err() {
         return;
     }

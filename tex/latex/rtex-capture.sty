@@ -84,12 +84,18 @@
 \AddToHook{begindocument/before}{\rtex@hookpgfshadings}
 % Map image resource indices to files so IMAGE display-list items can name their source.
 % luatex.def saves an image once and reuses it through \csname <file> image<attributes>\endcsname
-% (\useimageresource <index>): a repeated image saves nothing, so its index is read from there,
-% not from \lastsavedimageresourceindex (the last image saved, another file).
+% (\useimageresource <n>). Two numberings meet here: <n> and \lastsavedimageresourceindex count
+% every saved resource (box resources too: pgf's shadings), the image rule an IMAGE item comes
+% from carries the image's own index. The cached macro is set in a scratch box and the rule's
+% index read from it: right for repeated images and after box resources.
+\newbox\rtex@imgbox
 \AddToHook{package/graphicx/after}{%
   \AddToHook{cmd/Gin@setfile/after}{%
+    \setbox\rtex@imgbox\hbox{\csname\Gin@base\Gin@ext\space image%
+      \ifdefined\Gin@attr@hash\Gin@attr@hash\fi\endcsname}%
     \directlua{rtex_capture.image(\number\lastsavedimageresourceindex,
       "\luaescapestring{\Gin@base\Gin@ext}", "\luaescapestring{\Gin@page}",
       \number\lastsavedimageresourcepages,
-      "\luaescapestring{\Gin@base\Gin@ext\space image\ifdefined\Gin@attr@hash\Gin@attr@hash\fi}")}}}
+      "\luaescapestring{\Gin@base\Gin@ext\space image\ifdefined\Gin@attr@hash\Gin@attr@hash\fi}",
+      \number\rtex@imgbox)}}}
 \endinput
