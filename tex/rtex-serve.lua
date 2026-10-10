@@ -355,9 +355,17 @@ function S.begin_compile(req_id, ctx_id, source, pics)
   S.current.t_printed = gettime()
 end
 
--- graphicx hook (driver): image resource index -> file
+-- graphicx hook (driver): image resource index -> file. `cache`: the name of luatex.def's macro
+-- for this file, `\useimageresource <n>`: a repeated image is not saved again, so
+-- \lastsavedimageresourceindex names another one (rtex-capture.lua, C.image)
 S.images = {}
-function S.image(index, file, page, pages)
+function S.image(index, file, page, pages, cache)
+  local ok, body = pcall(token.get_macro, cache or "")
+  local cached = ok and body and tonumber(tostring(body):match("(%d+)%s*$"))
+  if cached and cached ~= index then
+    local known = S.images[tostring(cached)]
+    index, pages = cached, known and known.pages or nil
+  end
   S.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1, pages = pages }
   S.images_used = true
 end

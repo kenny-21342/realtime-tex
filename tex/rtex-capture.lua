@@ -374,7 +374,16 @@ function C.post_linebreak(head, groupcode)
 end
 
 C.images = {}
-function C.image(index, file, page, pages)
+-- `cache`: the name of luatex.def's macro for this file and attributes, `\useimageresource <n>`
+-- (n is the image's index whether it was saved now or by an earlier inclusion).
+function C.image(index, file, page, pages, cache)
+  local ok, body = pcall(token.get_macro, cache or "")
+  local cached = ok and body and tonumber(tostring(body):match("(%d+)%s*$"))
+  if cached and cached ~= index then
+    -- an image saved earlier: \lastsavedimageresource* describe another one
+    local known = C.images[tostring(cached)]
+    index, pages = cached, known and known.pages or nil
+  end
   C.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1, pages = pages }
 end
 

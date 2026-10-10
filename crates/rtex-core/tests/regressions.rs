@@ -265,3 +265,109 @@ fn shipout_background_material_degrades_the_page() {
     assert_eq!(pages.into_iter().collect::<Vec<_>>(), vec![(1, (true, false)), (2, (false, true))]);
     s.close();
 }
+
+/// A repeated `\includegraphics` reuses the image luatex.def saved the first time and saves
+/// nothing, so `\lastsavedimageresourceindex` names the last image saved, another file: its
+/// index was recorded as that file (or not at all), and hosts had no source, or the wrong one,
+/// for it (stress-test document: an image included 16 times).
+#[test]
+fn repeated_images_keep_their_files() {
+    const PNG: &[u8] = TINY_PNG;
+    let doc = "\\documentclass{article}\n\\usepackage{graphicx}\n\\begin{document}\n\\includegraphics[width=1cm]{a.png}\n\\includegraphics[width=1cm]{b.png}\n\\includegraphics[width=1cm]{a.png}\n\\end{document}\n";
+    if TexLive::discover().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-regr-{}-images", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("main.tex"), doc).unwrap();
+    std::fs::write(project.join("a.png"), PNG).unwrap();
+    std::fs::write(project.join("b.png"), PNG).unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    let s = Session::open(cfg).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut files = vec![];
+    while files.is_empty() {
+        assert!(Instant::now() < deadline, "no converged layout");
+        for e in s.poll(Duration::from_millis(100)) {
+            if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
+                if matches!(convergence, Convergence::Converged) {
+                    for p in pages_changed {
+                        let items = p.dl.other.iter().chain(p.dl.lines.iter().flat_map(|l| l.items.iter()));
+                        for it in items {
+                            if let rtex_dl::Item::Image { index, .. } = it {
+                                files.push(p.dl.images.get(&index.to_string()).map(|i| i.file.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let f = |n: &str| Some(n.to_string());
+    assert_eq!(files, vec![f("a.png"), f("b.png"), f("a.png")]);
+    s.close();
+}
+
+/// A 1x1 PNG.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+    0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18,
+    0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// The live server keeps the images it saved: from the second compile of a paragraph on, its
+/// images are reused and `\lastsavedimageresourceindex` names another one; the result named the
+/// wrong files (same cause as `repeated_images_keep_their_files`).
+#[test]
+fn live_results_name_reused_images() {
+    let doc = "\\documentclass{article}\n\\usepackage{graphicx}\n\\begin{document}\nTwo images \\includegraphics[width=1cm]{a.png} and \\includegraphics[width=1cm]{b.png} in a paragraph.\n\nAnother paragraph.\n\\end{document}\n";
+    if TexLive::discover().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-regr-{}-live-images", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("main.tex"), doc).unwrap();
+    std::fs::write(project.join("a.png"), TINY_PNG).unwrap();
+    std::fs::write(project.join("b.png"), TINY_PNG).unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    let s = Session::open(cfg).unwrap();
+    let mut o = rtex_core::replay::Observer::new();
+    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    let mut files = vec![];
+    // a word, then the two images swapped: the second compile reuses both, b.png first
+    for step in 0..2 {
+        let text = s.document_text("main.tex").unwrap();
+        let edit = if step == 0 {
+            let at = text.find("images").unwrap();
+            rtex_core::Edit { start_byte: at, end_byte: at, text: "new ".into() }
+        } else {
+            let (a, b) = (text.find("{a.png}").unwrap(), text.find("{b.png}").unwrap());
+            rtex_core::Edit { start_byte: a, end_byte: b + 7, text: "{b.png} and \\includegraphics[width=1cm]{a.png}".into() }
+        };
+        let r = s.apply_edit("main.tex", edit).unwrap();
+        assert_eq!(r.routed, "fast", "{:?}", r.reasons);
+        let eid = r.edit_id;
+        assert!(o.pump(&s, Duration::from_secs(20), |o| o.updates.keys().any(|(e, _)| *e == eid)), "no fast result");
+        let sv = o.updates.iter().find(|((e, _), _)| *e == eid).map(|(_, v)| v.clone()).unwrap();
+        files = sv
+            .dl
+            .lines
+            .iter()
+            .flat_map(|l| l.items.iter())
+            .filter_map(|it| match it {
+                rtex_dl::Item::Image { index, .. } => Some(sv.dl.images.get(&index.to_string()).map(|i| i.file.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+    }
+    let f = |n: &str| Some(n.to_string());
+    assert_eq!(files, vec![f("b.png"), f("a.png")], "the second compile's images");
+    s.close();
+}
