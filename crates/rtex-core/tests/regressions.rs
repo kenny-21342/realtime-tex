@@ -202,3 +202,36 @@ fn landscape_pages_say_they_are_rotated() {
     );
     s.close();
 }
+
+/// `\paragraph` runs into its text: heading and text, over several source lines, are one TeX
+/// paragraph, and the capture gives all its rows to the heading's unit. The heading's span used
+/// to end with its line, so an edit there was served as a one-row fragment (stress-test
+/// document, `\paragraph{Depth 4.}`).
+#[test]
+fn runin_heading_is_served_with_its_text() {
+    let doc = "\\documentclass{article}\n\\begin{document}\nSome text before the heading.\n\n\\paragraph{Run-in heading.} This paragraph starts on the heading's line and continues\nover several source lines, so that heading and text are set as one paragraph with more\nthan one row in the output, which the fast path must reproduce exactly.\n\nClosing paragraph.\n\\end{document}\n";
+    let Some(s) = open("runin", doc) else {
+        return;
+    };
+    let mut o = rtex_core::replay::Observer::new();
+    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    let at = doc.find("starts on").unwrap();
+    let r = s
+        .apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "quickly ".into() })
+        .unwrap();
+    assert_eq!(r.routed, "fast", "{:?}", r.reasons);
+    let eid = r.edit_id;
+    assert!(o.pump(&s, Duration::from_secs(20), |o| o.updates.keys().any(|(e, _)| *e == eid)), "no fast result");
+    assert!(o.settle(&s, r.source_revision, Duration::from_secs(120)), "no settled layout");
+    let served: Vec<_> = o.updates.iter().filter(|((e, _), _)| *e == eid).map(|(_, v)| v.clone()).collect();
+    for sv in &served {
+        let j = o.judge(sv);
+        assert!(
+            matches!(j.verdict, rtex_core::replay::Verdict::Match | rtex_core::replay::Verdict::DeclinedStatus),
+            "{:?}: {:?}",
+            j.verdict,
+            j.details
+        );
+    }
+    s.close();
+}

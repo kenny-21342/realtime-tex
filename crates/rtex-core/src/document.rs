@@ -93,6 +93,11 @@ const HEADING_CMDS: &[&str] = &[
     "\\tableofcontents",
 ];
 
+/// Headings the standard classes set run-in (`\@startsection` with a negative after-skip): the
+/// heading and the text after it, on its line and the following ones, are one TeX paragraph,
+/// and the capture gives all its rows to the heading's unit.
+const RUNIN_HEADING_CMDS: &[&str] = &["\\paragraph", "\\subparagraph"];
+
 fn brace_balance(line: &str) -> i32 {
     let b = line.as_bytes();
     let mut bal = 0;
@@ -437,6 +442,8 @@ fn segment_body(
     // after a block environment closed (the capture closes the unit at those points)
     let mut split_pending = false;
     let mut heading_balance: i32 = 0;
+    // the current heading is run-in: its span continues like a paragraph's
+    let mut runin = false;
     for (lstart, line) in &lines {
         let trimmed = line.trim();
         let stripped = strip_comment(trimmed);
@@ -453,6 +460,9 @@ fn segment_body(
             Vec::new()
         };
         let heading = HEADING_CMDS.iter().any(|h| stripped.starts_with(h));
+        let runin_heading = RUNIN_HEADING_CMDS
+            .iter()
+            .any(|h| stripped.strip_prefix(h).is_some_and(|r| !r.starts_with(|c: char| c.is_ascii_alphabetic())));
         // a picture environment opened while a paragraph is open (text before it in this span
         // or on its line) is an inline box of that paragraph, as the capture sees it (no unit
         // of its own); the same rule as eligibility.rs (content_start before the \begin)
@@ -488,9 +498,12 @@ fn segment_body(
                 } else {
                     SpanKind::Body
                 };
+                runin = runin_heading;
                 heading_balance = 0;
                 split_pending = false;
-            } else if (heading && cur_kind == SpanKind::Body) || split_pending {
+            } else if (heading && (cur_kind == SpanKind::Body || (cur_kind == SpanKind::Heading && runin)))
+                || split_pending
+            {
                 // a heading command starts a new unit even without a blank line, and a unit ends
                 // after a heading or a block environment
                 flush(out, cur_start.unwrap(), *lstart, cur_kind);
@@ -500,6 +513,7 @@ fn segment_body(
                 } else {
                     SpanKind::Body
                 };
+                runin = runin_heading;
                 heading_balance = 0;
                 split_pending = false;
             }
@@ -509,7 +523,7 @@ fn segment_body(
             {
                 cur_kind = SpanKind::Env;
             }
-            if cur_kind == SpanKind::Heading {
+            if cur_kind == SpanKind::Heading && !runin {
                 heading_balance += brace_balance(stripped);
                 if heading_balance <= 0 && begins.is_empty() {
                     split_pending = true;
@@ -1109,6 +1123,24 @@ mod tests {
             )
         );
         assert_eq!(fb.spans.len(), 7);
+    }
+
+    #[test]
+    fn runin_headings_keep_their_text() {
+        // \paragraph and \subparagraph run into their text: heading and text are one paragraph
+        // (the capture's unit), up to a blank line or the next heading
+        let doc = "\\documentclass{article}\n\\begin{document}\n\\paragraph{Run-in.} Text that\ncontinues here.\n\\subparagraph{Next.} More.\n\n\\section{Display}\nBody text.\n\\end{document}\n";
+        let mut ids = IdAllocator(0);
+        let fb = FileBuf::new(doc, &mut ids, 1);
+        let texts: Vec<(&str, SpanKind)> = fb
+            .spans
+            .iter()
+            .map(|s| (fb.text[s.range.clone()].trim_end(), s.kind))
+            .collect();
+        assert_eq!(texts[1], ("\\paragraph{Run-in.} Text that\ncontinues here.", SpanKind::Heading));
+        assert_eq!(texts[2], ("\\subparagraph{Next.} More.", SpanKind::Heading));
+        assert_eq!(texts[3], ("\\section{Display}", SpanKind::Heading));
+        assert_eq!(texts[4], ("Body text.", SpanKind::Body));
     }
 
     #[test]
