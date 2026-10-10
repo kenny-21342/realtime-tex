@@ -10,7 +10,9 @@
 \AddToHook{begindocument/end}{\directlua{rtex_capture.begin_document()}}
 \AddToHook{para/begin}{\directlua{rtex_capture.parbegin()}}
 \AddToHook{para/after}{\directlua{rtex_capture.parafter()}}
-\AddToHook{shipout/before}{\directlua{rtex_capture.shipout(\number\ShipoutBox)}}
+% the page attributes in force at shipout (pdflscape's /Rotate 90 is set there)
+\AddToHook{shipout/before}{\directlua{rtex_capture.shipout(\number\ShipoutBox,
+  "\luaescapestring{\the\pdfvariable pageattr}")}}
 \AddToHook{cmd/@outputpage/before}{\directlua{rtex_capture.output_begin()}}
 \AddToHook{cmd/@outputpage/after}{\directlua{rtex_capture.output_end()}}
 \AddToHook{cmd/@afterheading/before}{\directlua{rtex_capture.afterheading()}}
@@ -81,9 +83,19 @@
 \AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfshadings}
 \AddToHook{begindocument/before}{\rtex@hookpgfshadings}
 % Map image resource indices to files so IMAGE display-list items can name their source.
+% luatex.def saves an image once and reuses it through \csname <file> image<attributes>\endcsname
+% (\useimageresource <n>). Two numberings meet here: <n> and \lastsavedimageresourceindex count
+% every saved resource (box resources too: pgf's shadings), the image rule an IMAGE item comes
+% from carries the image's own index. The cached macro is set in a scratch box and the rule's
+% index read from it: right for repeated images and after box resources.
+\newbox\rtex@imgbox
 \AddToHook{package/graphicx/after}{%
   \AddToHook{cmd/Gin@setfile/after}{%
+    \setbox\rtex@imgbox\hbox{\csname\Gin@base\Gin@ext\space image%
+      \ifdefined\Gin@attr@hash\Gin@attr@hash\fi\endcsname}%
     \directlua{rtex_capture.image(\number\lastsavedimageresourceindex,
       "\luaescapestring{\Gin@base\Gin@ext}", "\luaescapestring{\Gin@page}",
-      \number\lastsavedimageresourcepages)}}}
+      \number\lastsavedimageresourcepages,
+      "\luaescapestring{\Gin@base\Gin@ext\space image\ifdefined\Gin@attr@hash\Gin@attr@hash\fi}",
+      \number\rtex@imgbox)}}}
 \endinput

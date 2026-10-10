@@ -137,6 +137,7 @@ function C.setup(opts)
   C.attr_unit = luatexbase.new_attribute("rtex_unit")
   luatexbase.add_to_callback("pre_linebreak_filter", C.pre_linebreak, "rtex-capture")
   luatexbase.add_to_callback("post_linebreak_filter", C.post_linebreak, "rtex-capture")
+  luatexbase.add_to_callback("pre_shipout_filter", C.pre_shipout, "rtex-capture")
   local extra = os.getenv("RTEX_UNIT_ENVS") or ""
   for name in extra:gmatch("[^,%s]+") do C.BLOCK_ENVS[#C.BLOCK_ENVS + 1] = name end
 end
@@ -372,9 +373,33 @@ function C.post_linebreak(head, groupcode)
   return true
 end
 
+-- The image a graphicx inclusion placed: `boxnum` holds luatex.def's cached \useimageresource
+-- (see rtex-capture.sty); its rule's index is the IMAGE items' index. `last`/`lastpages`:
+-- \lastsavedimageresource{index,pages}, which describe this image only if it was saved just now
+-- (the cached macro names the same resource number).
+local IMAGE_RULE = (function()
+  for k, v in pairs(node.subtypes("rule")) do if v == "image" then return k end end
+end)()
+local function image_index(last, lastpages, cache, boxnum)
+  local ok, body = pcall(token.get_macro, cache or "")
+  local resource = ok and body and tonumber(tostring(body):match("(%d+)%s*$"))
+  local idx
+  local b = boxnum and tex.box[boxnum]
+  if b then
+    for n in node.traverse(b.head) do
+      if n.id == node.id("rule") and n.subtype == IMAGE_RULE then idx = n.index end
+    end
+  end
+  local fresh = resource == nil or resource == last
+  return idx or resource or last, fresh and lastpages or nil
+end
+
 C.images = {}
-function C.image(index, file, page, pages)
-  C.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1, pages = pages }
+function C.image(last, file, page, lastpages, cache, boxnum)
+  local index, pages = image_index(last, lastpages, cache, boxnum)
+  local known = C.images[tostring(index)]
+  C.images[tostring(index)] = { index = index, file = file, page = tonumber(page) or 1,
+                                pages = pages or (known and known.pages) or nil }
 end
 
 -- Rows of a paragraph unit that come from a deeper paragraph (nest >= 2) reached through
@@ -499,12 +524,77 @@ end
 -- not listed in images_info: hosts never see a cached picture as an image
 function C.pic_write() P.write(C.picctl, C.cache_images) end
 
-function C.shipout(boxnum)
+-- The page's /Rotate (degrees clockwise, 0, 90, 180 or 270) from the page attributes in force
+-- at shipout (\pdfvariable pageattr; pdflscape adds /Rotate 90 for a landscape page). Viewers
+-- turn the page; the display list says so (`rotate`). The last /Rotate wins, as in the PDF.
+local function page_rotate(attrs)
+  local r
+  for v in tostring(attrs or ""):gmatch("/Rotate%s*(%-?%d+)") do r = tonumber(v) end
+  r = r and r % 360 or 0
+  return (r % 90 == 0) and r or 0
+end
+C.page_rotate = page_rotate
+
+-- Marks a page leaves on paper: glyphs, rules (images and box resources included), literals and
+-- specials, anywhere in the box.
+local Dn = node.direct
+local INK = { [node.id("glyph")] = true, [node.id("rule")] = true }
+local LIST = { [node.id("hlist")] = true, [node.id("vlist")] = true }
+local WHATSIT = node.id("whatsit")
+local INK_WHATSITS = { [node.subtype("pdf_literal")] = true, [node.subtype("special")] = true }
+local function ink(head)
+  local n = 0
+  for x, id, sub in Dn.traverse(head) do
+    if INK[id] then
+      n = n + 1
+    elseif LIST[id] then
+      local h = Dn.getlist(x)
+      if h then n = n + ink(h) end
+    elseif id == WHATSIT and INK_WHATSITS[sub] then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- The box LaTeX finally ships: material added after shipout/before (shipout/background and
+-- /foreground: eso-pic, pdfpages, watermarks) is not in the captured page. Such a page says so
+-- (`shipout_extras`, Degraded): drawn from its PDF.
+function C.pre_shipout(head)
+  local want = C.pending_ink
+  C.pending_ink = nil
+  if want then
+    local d = Dn.todirect(head)
+    local id = Dn.getid(d)
+    local have = LIST[id] and ink(Dn.getlist(d)) or ink(d)
+    local page = C.pages[#C.pages]
+    if have > want and page then
+      page.flags = page.flags or {}
+      page.flags.shipout_extras = have - want
+    end
+  end
+  return true
+end
+
+function C.shipout(boxnum, pageattr)
   C.page = C.page + 1
   local b = tex.box[boxnum]
   if not b then return end
+  C.pending_ink = ink(Dn.getlist(Dn.todirect(b)))
+  -- color stacks carry over from page to page (\pdfcolorstackinit page): the page records the
+  -- stacks it starts with when they are not the color package's initial black
+  local base = C.color_carry or { ["0"] = { "0 g 0 G" } }
   local page = dl.page(b, C.attr_par, C.attr_line, C.page, nil, C.attr_unit, is_insert,
-                       { attr_pic = C.attr_pic, pic_images = C.cache_images })
+                       { attr_pic = C.attr_pic, pic_images = C.cache_images, color_base = base })
+  C.color_carry = page.color_end
+  page.color_end = nil
+  local plain = true
+  for id, st in pairs(base) do
+    if not (id == "0" and #st == 1 and st[1] == "0 g 0 G") and #st > 0 then plain = false end
+  end
+  if not plain then page.color_base = base end
+  local rot = page_rotate(pageattr)
+  if rot ~= 0 then page.rotate = rot end
   for _, pc in ipairs(page.pics or {}) do
     local k = C.pic_keys[pc.id]
     -- one box per picture (several boxes on one baseline are joined); a picture broken over

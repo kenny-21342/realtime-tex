@@ -33,6 +33,11 @@ pub struct SessionConfig {
     pub fast_on_stale_context: bool,
     pub bib_tool: BibTool,
     pub compile_timeout: Duration,
+    /// A background lualatex run still going after this long is stopped and the run fails
+    /// (default 120 s): a document that loops forever (`\def\x{\x}\x`) would hold the
+    /// background path. A run is stopped sooner once the sources have changed since it started
+    /// and it has taken twice as long as the slowest run that finished (a loop being fixed).
+    pub pass_timeout: Duration,
     /// Units whose last fast compile took longer than this are routed to the background path
     /// until the next layout (the host keeps its real-time guarantee).
     pub fast_budget: Duration,
@@ -119,6 +124,7 @@ impl SessionConfig {
             fast_on_stale_context: true,
             bib_tool: BibTool::Auto,
             compile_timeout: Duration::from_secs(5),
+            pass_timeout: Duration::from_secs(120),
             fast_budget: Duration::from_millis(5),
             unit_envs: Vec::new(),
             warm_background: true,
@@ -316,6 +322,8 @@ struct Shared {
     files: Mutex<BTreeMap<String, FileBuf>>,
     ids: Mutex<IdAllocator>,
     source_revision: AtomicU64,
+    /// The longest a background lualatex run that finished took (ms; `pass_timeout`).
+    slowest_pass_ms: AtomicU64,
     preamble_revision: AtomicU64,
     /// Per file: last revision at which a background-only span or the preamble changed.
     bg_change: Mutex<HashMap<String, Vec<(Revision, i64)>>>, // (revision, first line of the changed span)
@@ -330,6 +338,10 @@ struct Shared {
     shutdown: AtomicBool,
     /// A background pass is compiling right now: fast-path timings are not budget evidence.
     bg_running: AtomicBool,
+    /// Background passes run in a prepared standby engine (preamble already loaded) / started
+    /// from scratch: `Session::background_passes`.
+    bg_warm: AtomicU64,
+    bg_cold: AtomicU64,
     /// Background passes are deferred while paused (benchmarks, host-controlled quiet periods).
     bg_paused: AtomicBool,
     bg_pending_while_paused: AtomicBool,
@@ -415,7 +427,7 @@ impl Session {
         }
         // the main file and, transitively, every file it \input/\includes
         let texts = crate::document::load_project_files(&cfg.project_root, &cfg.main_file)
-            .with_context(|| format!("reading {}", cfg.main_file))?;
+            .context("loading the project")?;
         let mut ids = IdAllocator(0);
         let mut files = BTreeMap::new();
         let preamble = effective_preamble(&texts, &cfg.main_file);
@@ -443,6 +455,7 @@ impl Session {
             files: Mutex::new(files),
             ids: Mutex::new(ids),
             source_revision: AtomicU64::new(1),
+            slowest_pass_ms: AtomicU64::new(0),
             preamble_revision: AtomicU64::new(1),
             bg_change: Mutex::new(HashMap::new()),
             layout: Mutex::new(LayoutStore::default()),
@@ -453,6 +466,8 @@ impl Session {
             bg_signal: unbounded(),
             shutdown: AtomicBool::new(false),
             bg_running: AtomicBool::new(false),
+            bg_warm: AtomicU64::new(0),
+            bg_cold: AtomicU64::new(0),
             bg_paused: AtomicBool::new(false),
             bg_pending_while_paused: AtomicBool::new(false),
             cfg,
@@ -501,6 +516,12 @@ impl Session {
             requeued: Mutex::new(std::collections::VecDeque::new()),
             threads,
         })
+    }
+
+    /// Background passes so far: (warm, cold). A warm pass runs in a standby engine that loaded
+    /// the preamble while the user typed; a cold one loads it first.
+    pub fn background_passes(&self) -> (u64, u64) {
+        (self.shared.bg_warm.load(Ordering::SeqCst), self.shared.bg_cold.load(Ordering::SeqCst))
     }
 
     pub fn versions(&self) -> Versions {
@@ -1595,6 +1616,7 @@ fn engine_thread(s: Arc<Shared>) {
                 wanted_gen,
                 aux.as_deref(),
                 s.cfg.debug_dir.is_some(),
+                Some(&s.shutdown),
             ) {
                 Ok(mut srv) => {
                     srv.timeout = s.cfg.compile_timeout.max(Duration::from_secs(30)); // first compile loads fonts
@@ -1799,6 +1821,51 @@ fn engine_thread(s: Arc<Shared>) {
                             reset_link(&s);
                             continue;
                         }
+                    };
+                    // a compile that changes state the leak check cannot see (an expl3
+                    // sequence the unit appends to, a register stepped through \csname) shows
+                    // when the same text is compiled again: its result moves
+                    let v = if matches!(v, ProbeVerdict::Verified) {
+                        link.probing = true;
+                        drop(link);
+                        let t_again = Instant::now();
+                        let res = srv.compile_with_pics(req.seq, &text, &req.pics);
+                        let mut relock = s.link.lock();
+                        relock.probing = false;
+                        relock.probe_us += t_again.elapsed().as_micros() as u64;
+                        link = relock;
+                        match res {
+                            Ok((cr, _)) => {
+                                let layout = s.layout.lock();
+                                if layout.layout_version != lv {
+                                    drop(layout);
+                                    drop(link);
+                                    s.pending.lock().insert(req.par_id, req);
+                                    s.pending_signal.0.send(()).ok();
+                                    continue;
+                                }
+                                let again = match &cr.dl {
+                                    Some(dl) => layout.probe_check(req.par_id, dl),
+                                    None => Err("no box".into()),
+                                };
+                                match again {
+                                    Ok(()) if cr.leaks.is_empty() && cr.status != "error" => ProbeVerdict::Verified,
+                                    Ok(()) => ProbeVerdict::Leak("the unit's second compile differs (leaks or errors)".into()),
+                                    Err(why) => ProbeVerdict::Leak(format!(
+                                        "the unit's result changes when it is compiled again ({why})"
+                                    )),
+                                }
+                            }
+                            Err(e) => {
+                                drop(link);
+                                engine_failed(&s, &req, e, wanted_gen, server.as_ref());
+                                server = None;
+                                reset_link(&s);
+                                continue;
+                            }
+                        }
+                    } else {
+                        v
                     };
                     s.probe.lock().insert(req.par_id, (lv, v.clone()));
                     v
@@ -2351,6 +2418,30 @@ fn pass_dir(s: &Shared, n: usize) -> PathBuf {
     s.cfg.build_dir.join("bg").join(format!("pass-{n}"))
 }
 
+/// The errors of a pass that stopped before writing its capture: the newest `<job>.log` in the
+/// pass directories written since `since` that reports an error (a standby opens its own log in
+/// the other directory as soon as it starts). File names as in `deliver_layout`.
+fn failed_pass_diagnostics(s: &Shared, since: std::time::SystemTime) -> Vec<Diagnostic> {
+    let jobname = jobname_of(&s.cfg.main_file);
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = [pass_dir(s, 0), pass_dir(s, 1), s.cfg.build_dir.join("bg")]
+        .iter()
+        .filter_map(|d| {
+            let p = d.join(format!("{jobname}.log"));
+            let m = std::fs::metadata(&p).ok()?.modified().ok()?;
+            (m >= since).then_some((m, p))
+        })
+        .collect();
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, log) in logs {
+        let mut items = parse_log(&log);
+        if items.iter().any(|d| d.severity == "error") {
+            locate_standby_diagnostics(s, &mut items);
+            return items;
+        }
+    }
+    Vec::new()
+}
+
 /// The directory of the last finished pass (seeded from disk on the first call: the newer
 /// of the two pass directories, or the pre-pass-directory layout `build/bg` itself).
 fn last_pass_dir(s: &Shared) -> Option<PathBuf> {
@@ -2505,17 +2596,34 @@ fn run_background_pass_inner(s: &Shared) {
     let snap_dir = snapshot_dir(&s.cfg.build_dir);
     // a pass that cannot run is still a layout result: hosts see compile = Failed instead of a
     // pass that never ends
-    let failed = |msg: String| {
+    let started = std::time::SystemTime::now();
+    let stop = |ran: Duration| -> Option<String> {
+        if ran >= s.cfg.pass_timeout {
+            return Some(format!(
+                "LaTeX did not finish within {} s (an endless loop?); stopped",
+                s.cfg.pass_timeout.as_secs()
+            ));
+        }
+        let slowest = Duration::from_millis(s.slowest_pass_ms.load(Ordering::SeqCst));
+        (!slowest.is_zero()
+            && ran > (slowest * 2).max(Duration::from_secs(5))
+            && s.source_revision.load(Ordering::SeqCst) != rev)
+            .then(|| {
+                format!(
+                    "LaTeX did not finish within {} s, twice its longest run so far; stopped for the edited sources",
+                    ran.as_secs()
+                )
+            })
+    };
+    let ran_to_end = |cap: &crate::capture::CaptureResult| {
+        s.slowest_pass_ms
+            .fetch_max(cap.wall.as_millis() as u64, Ordering::SeqCst);
+    };
+    let failed_with = |msg: String, items: Vec<Diagnostic>| {
         s.events
             .send(Event::Diagnostics {
                 source: "background".into(),
-                items: vec![Diagnostic {
-                    severity: "error".into(),
-                    file: None,
-                    line: None,
-                    message: msg.clone(),
-                    context: None,
-                }],
+                items,
             })
             .ok();
         *s.convergence.lock() = Some(Convergence::PassLimitReached {
@@ -2542,6 +2650,16 @@ fn run_background_pass_inner(s: &Shared) {
                 wall_ms: t0.elapsed().as_millis() as u64,
             })
             .ok();
+    };
+    let failed = |msg: String| {
+        let item = Diagnostic {
+            severity: "error".into(),
+            file: None,
+            line: None,
+            message: msg.clone(),
+            context: None,
+        };
+        failed_with(msg, vec![item])
     };
     if let Err(e) = write_snapshot(&s.cfg.project_root, &texts, &snap_dir) {
         failed(format!("snapshot: {e}"));
@@ -2579,13 +2697,20 @@ fn run_background_pass_inner(s: &Shared) {
         *pic_fragments.lock().unwrap() = cache.fragments(&pics);
     };
     let absorb = |cap: &crate::capture::CaptureResult| {
-        if pics.is_empty() {
+        // a pass that ended on a fatal error has no (complete) PDF to take pictures from
+        if pics.is_empty() || cap.fatal() {
             return;
         }
+        let errors: Vec<(String, i64)> = parse_log(&cap.log)
+            .into_iter()
+            .filter(|d| d.severity == "error")
+            .filter_map(|d| Some((d.file?, d.line?)))
+            .collect();
         if let Err(e) = pic_cache.lock().unwrap().absorb(
             &pics,
             &cap.json.recorded_pics(),
             &cap.json.pic_mismatch,
+            &errors,
             &cap.pdf,
         ) {
             log::warn!("picture cache: {e:#}");
@@ -2622,7 +2747,9 @@ fn run_background_pass_inner(s: &Shared) {
                 true,
             );
         }
+        let t_absorb = Instant::now();
         absorb(cap);
+        log::debug!("background pass {pass}: picture cache absorb {} ms", t_absorb.elapsed().as_millis());
         pass_started = Instant::now();
     };
     let result = if s.cfg.warm_background {
@@ -2630,10 +2757,9 @@ fn run_background_pass_inner(s: &Shared) {
         // typed, then the one started when the previous pass was released (its preamble loads
         // while the body is typeset). Two snapshot directories alternate so a loading standby
         // never rewrites the files a running one reads.
-        let pre_hash = texts
-            .get(&s.cfg.main_file)
-            .and_then(|t| crate::split_preamble(t))
-            .map(|(p, _)| crate::document::hash_str(p));
+        // the standby's own hash (write_body_snapshot): the preamble with its \input files
+        // inlined; the raw preamble text never matched one that \inputs files
+        let pre_hash = standby_preamble_hash(&texts, &s.cfg.main_file);
         let mut runner = |_pass: u32| -> Result<crate::capture::CaptureResult> {
             let ready = {
                 let mut slot = s.standby.lock();
@@ -2642,13 +2768,24 @@ fn run_background_pass_inner(s: &Shared) {
                         if Some(w.preamble_hash) == pre_hash && w.is_alive() {
                             Some(w)
                         } else {
+                            log::debug!(
+                                "background pass: standby discarded (preamble {}, alive {})",
+                                if Some(w.preamble_hash) == pre_hash { "same" } else { "changed" },
+                                w.is_alive()
+                            );
                             w.kill();
                             None
                         }
                     }
-                    None => None,
+                    None => {
+                        log::debug!("background pass: no standby");
+                        None
+                    }
                 }
             };
+            let warm = ready.is_some();
+            if warm { &s.bg_warm } else { &s.bg_cold }.fetch_add(1, Ordering::SeqCst);
+            let t_pass = Instant::now();
             let w = match ready {
                 Some(w) => w,
                 None => {
@@ -2685,7 +2822,15 @@ fn run_background_pass_inner(s: &Shared) {
             ) {
                 *s.standby.lock() = Some(next);
             }
-            let mut cap = w.run(&s.cfg.project_root, &texts, &s.cfg.main_file)?;
+            let t_run = Instant::now();
+            let mut cap = w.run_until(&s.cfg.project_root, &texts, &s.cfg.main_file, &stop)?;
+            ran_to_end(&cap);
+            log::debug!(
+                "background pass: {} standby, waited/spawned {} ms, engine run {} ms",
+                if warm { "warm" } else { "cold" },
+                (t_run - t_pass).as_millis(),
+                t_run.elapsed().as_millis()
+            );
             cap.pic_fragments = pic_fragments.lock().unwrap().clone();
             finished(&cap);
             Ok(cap)
@@ -2705,14 +2850,16 @@ fn run_background_pass_inner(s: &Shared) {
         let dir = pass_dir(s, 0);
         let mut runner = |_pass: u32| -> Result<crate::capture::CaptureResult> {
             prepare_dir(&dir);
-            let mut cap = crate::capture::run_capture_with(
+            let mut cap = crate::capture::run_capture_until(
                 &s.tl,
                 &snap_dir,
                 &s.cfg.main_file,
                 &dir,
                 true,
                 &unit_envs,
+                &stop,
             )?;
+            ran_to_end(&cap);
             cap.pic_fragments = pic_fragments.lock().unwrap().clone();
             finished(&cap);
             Ok(cap)
@@ -2731,7 +2878,35 @@ fn run_background_pass_inner(s: &Shared) {
     let outcome = match result {
         Ok(o) => o,
         Err(e) => {
-            failed(format!("background pass: {e:#}"));
+            // LaTeX stopped before the end of the document (no capture): its log still says
+            // where; the error list is the log's, as for any pass
+            let mut items = failed_pass_diagnostics(s, started);
+            if let Some(stopped) = e.downcast_ref::<crate::capture::Stopped>() {
+                // stopped by pass_timeout: that is the reason, whatever the log says so far
+                items.insert(
+                    0,
+                    Diagnostic {
+                        severity: "error".into(),
+                        file: None,
+                        line: None,
+                        message: stopped.0.clone(),
+                        context: None,
+                    },
+                );
+                failed_with(stopped.0.clone(), items);
+                return;
+            }
+            match items.iter().find(|d| d.severity == "error") {
+                Some(first) => {
+                    let at = match (&first.file, first.line) {
+                        (Some(f), Some(l)) => format!(" ({f}:{l})"),
+                        _ => String::new(),
+                    };
+                    let msg = format!("fatal error, LaTeX stopped: {}{at}", first.message);
+                    failed_with(msg, items);
+                }
+                None => failed(format!("background pass: {e:#}")),
+            }
             return;
         }
     };
@@ -2792,6 +2967,7 @@ fn layout_failed(s: &Shared, t0: Instant, rev: Revision, msg: String) {
 /// run that is not stable yet (another pass follows); the layout is usable, its convergence is
 /// `Converging`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn deliver_layout(
     s: &Shared,
     t0: Instant,
@@ -2802,19 +2978,33 @@ fn deliver_layout(
     rev: Revision,
     provisional: bool,
 ) {
+    let t = Instant::now();
+    deliver_layout_inner(s, t0, cap, passes, aux_stable, spans, rev, provisional);
+    log::debug!(
+        "background pass {passes}: layout delivered in {} ms ({} pages, provisional {provisional})",
+        t.elapsed().as_millis(),
+        cap.json.pages
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_layout_inner(
+    s: &Shared,
+    t0: Instant,
+    cap: &crate::capture::CaptureResult,
+    passes: u32,
+    aux_stable: bool,
+    spans: Vec<SnapshotSpan>,
+    rev: Revision,
+    provisional: bool,
+) {
     let mut diagnostics = parse_log(&cap.log);
-    for d in &mut diagnostics {
-        // the standby reads the preamble from rtex-preamble.tex (same line numbers)
-        if d.file
-            .as_deref()
-            .map(|f| f.ends_with("rtex-preamble.tex"))
-            .unwrap_or(false)
-        {
-            d.file = Some(s.cfg.main_file.clone());
-        }
-    }
+    locate_standby_diagnostics(s, &mut diagnostics);
     let errors = diagnostics.iter().filter(|d| d.severity == "error").count();
-    let compile = if cap.json.pages == 0 {
+    // a fatal error leaves no PDF (at most a partial one) even when pages were shipped: the
+    // pass is a failure, the previous layout stays
+    let fatal = cap.fatal();
+    let compile = if cap.json.pages == 0 || fatal {
         CompileStatus::Failed
     } else if errors > 0 {
         CompileStatus::CompiledWithErrors { count: errors }
@@ -2837,7 +3027,7 @@ fn deliver_layout(
                 compile,
                 convergence: Convergence::PassLimitReached {
                     passes: passes,
-                    reasons: vec!["no pages".into()],
+                    reasons: vec![if fatal { "fatal error: no PDF".into() } else { "no pages".into() }],
                 },
                 passes: passes,
                 pages_changed: vec![],
@@ -3134,14 +3324,15 @@ fn run_export(s: &Shared, job: u64, out: PathBuf) {
         Ok(o) => {
             let diags = parse_log(&o.capture.log);
             let errors = diags.iter().filter(|d| d.severity == "error").count();
-            let status = if !o.capture.pdf.exists() {
+            let fatal = o.capture.fatal();
+            let status = if fatal {
                 CompileStatus::Failed
             } else if errors > 0 {
                 CompileStatus::CompiledWithErrors { count: errors }
             } else {
                 CompileStatus::Ok
             };
-            let path = if o.capture.pdf.exists() {
+            let path = if !fatal {
                 if let Some(parent) = out.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -3215,9 +3406,17 @@ pub fn parse_log(log: &Path) -> Vec<Diagnostic> {
                 context: None,
             });
         } else if l.starts_with("! ") {
+            // an error raised while TeX reads the standby's command line right after the
+            // preamble file (LaTeX looking past a \usepackage for its optional date): plain
+            // LaTeX reads on in the main file and reports it there, at \begin{document}
+            let after_preamble = lines[i + 1..]
+                .iter()
+                .take(30)
+                .take_while(|n| !n.starts_with("! ") && !re_fle.is_match(n))
+                .any(|n| n.starts_with("<*> ") && n.trim_end().ends_with("\\input{rtex-preamble.tex}"));
             out.push(Diagnostic {
                 severity: "error".into(),
-                file: None,
+                file: after_preamble.then(|| "rtex-preamble.tex".to_string()),
                 line: None,
                 message: l[2..].to_string(),
                 context: lines.get(i + 1).map(|s| s.to_string()),
@@ -3225,4 +3424,26 @@ pub fn parse_log(log: &Path) -> Vec<Diagnostic> {
         }
     }
     out
+}
+
+/// Diagnostics of a standby pass in the main file's terms: the standby reads the preamble from
+/// `rtex-preamble.tex` (same line numbers); an error after its end (no line) is where plain
+/// LaTeX reports it, the `\begin{document}` line.
+fn locate_standby_diagnostics(s: &Shared, items: &mut [Diagnostic]) {
+    let mut begin_line = None;
+    for d in items {
+        if !d.file.as_deref().is_some_and(|f| f.ends_with("rtex-preamble.tex")) {
+            continue;
+        }
+        d.file = Some(s.cfg.main_file.clone());
+        if d.line.is_none() {
+            let line = *begin_line.get_or_insert_with(|| {
+                s.files.lock().get(&s.cfg.main_file).and_then(|f| {
+                    let at = crate::document::find_uncommented(&f.text, "\\begin{document}")?;
+                    Some(f.text[..at].matches('\n').count() as i64 + 1)
+                })
+            });
+            d.line = line;
+        }
+    }
 }

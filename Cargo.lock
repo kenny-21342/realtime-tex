@@ -1011,6 +1011,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossbeam-channel",
+ "env_logger",
  "hex",
  "libc",
  "log",

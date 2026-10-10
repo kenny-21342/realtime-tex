@@ -121,6 +121,15 @@ checked before any other handling of a result, warm-ups and superseded results i
 name built with `\csname…\endcsname` does not appear in the source and is not seen: the
 fingerprint and the counter restore remain the defence for that case.
 
+**Second probe compile.** State the leak check cannot see (an expl3 sequence a unit appends to,
+a register stepped through `\csname`) shows when the same text is compiled again: a verified
+probe compiles the snapshot text a second time, and a result that no longer matches the pass is
+a leak (`the unit's result changes when it is compiled again`): the unit is demoted and the
+engine restarted. Without it, a paragraph such as `\push{a}\push{b} items: \items.` (a global
+sequence printed in place) passed the probe and was then served with its items repeated on every
+keystroke (`tests/regressions.rs`, `hidden_global_state_demotes_the_unit`). The cost is one more
+compile per probed unit per layout.
+
 **Bookkeeping.** The probe runs on the engine thread without the link lock held (the host's
 `apply_edit` never waits on it; the direct dispatch path stays off the server meanwhile), it
 reads the snapshot text from the layout current at that moment and judges against that same

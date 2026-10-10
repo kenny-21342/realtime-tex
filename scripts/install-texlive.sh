@@ -23,6 +23,11 @@ PACKAGES=(
   pgf hyperref csquotes
   enumitem multirow ulem cancel wrapfig titlesec siunitx algorithms algorithmicx framed soul makecell
   pgfplots circuitikz xecjk xypic gensymb regexpatch haranoaji luatexja
+  # rtex-fixtures latex_stress_test (main document)
+  catchfile cleveref diagbox fontawesome5 forest glossaries imakeidx lastpage marginnote mhchem nag
+  nicematrix physics placeins tcolorbox tikz-cd pict2e tikzfill pdfcol latexmk
+  # its edit scenarios (babel ngerman)
+  babel-german hyphen-german
 )
 
 arch() {

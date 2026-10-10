@@ -93,6 +93,11 @@ const HEADING_CMDS: &[&str] = &[
     "\\tableofcontents",
 ];
 
+/// Headings the standard classes set run-in (`\@startsection` with a negative after-skip): the
+/// heading and the text after it, on its line and the following ones, are one TeX paragraph,
+/// and the capture gives all its rows to the heading's unit.
+const RUNIN_HEADING_CMDS: &[&str] = &["\\paragraph", "\\subparagraph"];
+
 fn brace_balance(line: &str) -> i32 {
     let b = line.as_bytes();
     let mut bal = 0;
@@ -379,8 +384,8 @@ fn compute_line_starts(text: &str) -> Vec<usize> {
 /// Boundaries of paragraph-ish units in `text`, as byte ranges with kinds (ids not assigned).
 fn segment(text: &str, extra_block_envs: &[String]) -> Vec<(Range<usize>, SpanKind)> {
     let mut out: Vec<(Range<usize>, SpanKind)> = Vec::new();
-    let begin_doc = text.find("\\begin{document}");
-    let end_doc = text.find("\\end{document}");
+    let begin_doc = find_uncommented(text, "\\begin{document}");
+    let end_doc = find_uncommented(text, "\\end{document}");
     let body_start = match begin_doc {
         Some(i) => {
             let e = i + "\\begin{document}".len();
@@ -437,6 +442,8 @@ fn segment_body(
     // after a block environment closed (the capture closes the unit at those points)
     let mut split_pending = false;
     let mut heading_balance: i32 = 0;
+    // the current heading is run-in: its span continues like a paragraph's
+    let mut runin = false;
     for (lstart, line) in &lines {
         let trimmed = line.trim();
         let stripped = strip_comment(trimmed);
@@ -453,6 +460,9 @@ fn segment_body(
             Vec::new()
         };
         let heading = HEADING_CMDS.iter().any(|h| stripped.starts_with(h));
+        let runin_heading = RUNIN_HEADING_CMDS
+            .iter()
+            .any(|h| stripped.strip_prefix(h).is_some_and(|r| !r.starts_with(|c: char| c.is_ascii_alphabetic())));
         // a picture environment opened while a paragraph is open (text before it in this span
         // or on its line) is an inline box of that paragraph, as the capture sees it (no unit
         // of its own); the same rule as eligibility.rs (content_start before the \begin)
@@ -488,9 +498,12 @@ fn segment_body(
                 } else {
                     SpanKind::Body
                 };
+                runin = runin_heading;
                 heading_balance = 0;
                 split_pending = false;
-            } else if (heading && cur_kind == SpanKind::Body) || split_pending {
+            } else if (heading && (cur_kind == SpanKind::Body || (cur_kind == SpanKind::Heading && runin)))
+                || split_pending
+            {
                 // a heading command starts a new unit even without a blank line, and a unit ends
                 // after a heading or a block environment
                 flush(out, cur_start.unwrap(), *lstart, cur_kind);
@@ -500,6 +513,7 @@ fn segment_body(
                 } else {
                     SpanKind::Body
                 };
+                runin = runin_heading;
                 heading_balance = 0;
                 split_pending = false;
             }
@@ -509,7 +523,7 @@ fn segment_body(
             {
                 cur_kind = SpanKind::Env;
             }
-            if cur_kind == SpanKind::Heading {
+            if cur_kind == SpanKind::Heading && !runin {
                 heading_balance += brace_balance(stripped);
                 if heading_balance <= 0 && begins.is_empty() {
                     split_pending = true;
@@ -531,6 +545,14 @@ fn segment_body(
                 }
             }
         }
+        // TeX reads the rest of the line that holds \endinput and nothing after it: the lines
+        // below are no part of the document (no units)
+        if has_control_word(stripped, "endinput") {
+            if let Some(s) = cur_start.take() {
+                flush(out, s, *lstart + line.len(), cur_kind);
+            }
+            return env_stack.is_empty();
+        }
     }
     if let Some(s) = cur_start {
         flush(out, s, body.len(), cur_kind);
@@ -538,7 +560,30 @@ fn segment_body(
     env_stack.is_empty()
 }
 
+/// True when `line` holds the control word `\name` (not a longer name that starts with it).
+pub fn has_control_word(line: &str, name: &str) -> bool {
+    let pat = format!("\\{name}");
+    line.match_indices(&pat).any(|(i, _)| {
+        let after = &line[i + pat.len()..];
+        !after.starts_with(|c: char| c.is_ascii_alphabetic() || c == '@')
+            && (i == 0 || !line[..i].ends_with('\\'))
+    })
+}
+
 /// Strip an unescaped `%` comment from a source line.
+/// Byte offset of the first `needle` in `text` outside `%` comments: a header comment that
+/// mentions `\begin{document}` is not where the document begins.
+pub fn find_uncommented(text: &str, needle: &str) -> Option<usize> {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if let Some(i) = strip_comment(line).find(needle) {
+            return Some(at + i);
+        }
+        at += line.len();
+    }
+    None
+}
+
 pub fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     let mut i = 0;
@@ -1109,6 +1154,54 @@ mod tests {
             )
         );
         assert_eq!(fb.spans.len(), 7);
+    }
+
+    #[test]
+    fn runin_headings_keep_their_text() {
+        // \paragraph and \subparagraph run into their text: heading and text are one paragraph
+        // (the capture's unit), up to a blank line or the next heading
+        let doc = "\\documentclass{article}\n\\begin{document}\n\\paragraph{Run-in.} Text that\ncontinues here.\n\\subparagraph{Next.} More.\n\n\\section{Display}\nBody text.\n\\end{document}\n";
+        let mut ids = IdAllocator(0);
+        let fb = FileBuf::new(doc, &mut ids, 1);
+        let texts: Vec<(&str, SpanKind)> = fb
+            .spans
+            .iter()
+            .map(|s| (fb.text[s.range.clone()].trim_end(), s.kind))
+            .collect();
+        assert_eq!(texts[1], ("\\paragraph{Run-in.} Text that\ncontinues here.", SpanKind::Heading));
+        assert_eq!(texts[2], ("\\subparagraph{Next.} More.", SpanKind::Heading));
+        assert_eq!(texts[3], ("\\section{Display}", SpanKind::Heading));
+        assert_eq!(texts[4], ("Body text.", SpanKind::Body));
+    }
+
+    #[test]
+    fn nothing_after_endinput_is_a_unit() {
+        let doc = "\\documentclass{article}\n\\begin{document}\nText before.\nMore text, then the end. \\endinput\nIgnored by TeX: \\undefined {\n\nAlso ignored.\n\\end{document}\n";
+        let mut ids = IdAllocator(0);
+        let fb = FileBuf::new(doc, &mut ids, 1);
+        let texts: Vec<&str> = fb
+            .spans
+            .iter()
+            .filter(|s| s.kind != SpanKind::Preamble && s.kind != SpanKind::Trailer)
+            .map(|s| fb.text[s.range.clone()].trim_end())
+            .collect();
+        assert_eq!(texts, ["Text before.\nMore text, then the end. \\endinput"]);
+        assert!(has_control_word("a \\endinput b", "endinput"));
+        assert!(!has_control_word("a \\endinputx b", "endinput"));
+        assert!(!has_control_word("a \\\\endinput", "endinput"));
+    }
+
+    #[test]
+    fn commented_document_markers_are_not_boundaries() {
+        let doc = "% Mistake: \\usepackage after \\begin{document}, see \\end{document}\n\\documentclass{article}\n\\begin{document}\nText.\n\\end{document}\n";
+        let mut ids = IdAllocator(0);
+        let fb = FileBuf::new(doc, &mut ids, 1);
+        let pre = fb.spans.iter().find(|s| s.kind == SpanKind::Preamble).unwrap();
+        assert!(fb.text[pre.range.clone()].ends_with("\\begin{document}\n"));
+        assert!(fb.text[pre.range.clone()].contains("\\documentclass"));
+        let (p, _) = crate::split_preamble(doc).unwrap();
+        assert!(p.contains("\\documentclass{article}\n"));
+        assert_eq!(find_uncommented("a \\% b\n% b\nb", "b"), Some(5));
     }
 
     #[test]

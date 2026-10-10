@@ -44,6 +44,12 @@ pub enum Reason {
     KindMismatch,
     /// The last fast compile of this unit exceeded the session's budget (ms).
     OverBudget(u64),
+    /// A list that continues the numbering of an earlier one (enumitem `resume`, `resume*`,
+    /// `series=`): the number is saved globally when that list ends, where the fast path cannot
+    /// see it.
+    ListResumed,
+    /// `\endinput`: it ends the input file it is read from, in the live server the server's own.
+    EndInput,
 }
 
 impl std::fmt::Display for Reason {
@@ -78,6 +84,8 @@ impl std::fmt::Display for Reason {
                 "\\{m} before the unit's text runs before its counters are captured; put it inside the paragraph or environment, or on its own line"
             ),
             Reason::OverBudget(ms) => write!(f, "last fast compile took {ms} ms, over the budget"),
+            Reason::ListResumed => write!(f, "the list resumes the numbering of an earlier list"),
+            Reason::EndInput => write!(f, "\\endinput ends the file it is read from"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -954,7 +962,9 @@ pub fn setup_prefix(text: &str) -> (usize, bool) {
             return (stmt, any);
         }
         i = j;
-        // arguments
+        // arguments; a control sequence after a braced argument is not one (`\def\x{\x}\x`
+        // defines \x and then uses it)
+        let mut braced = false;
         loop {
             while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
                 i += 1;
@@ -991,6 +1001,7 @@ pub fn setup_prefix(text: &str) -> (usize, bool) {
                         return (stmt, any);
                     };
                     i = c + 1;
+                    braced = true;
                 }
                 b'#' => {
                     i += 1;
@@ -998,6 +1009,7 @@ pub fn setup_prefix(text: &str) -> (usize, bool) {
                         i += 1;
                     }
                 }
+                b'\\' if braced => break,
                 b'\\' => {
                     // a control-sequence argument (\def\foo, \setlength\parindent); a setup
                     // command starts the next statement instead
@@ -2313,10 +2325,33 @@ pub fn classify_source_with(
     if shape == UnitShape::Par && text.contains("\\maketitle") {
         shape = UnitShape::Env("center".into());
     }
+    if resumes_a_list(&text) {
+        push(&mut reasons, Reason::ListResumed);
+    }
+    if text.lines().any(|l| crate::document::has_control_word(l, "endinput")) {
+        push(&mut reasons, Reason::EndInput);
+    }
     if permissive {
         reasons.retain(|r| !is_vocabulary_reason(r));
     }
     (shape, reasons)
+}
+
+/// A list environment whose options continue an earlier list (enumitem: `resume`, `resume*`,
+/// `series=…`).
+fn resumes_a_list(text: &str) -> bool {
+    LIST_ENVS.iter().any(|env| {
+        let open = format!("\\begin{{{env}}}");
+        text.match_indices(&open).any(|(i, _)| {
+            let rest = text[i + open.len()..].trim_start();
+            let Some(opts) = rest.strip_prefix('[') else { return false };
+            let opts = &opts[..opts.find(']').unwrap_or(opts.len())];
+            opts.split(',').any(|o| {
+                let k = o.trim();
+                k == "resume" || k == "resume*" || k.split('=').next().map(str::trim) == Some("series")
+            })
+        })
+    })
 }
 
 /// Length of the vertical material at the start of `s` (`\vspace`, `\noindent`, `\centering`,
@@ -2553,6 +2588,13 @@ mod tests {
         )
         .is_empty());
         assert!(reasons("\\begin{enumerate}[label=(\\alph*)]\\item a\\end{enumerate}").is_empty());
+        // \endinput would end the live server's own input
+        assert!(reasons("The end of a file. \\endinput").contains(&Reason::EndInput));
+        // a resumed list's first number is saved where the fast path cannot see it
+        for opts in ["[resume]", "[resume*]", "[label=(\\alph*), resume]", "[series=steps]"] {
+            let r = reasons(&format!("Then:\n\\begin{{enumerate}}{opts}\n\\item c\n\\end{{enumerate}}"));
+            assert!(r.contains(&Reason::ListResumed), "{opts}: {r:?}");
+        }
         let r = reasons("\\begin{table}\\setlength{\\tabcolsep}{2pt}\\renewcommand{\\arraystretch}{1.2}\\begin{tabular}{l}a\\end{tabular}\\end{table}");
         assert!(r.is_empty(), "{r:?}");
         assert!(reasons("\\setlength{\\parindent}{0pt} text")
@@ -2803,6 +2845,9 @@ mod tests {
         )
         .is_some());
         assert!(setup_statements("\\newcommand{\\kw}{x} Text after it").is_none());
+        // a definition followed by a use of what it defines (an endless loop here)
+        assert!(setup_statements("\\def\\x{\\x}\\x").is_none());
+        assert!(setup_statements("\\newcommand{\\a}{1}\\newcommand{\\b}[1]{#1}\\def\\c#1{#1}").is_some());
         assert!(setup_statements("Text \\newcommand{\\kw}{x}").is_none());
         assert!(setup_statements("\\setcounter{page}{3}").is_none());
         assert!(setup_statements("\\newcommand{\\kw}{x").is_none());

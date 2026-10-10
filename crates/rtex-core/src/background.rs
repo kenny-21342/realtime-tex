@@ -82,11 +82,13 @@ fn copy_tree(src: &Path, dst: &Path, depth: usize) -> Result<()> {
         } else if !path.is_file() {
             continue;
         } else {
+            // build outputs a pass could read in place of its own (a stale .aux, .toc, .bbl):
+            // never copied. PDFs are inputs (\includegraphics, \includepdf) and are copied; an
+            // old output PDF of the document is harmless, LaTeX never reads one implicitly.
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if matches!(
                 ext,
-                "pdf"
-                    | "aux"
+                "aux"
                     | "log"
                     | "synctex.gz"
                     | "fls"
@@ -138,7 +140,7 @@ pub fn mirror_dirs(src: &Path, out: &Path, depth: usize) -> Result<()> {
 fn aux_signature(out_dir: &Path, jobname: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     use std::hash::{Hash, Hasher};
-    for ext in ["aux", "toc", "lof", "lot", "out", "bcf", "bbl", "idx"] {
+    for ext in ["aux", "toc", "lof", "lot", "out", "bcf", "bbl", "idx", "ind"] {
         if let Ok(b) = std::fs::read(out_dir.join(format!("{jobname}.{ext}"))) {
             ext.hash(&mut h);
             b.hash(&mut h);
@@ -299,6 +301,8 @@ pub fn run_pass_with_runner(
         .to_string();
     let mut sig_before = aux_signature(aux_dir, &jobname);
     let mut bib_ran = false;
+    // the .idx makeindex last read: run again only when the entries or their pages changed
+    let mut indexed: Option<Vec<u8>> = None;
     let mut last: Option<CaptureResult> = None;
     let mut passes = 0;
     let mut stable = false;
@@ -343,6 +347,31 @@ pub fn run_pass_with_runner(
                 log::warn!("{tool} failed: {}", String::from_utf8_lossy(&out.stderr));
             }
             bib_ran = true;
+        }
+        // an index (\makeindex, \index, \printindex): makeindex turns the pass's .idx into the
+        // .ind the next pass prints. A changed .ind changes the signature: another pass.
+        let idx = out_dir.join(format!("{jobname}.idx"));
+        if let Ok(entries) = std::fs::read(&idx) {
+            if !entries.is_empty() && indexed.as_deref() != Some(entries.as_slice()) {
+                let mut cmd = Command::new("makeindex");
+                cmd.current_dir(out_dir).arg("-q").arg(format!("{jobname}.idx"));
+                if let Some(d) = &tl.bin_dir {
+                    cmd.env(
+                        "PATH",
+                        format!("{}:{}", d.display(), std::env::var("PATH").unwrap_or_default()),
+                    );
+                }
+                // a style file (-s) in the project is found through INDEXSTYLE
+                cmd.env("INDEXSTYLE", format!("{}:", snapshot_dir.display()));
+                match cmd.output() {
+                    Ok(out) if !out.status.success() => {
+                        log::warn!("makeindex failed: {}", String::from_utf8_lossy(&out.stderr))
+                    }
+                    Err(e) => log::warn!("makeindex: {e}"),
+                    _ => {}
+                }
+                indexed = Some(entries);
+            }
         }
         let sig_after = aux_signature(out_dir, &jobname);
         // a bibliography run that changed nothing (same .bbl) needs no extra pass: the .bbl is
@@ -593,10 +622,21 @@ impl WarmEngine {
     /// Typeset the body: refresh the snapshot texts (same preamble), release the engine and
     /// collect the pass like a fresh run.
     pub fn run(
+        self,
+        project: &Path,
+        files: &BTreeMap<String, String>,
+        main: &str,
+    ) -> Result<CaptureResult> {
+        self.run_until(project, files, main, &crate::capture::never_stop)
+    }
+
+    /// `run` that `stop` may end early (`capture::StopCheck`).
+    pub fn run_until(
         mut self,
         project: &Path,
         files: &BTreeMap<String, String>,
         main: &str,
+        stop: crate::capture::StopCheck,
     ) -> Result<CaptureResult> {
         let t0 = std::time::Instant::now();
         let h = write_body_snapshot(project, files, main, &self.src_dir)?;
@@ -613,13 +653,8 @@ impl WarmEngine {
             stdin.flush().ok();
             drop(stdin);
         }
-        // drain stdout before waiting (a full pipe would block the engine), then reap
-        let mut stdout = Vec::new();
-        if let Some(mut so) = self.child.stdout.take() {
-            use std::io::Read;
-            let _ = so.read_to_end(&mut stdout);
-        }
-        let status = self.child.wait().context("waiting for standby pass")?;
+        // stdout is drained while waiting (a full pipe would block the engine)
+        let (status, stdout) = crate::capture::wait_child(&mut self.child, t0, stop)?;
         collect_capture(
             &self.out_dir,
             &self.jobname,
@@ -659,6 +694,8 @@ mod tests {
         std::fs::write(project.join("main.tex"), "x").unwrap();
         std::fs::write(project.join("a/b/file.txt"), "nested").unwrap();
         std::fs::write(project.join("a/top.bib"), "bib").unwrap();
+        std::fs::write(project.join("a/figure.pdf"), "%PDF-1.5").unwrap();
+        std::fs::write(project.join("main.aux"), "stale").unwrap();
         let mut files = BTreeMap::new();
         files.insert("main.tex".to_string(), "edited".to_string());
         write_snapshot(&project, &files, &dir.join("snap")).unwrap();
@@ -674,6 +711,12 @@ mod tests {
             std::fs::read_to_string(dir.join("snap/main.tex")).unwrap(),
             "edited"
         );
+        // PDF figures are inputs; build outputs such as a stale .aux are not
+        assert_eq!(
+            std::fs::read_to_string(dir.join("snap/a/figure.pdf")).unwrap(),
+            "%PDF-1.5"
+        );
+        assert!(!dir.join("snap/main.aux").exists());
         // a second snapshot (files already present) is fine too
         write_snapshot(&project, &files, &dir.join("snap")).unwrap();
     }
