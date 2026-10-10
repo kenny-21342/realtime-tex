@@ -1800,6 +1800,51 @@ fn engine_thread(s: Arc<Shared>) {
                             continue;
                         }
                     };
+                    // a compile that changes state the leak check cannot see (an expl3
+                    // sequence the unit appends to, a register stepped through \csname) shows
+                    // when the same text is compiled again: its result moves
+                    let v = if matches!(v, ProbeVerdict::Verified) {
+                        link.probing = true;
+                        drop(link);
+                        let t_again = Instant::now();
+                        let res = srv.compile_with_pics(req.seq, &text, &req.pics);
+                        let mut relock = s.link.lock();
+                        relock.probing = false;
+                        relock.probe_us += t_again.elapsed().as_micros() as u64;
+                        link = relock;
+                        match res {
+                            Ok((cr, _)) => {
+                                let layout = s.layout.lock();
+                                if layout.layout_version != lv {
+                                    drop(layout);
+                                    drop(link);
+                                    s.pending.lock().insert(req.par_id, req);
+                                    s.pending_signal.0.send(()).ok();
+                                    continue;
+                                }
+                                let again = match &cr.dl {
+                                    Some(dl) => layout.probe_check(req.par_id, dl),
+                                    None => Err("no box".into()),
+                                };
+                                match again {
+                                    Ok(()) if cr.leaks.is_empty() && cr.status != "error" => ProbeVerdict::Verified,
+                                    Ok(()) => ProbeVerdict::Leak("the unit's second compile differs (leaks or errors)".into()),
+                                    Err(why) => ProbeVerdict::Leak(format!(
+                                        "the unit's result changes when it is compiled again ({why})"
+                                    )),
+                                }
+                            }
+                            Err(e) => {
+                                drop(link);
+                                engine_failed(&s, &req, e, wanted_gen, server.as_ref());
+                                server = None;
+                                reset_link(&s);
+                                continue;
+                            }
+                        }
+                    } else {
+                        v
+                    };
                     s.probe.lock().insert(req.par_id, (lv, v.clone()));
                     v
                 }

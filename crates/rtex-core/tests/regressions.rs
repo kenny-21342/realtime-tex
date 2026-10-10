@@ -131,3 +131,39 @@ fn a_fatal_error_after_earlier_passes_is_a_failure() {
     }
     s.close();
 }
+
+/// A paragraph that appends to a global expl3 sequence and prints it changes the live server's
+/// state on every compile, through a variable its source never names (the leak check compares
+/// the meanings of the names a unit mentions). Its probe matched the pass, so the edits after it
+/// were served with the items repeated (stress-test replay, `\skpush`/`\sklist`). The probe now
+/// compiles the snapshot twice: the second result differs, the unit is demoted.
+#[test]
+fn hidden_global_state_demotes_the_unit() {
+    let doc = "\\documentclass{article}\n\\ExplSyntaxOn\n\\seq_new:N \\g_t_seq\n\\NewDocumentCommand\\push{m}{\\seq_gput_right:Nn \\g_t_seq {#1}}\n\\NewDocumentCommand\\items{}{\\seq_use:Nn \\g_t_seq {,~}}\n\\ExplSyntaxOff\n\\begin{document}\n\\push{alpha}\\push{beta} The items are \\items.\n\nAnother paragraph.\n\\end{document}\n";
+    let Some(s) = open("hidden-state", doc) else {
+        return;
+    };
+    let (compile, ..) = final_layout(&s, 120, Duration::from_millis(500));
+    assert_eq!(compile, CompileStatus::Ok);
+    let at = doc.find("The items").unwrap();
+    let r = s
+        .apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "Now ".into() })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut served = vec![];
+    let mut demoted = vec![];
+    while Instant::now() < deadline && served.is_empty() && demoted.is_empty() {
+        for e in s.poll(Duration::from_millis(100)) {
+            match e {
+                Event::ParagraphUpdate { edit_id, status, dl, .. } if edit_id == r.edit_id && status == "ok" => {
+                    served.push(dl.lines.len())
+                }
+                Event::BackgroundScheduled { edit_id, reasons, .. } if edit_id == r.edit_id => demoted.extend(reasons),
+                _ => {}
+            }
+        }
+    }
+    assert!(served.is_empty(), "served live although its compile changes hidden state: {served:?} rows");
+    assert!(demoted.iter().any(|r| r.contains("compiled again")), "{demoted:?}");
+    s.close();
+}
