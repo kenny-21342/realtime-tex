@@ -241,6 +241,7 @@ fn over_budget_units_fall_back_to_background() {
     let mut cfg = SessionConfig::new(&project, "main.tex");
     cfg.build_dir = root.join("build");
     cfg.fast_budget = Duration::from_micros(1); // everything is over budget
+    cfg.fast_budget_factor = 0.0; // the floor alone
     let s = Session::open(cfg).unwrap();
     let (first, _) = s.wait_for(Duration::from_secs(300), |e| {
         matches!(e, Event::LayoutUpdate { .. })

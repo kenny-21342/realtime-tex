@@ -7,17 +7,22 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     project: PathBuf,
     main: String,
     build: Option<PathBuf>,
     fast_budget_ms: u64,
+    fast_budget_factor: f64,
+    pass_timeout_ms: u64,
     eligibility: &str,
     picture_cache: bool,
     debug_dir: Option<PathBuf>,
 ) -> Result<()> {
     let mut cfg = SessionConfig::new(project, main);
     cfg.fast_budget = std::time::Duration::from_millis(fast_budget_ms);
+    cfg.fast_budget_factor = fast_budget_factor;
+    cfg.pass_timeout = Duration::from_millis(pass_timeout_ms);
     cfg.picture_cache = picture_cache;
     if debug_dir.is_some() {
         cfg.debug_dir = debug_dir;

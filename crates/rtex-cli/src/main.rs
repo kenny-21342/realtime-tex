@@ -95,6 +95,15 @@ enum Cmd {
         /// times in a row goes to the background path until the next layout (default 5).
         #[arg(long, default_value_t = 5)]
         fast_budget_ms: u64,
+        /// The budget follows the document: a compile is over budget only when it also takes
+        /// longer than this many times the median of the session's recent compiles (default 4;
+        /// 0: --fast-budget-ms alone).
+        #[arg(long, default_value_t = 4.0)]
+        fast_budget_factor: f64,
+        /// A background pass still running after this many milliseconds is stopped and the
+        /// run fails (an endless loop; default 120000).
+        #[arg(long, default_value_t = 120_000)]
+        pass_timeout_ms: u64,
         /// How units qualify for the fast path: probe (default) or allowlist.
         #[arg(long, default_value = "probe")]
         eligibility: String,
@@ -258,6 +267,8 @@ fn main() -> anyhow::Result<()> {
             main,
             build,
             fast_budget_ms,
+            fast_budget_factor,
+            pass_timeout_ms,
             eligibility,
             no_picture_cache,
             debug_dir,
@@ -266,6 +277,8 @@ fn main() -> anyhow::Result<()> {
             main,
             build,
             fast_budget_ms,
+            fast_budget_factor,
+            pass_timeout_ms,
             &eligibility,
             !no_picture_cache,
             debug_dir,

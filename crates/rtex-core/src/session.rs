@@ -41,6 +41,12 @@ pub struct SessionConfig {
     /// Units whose last fast compile took longer than this are routed to the background path
     /// until the next layout (the host keeps its real-time guarantee).
     pub fast_budget: Duration,
+    /// The budget follows the document (default 4): a compile is over budget when it takes
+    /// longer than `fast_budget` and than this many times the median of the session's recent
+    /// live compiles. A font stack that makes every paragraph cost 8 ms (luaotfload node mode)
+    /// keeps its paragraphs live while a unit far slower than them (a plot) still leaves.
+    /// No unit is judged before the session has `BUDGET_SAMPLES` compiles. 0: `fast_budget` alone.
+    pub fast_budget_factor: f64,
     /// Extra block environments (theorem-like) treated as units, besides those found by scanning
     /// the preamble for `\newtheorem`.
     pub unit_envs: Vec<String>,
@@ -126,6 +132,7 @@ impl SessionConfig {
             compile_timeout: Duration::from_secs(5),
             pass_timeout: Duration::from_secs(120),
             fast_budget: Duration::from_millis(5),
+            fast_budget_factor: 4.0,
             unit_envs: Vec::new(),
             warm_background: true,
             eligibility: EligibilityMode::Probe,
@@ -356,6 +363,8 @@ struct Shared {
     slow_units: Mutex<HashMap<ParaId, (u64, u64)>>,
     /// Consecutive over-budget compiles per unit (the first ones may be loading fonts).
     slow_candidates: Mutex<HashMap<ParaId, u32>>,
+    /// Round trips of the latest live compiles (µs, newest last; `fast_budget_factor`).
+    live_compile_us: Mutex<std::collections::VecDeque<u64>>,
     edit_counter: AtomicU64,
     convergence: Mutex<Option<Convergence>>,
     overlays: Mutex<HashMap<ParaId, Revision>>,
@@ -477,6 +486,7 @@ impl Session {
             inputted: Mutex::new(crate::document::inputted_files(&texts)),
             slow_units: Mutex::new(HashMap::new()),
             slow_candidates: Mutex::new(HashMap::new()),
+            live_compile_us: Mutex::new(std::collections::VecDeque::new()),
             edit_counter: AtomicU64::new(0),
             convergence: Mutex::new(None),
             overlays: Mutex::new(HashMap::new()),
@@ -2333,7 +2343,19 @@ fn handle_result(
     // layout. The first slow compiles of a unit are forgiven (font loading, cold caches); three
     // in a row mark the unit.
     const STRIKES: u32 = 3;
-    if total_us > s.cfg.fast_budget.as_micros() as u64 {
+    let budget_us = {
+        let mut recent = s.live_compile_us.lock();
+        let b = effective_budget_us(s.cfg.fast_budget.as_micros() as u64, s.cfg.fast_budget_factor, &recent);
+        if recent.len() == BUDGET_WINDOW {
+            recent.pop_front();
+        }
+        recent.push_back(total_us);
+        b
+    };
+    let Some(budget_us) = budget_us else {
+        return;
+    };
+    if total_us > budget_us {
         if s.bg_running.load(Ordering::SeqCst) {
             // a layout pass is using the CPU: a slow round trip now says nothing about the unit
             return;
@@ -2357,6 +2379,26 @@ fn handle_result(
     } else {
         s.slow_candidates.lock().remove(&req.par_id);
     }
+}
+
+/// Live compiles the budget's median is taken over, and how many it needs before it judges.
+const BUDGET_WINDOW: usize = 64;
+const BUDGET_SAMPLES: usize = 8;
+
+/// The budget a live compile is held to (µs): `floor_us` (`fast_budget`), or `factor` times the
+/// median of the session's recent compiles when that is larger. `None` (judge nothing) while
+/// fewer than `BUDGET_SAMPLES` compiles are known, unless `factor` is 0 (the floor alone).
+fn effective_budget_us(floor_us: u64, factor: f64, recent: &std::collections::VecDeque<u64>) -> Option<u64> {
+    if factor <= 0.0 {
+        return Some(floor_us);
+    }
+    if recent.len() < BUDGET_SAMPLES {
+        return None;
+    }
+    let mut v: Vec<u64> = recent.iter().copied().collect();
+    v.sort_unstable();
+    let median = v[v.len() / 2];
+    Some(floor_us.max((median as f64 * factor) as u64))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3445,5 +3487,26 @@ fn locate_standby_diagnostics(s: &Shared, items: &mut [Diagnostic]) {
             });
             d.line = line;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn the_budget_follows_the_document() {
+        let of = |v: &[u64]| v.iter().copied().collect::<VecDeque<u64>>();
+        // nothing is judged before the document's cost is known; factor 0 is the floor alone
+        assert_eq!(effective_budget_us(5000, 4.0, &of(&[9000; 7])), None);
+        assert_eq!(effective_budget_us(5000, 0.0, &of(&[])), Some(5000));
+        // a fast document keeps the floor
+        assert_eq!(effective_budget_us(5000, 4.0, &of(&[900, 1000, 1100, 800, 1200, 1000, 950, 1050])), Some(5000));
+        // OpenType node mode: paragraphs at ~8 ms stay under the budget, a 60 ms plot does not
+        let slow = of(&[7000, 8000, 9000, 6500, 12000, 8500, 60000, 7500]);
+        let b = effective_budget_us(5000, 4.0, &slow).unwrap();
+        assert_eq!(b, 34000);
+        assert!(16000 < b && 60000 > b);
     }
 }

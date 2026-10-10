@@ -36,7 +36,7 @@ pub extern "C" fn rtex_version() -> *const c_char {
 
 /// Open a session. `config_json`: {"project_root": "...", "main_file": "main.tex",
 /// "build_dir": "...", "debounce_ms": 300, "max_passes": 5, "trusted_macros": [...],
-/// "fast_on_stale_context": true, "compile_timeout_ms": 5000, "pass_timeout_ms": 120000, "fast_budget_ms": 5, "unit_envs": [...], "warm_background": true, "eligibility": "probe"|"allowlist", "picture_cache": true, "debug_dir": "/path"}. On failure returns null and
+/// "fast_on_stale_context": true, "compile_timeout_ms": 5000, "pass_timeout_ms": 120000, "fast_budget_ms": 5, "fast_budget_factor": 4, "unit_envs": [...], "warm_background": true, "eligibility": "probe"|"allowlist", "picture_cache": true, "debug_dir": "/path"}. On failure returns null and
 /// writes an error message to `*err_out` (free with rtex_string_free).
 #[no_mangle]
 pub unsafe extern "C" fn rtex_session_open(
@@ -78,6 +78,9 @@ pub unsafe extern "C" fn rtex_session_open(
     }
     if let Some(ms) = v.get("pass_timeout_ms").and_then(|x| x.as_u64()) {
         cfg.pass_timeout = Duration::from_millis(ms);
+    }
+    if let Some(f) = v.get("fast_budget_factor").and_then(|x| x.as_f64()) {
+        cfg.fast_budget_factor = f;
     }
     if let Some(ms) = v.get("fast_budget_ms").and_then(|x| x.as_u64()) {
         cfg.fast_budget = Duration::from_millis(ms);
