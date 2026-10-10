@@ -267,7 +267,29 @@ pub struct CaptureResult {
     pub pic_fragments: BTreeMap<String, crate::piccache::Fragment>,
 }
 
+/// LuaTeX's last word after a fatal error (an emergency stop, 100 errors, a runaway argument at
+/// the end of the file).
+const NO_PDF: &str = "no output PDF file produced";
+
+/// True when the end of `log` says LuaTeX stopped on a fatal error.
+pub fn log_says_fatal(log: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(log) else { return false };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(4096)));
+    let mut tail = Vec::new();
+    let _ = f.read_to_end(&mut tail);
+    String::from_utf8_lossy(&tail).contains(NO_PDF)
+}
+
 impl CaptureResult {
+    /// The pass ended on a fatal error: LuaTeX produced no PDF, although it may have shipped
+    /// pages (the capture has them) and left a partial file behind (opened at the first
+    /// shipout, never finished).
+    pub fn fatal(&self) -> bool {
+        !self.pdf.exists() || log_says_fatal(&self.log)
+    }
+
     pub fn page(&self, n: i64) -> Result<DisplayList> {
         let p = self
             .out_dir
@@ -367,7 +389,14 @@ pub fn collect_capture(
     let pdf = out_dir.join(format!("{jobname}.pdf"));
     let json = if instrumented {
         let jp = out_dir.join(format!("{jobname}.rtex.json"));
-        if !jp.exists() {
+        // written at \end{document}: a pass that stopped earlier (a fatal error) leaves the file
+        // of an earlier pass in the same directory, which is not this pass's capture
+        let started = std::time::SystemTime::now() - wall - std::time::Duration::from_secs(1);
+        let fresh = std::fs::metadata(&jp)
+            .and_then(|m| m.modified())
+            .map(|t| t >= started)
+            .unwrap_or(false);
+        if !fresh {
             bail!(
                 "capture run produced no {}; lualatex exit {:?}\n{}",
                 jp.display(),

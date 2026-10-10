@@ -98,3 +98,36 @@ fn a_node_named_in_one_picture_and_used_in_another() {
     assert_eq!(convergence, Convergence::Converged);
     s.close();
 }
+
+/// A pass that stops on a fatal error before `\\end{document}` (here TeX's limit of 100 errors)
+/// writes no capture and no PDF, only a partial file. The capture of an earlier pass in the same
+/// directory used to be taken for it: a layout "with errors" showing stale pages, the
+/// half-written PDF as the fallback for degraded pages (stress-test replay, typing into
+/// `\\pdfextension info`). It is a failure: the previous layout stays.
+#[test]
+fn a_fatal_error_after_earlier_passes_is_a_failure() {
+    let doc = "\\documentclass{article}\n\\begin{document}\nFirst page.\n\\clearpage\nSecond page.\n\\end{document}\n";
+    let Some(s) = open("fatal", doc) else {
+        return;
+    };
+    // two good runs: both pass directories hold a capture
+    let (compile, ..) = final_layout(&s, 120, Duration::from_millis(500));
+    assert_eq!(compile, CompileStatus::Ok);
+    let at = doc.find("Second page.").unwrap();
+    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "Again. ".into() }).unwrap();
+    s.request_layout();
+    let (compile, ..) = final_layout(&s, 120, Duration::from_millis(500));
+    assert_eq!(compile, CompileStatus::Ok);
+    let at = s.document_text("main.tex").unwrap().find("\\end{document}").unwrap();
+    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "\\undefinedmacro\n".repeat(101) }).unwrap();
+    s.request_layout();
+    let (compile, convergence, errors, _) = final_layout(&s, 120, Duration::from_secs(1));
+    assert_eq!(compile, CompileStatus::Failed, "errors: {errors:?}");
+    match convergence {
+        Convergence::PassLimitReached { reasons, .. } => {
+            assert!(reasons.iter().any(|r| r.contains("fatal")), "{reasons:?}")
+        }
+        c => panic!("a failed pass ends the run, got {c:?}"),
+    }
+    s.close();
+}

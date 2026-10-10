@@ -2579,7 +2579,8 @@ fn run_background_pass_inner(s: &Shared) {
         *pic_fragments.lock().unwrap() = cache.fragments(&pics);
     };
     let absorb = |cap: &crate::capture::CaptureResult| {
-        if pics.is_empty() {
+        // a pass that ended on a fatal error has no (complete) PDF to take pictures from
+        if pics.is_empty() || cap.fatal() {
             return;
         }
         if let Err(e) = pic_cache.lock().unwrap().absorb(
@@ -2814,7 +2815,10 @@ fn deliver_layout(
         }
     }
     let errors = diagnostics.iter().filter(|d| d.severity == "error").count();
-    let compile = if cap.json.pages == 0 {
+    // a fatal error leaves no PDF (at most a partial one) even when pages were shipped: the
+    // pass is a failure, the previous layout stays
+    let fatal = cap.fatal();
+    let compile = if cap.json.pages == 0 || fatal {
         CompileStatus::Failed
     } else if errors > 0 {
         CompileStatus::CompiledWithErrors { count: errors }
@@ -2837,7 +2841,7 @@ fn deliver_layout(
                 compile,
                 convergence: Convergence::PassLimitReached {
                     passes: passes,
-                    reasons: vec!["no pages".into()],
+                    reasons: vec![if fatal { "fatal error: no PDF".into() } else { "no pages".into() }],
                 },
                 passes: passes,
                 pages_changed: vec![],
@@ -3134,14 +3138,15 @@ fn run_export(s: &Shared, job: u64, out: PathBuf) {
         Ok(o) => {
             let diags = parse_log(&o.capture.log);
             let errors = diags.iter().filter(|d| d.severity == "error").count();
-            let status = if !o.capture.pdf.exists() {
+            let fatal = o.capture.fatal();
+            let status = if fatal {
                 CompileStatus::Failed
             } else if errors > 0 {
                 CompileStatus::CompiledWithErrors { count: errors }
             } else {
                 CompileStatus::Ok
             };
-            let path = if o.capture.pdf.exists() {
+            let path = if !fatal {
                 if let Some(parent) = out.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
