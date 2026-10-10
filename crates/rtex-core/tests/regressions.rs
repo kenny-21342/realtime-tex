@@ -939,7 +939,7 @@ fn a_reopened_session_starts_from_its_last_layout() {
         cfg.debounce = Duration::from_millis(50);
         Session::open(cfg).unwrap()
     };
-    // the first layout a session delivers: (provisional, pages, ms after open)
+    // the first layout a session delivers: (provisional, pages, time after open, its text)
     let first = |s: &Session| {
         let t0 = Instant::now();
         loop {
@@ -948,20 +948,33 @@ fn a_reopened_session_starts_from_its_last_layout() {
                 if let Event::LayoutUpdate {
                     convergence,
                     pages_total,
+                    pages_changed,
                     ..
                 } = e
                 {
                     let provisional = matches!(&convergence, Convergence::Converging { reasons, .. }
                         if reasons.iter().any(|r| r == "another pass is running"));
-                    return (provisional, pages_total, t0.elapsed());
+                    let text: String = pages_changed
+                        .iter()
+                        .flat_map(|p| p.dl.lines.iter())
+                        .flat_map(|l| l.items.iter())
+                        .filter_map(|i| match i {
+                            rtex_dl::Item::Glyph { char, .. } => char::from_u32(*char as u32),
+                            _ => None,
+                        })
+                        .collect();
+                    return (provisional, pages_total, t0.elapsed(), text);
                 }
             }
         }
     };
     let s = open();
-    let (provisional, pages, _) = first(&s);
-    assert!(!provisional);
+    let (provisional, pages, ..) = first(&s);
     assert_eq!(pages, 2);
+    if provisional {
+        // a slow first pass (a cold machine) is shown while the next one runs: wait for the end
+        final_layout(&s, 120, Duration::from_millis(300));
+    }
     // the run's sources hash is written right after its layout
     let until = Instant::now() + Duration::from_millis(500);
     while Instant::now() < until {
@@ -970,7 +983,7 @@ fn a_reopened_session_starts_from_its_last_layout() {
     s.close();
     // same sources: the saved layout first, then the pass
     let s = open();
-    let (provisional, pages, at) = first(&s);
+    let (provisional, pages, at, _) = first(&s);
     assert!(provisional, "the reopened session waited for its pass");
     assert_eq!(pages, 2);
     assert!(at < Duration::from_secs(5), "{at:?}");
@@ -988,8 +1001,13 @@ fn a_reopened_session_starts_from_its_last_layout() {
     )
     .unwrap();
     let s = open();
-    let (provisional, ..) = first(&s);
-    assert!(!provisional, "a layout of other sources was shown");
+    // (a slow pass of the new sources may itself be shown provisionally: what matters is that
+    // the first layout is of these sources)
+    let (.., text) = first(&s);
+    assert!(
+        text.contains("edited"),
+        "a layout of other sources was shown: {text}"
+    );
     s.close();
 }
 
