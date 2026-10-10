@@ -90,6 +90,11 @@ pub struct Report {
     pub paragraphs: Vec<ParagraphVerdict>,
     pub pages: Vec<PageVerdict>,
     pub pages_degraded: usize,
+    /// Degraded pages that native drawing resolves (`rtex_dl::gfx`); checked against MuPDF by
+    /// scripts/gfx_compare.py, not here.
+    pub pages_native: usize,
+    /// Why the other degraded pages are not drawn natively (first unsupported thing, counted).
+    pub native_blockers: std::collections::BTreeMap<String, usize>,
     pub capture_pdf_equals_clean: bool,
     pub layer1_pass: bool,
     pub layer2_pass: bool,
@@ -599,7 +604,22 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
         }
         if degraded {
             report.pages_degraded += 1;
-            println!("  page {page_no}: DEGRADED {} (host falls back to the PDF page); glyphs matched {}/{} (pdf {})", dl.flags, rep.matched, rep.dl_glyphs, rep.pdf_glyphs);
+            let native = if rtex_dl::gfx::only_literals(&dl) {
+                rtex_dl::gfx::native_graphics(&dl).map_err(|e| e.what)
+            } else {
+                Err(format!("flags {}", dl.flags))
+            };
+            let how = match &native {
+                Ok(n) => {
+                    report.pages_native += 1;
+                    format!("native drawing ({} ops)", n.ops.len())
+                }
+                Err(why) => {
+                    *report.native_blockers.entry(why.clone()).or_default() += 1;
+                    format!("host falls back to the PDF page; not native: {why}")
+                }
+            };
+            println!("  page {page_no}: DEGRADED {} ({how}); glyphs matched {}/{} (pdf {})", dl.flags, rep.matched, rep.dl_glyphs, rep.pdf_glyphs);
         }
         if opts.raster {
             let ref_png = opts.build.join(format!("ref-p{page_no}.png"));
@@ -643,8 +663,8 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
     report.layer2_pass = l2_ok;
     report.layer3_pass = l3_ok;
     let pages_exact = report.pages.iter().filter(|p| p.exact).count();
-    println!("layer 2 (pages vs PDF content stream): {} pages, {} exact, {} degraded (PDF fallback), pass={}; worst anchored dx {:.5} bp, worst interior dx {:.5} bp",
-        report.pages.len(), pages_exact, report.pages_degraded, l2_ok,
+    println!("layer 2 (pages vs PDF content stream): {} pages, {} exact, {} degraded ({} drawn natively, {} PDF fallback), pass={}; worst anchored dx {:.5} bp, worst interior dx {:.5} bp",
+        report.pages.len(), pages_exact, report.pages_degraded, report.pages_native, report.pages_degraded - report.pages_native, l2_ok,
         report.pages.iter().map(|p| p.anchored_max_dx_bp).fold(0.0, f64::max), report.pages.iter().map(|p| p.interior_max_dx_bp).fold(0.0, f64::max));
     if opts.raster {
         let worst = report

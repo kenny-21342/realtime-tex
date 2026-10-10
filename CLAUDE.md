@@ -13,11 +13,22 @@ Branch `kenny/main` is the working branch (the fork's default); `main` mirrors u
 
 ## Local changes on top of upstream 25b3f8f
 1. `crates/rtex-core/src/engine.rs`: poll the response FIFO in 2 ms slices (macOS `poll()` is not woken by a
-   FIFO write; without it the 5 s watchdog kills the server). Whether Linux needs it is an open question
-   the first cloud run answers (see below).
+   FIFO write; without it the 5 s watchdog kills the server). **Linux does not need it** (2026-10-09 cloud run:
+   all tests pass 3/3 without it; strace shows the blocking poll woken by the write in 0.3-137 ms). Kept
+   unconditionally: harmless on Linux.
 2. `crates/rtex-core/tests/mutation.rs`: random-edit correctness test (env vars documented in its header,
-   plus `RTEX_MUTATION_NO_PICCACHE`).
-3. `scripts/fixtures-verify.sh`, `scripts/fixtures-mutation.sh`, `scripts/serve_convergence.py`, `scripts/cloud-setup.sh` (light), `scripts/cloud-texlive.sh`.
+   plus `RTEX_MUTATION_NO_PICCACHE`, `RTEX_MUTATION_WAIT`). It edits text only (no option lists, no picture code),
+   prints the session state and last events when a clean pass does not converge, and fails (instead of a
+   silent `ok`) when `RTEX_MUTATION_PROJECT` is set but TeX Live is missing.
+3. Fixes for the math/phy "clean pass did not converge" hangs (`tests/regressions.rs` reproduces both):
+   - `session.rs`: a final pass with a stable aux family but compile errors ends as `PassLimitReached`
+     (it said `Converging`, promising a pass that never ran; docs/CONVERGENCE.md).
+   - `piccache.rs`: pictures linked by a pgf node name (one names a node, another uses it) are not cached.
+4. `scripts/fixtures-verify.sh`, `scripts/fixtures-mutation.sh`, `scripts/serve_convergence.py`, `scripts/cloud-setup.sh` (light), `scripts/cloud-texlive.sh`.
+
+Native TikZ drawing (Phase C: pgf literals, shadings and cached pictures drawn from the display list,
+checked against MuPDF by `scripts/gfx_compare.py` / `scripts/gfx_shading_check.py`) is on branch
+`claude/sharp-mayer-f5z1vz` for review, not yet on `kenny/main`.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by
@@ -31,9 +42,9 @@ Foreground commands are capped at 10 minutes: run `cargo test`, verify and mutat
 Attach the private repo `kenny-21342/rtex-fixtures` to the session; it is cloned next to this repo.
 `export RTEX_FIXTURES=<path to rtex-fixtures>/fixtures/ours`. Read `<rtex-fixtures>/notes/PLAN-next-session.md` first.
 
-## First tasks (Linux control)
-1. `cargo build --release -p rtex-cli`; `cargo test -p rtex-core` with the poll fix as committed, record every failure verbatim.
-2. Same with the fix reverted (`git stash`/revert locally, do not commit): do `boundary_change_and_preamble_change`
-   and `every_unit_kind_takes_the_fast_path` pass on Linux without it? (macOS: fail 3/3 without, pass 3/3 with.)
-3. `scripts/fixtures-verify.sh` and compare with the expected table in the plan (all four: 0 differing units).
-4. `scripts/fixtures-mutation.sh 30 21`: math and phy ended with "the clean pass did not converge" on macOS; find out whether Linux does too.
+## Linux control (done 2026-10-09; results in rtex-fixtures `notes/linux-cloud/`)
+Verify matches the macOS table on all four fixtures; econ-notes needs `makecell` (now in `install-texlive.sh`) and
+the DengXian font (Microsoft, not on Linux: run it from a copy with `WenQuanYi Zen Hei`, see
+`notes/linux-cloud/econ-font-substitution.diff`). After the fixes above, `scripts/fixtures-mutation.sh 30 21` gives
+30/30 served and equal on all four. `over_budget_units_fall_back_to_background` is load sensitive: run the suite
+on an otherwise idle machine.

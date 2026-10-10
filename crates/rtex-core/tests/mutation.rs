@@ -11,9 +11,12 @@
 //!   RTEX_MUTATION_BATCH    max edits per pass, on distinct paragraphs (default 3)
 //!   RTEX_MUTATION_SEED     seed (default 1)
 //!   RTEX_MUTATION_REPORT   write the per-edit verdicts as JSON to this path
+//!   RTEX_MUTATION_WAIT     seconds to wait for a clean pass to converge (default 900)
 //!   RTEX_MUTATION_SABOTAGE=1  corrupt one glyph of every served result before comparing: the
 //!                          test must then fail (negative control for the comparison itself)
-//! Skipped without lualatex.
+//! Skipped without lualatex, except when RTEX_MUTATION_PROJECT is set: then a missing TeX Live is
+//! an error (a skip would otherwise report `ok` for a run that tested nothing).
+//! On a timeout the test prints the session state and the last events it saw.
 
 use rtex_core::fixtures::{generate, FontSet, Variant};
 use rtex_core::layout::Fragment;
@@ -40,11 +43,12 @@ fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
-/// Lowercase ASCII words delimited by single spaces, outside math and braces, not part of a
-/// control sequence: editing them cannot break the paragraph's syntax.
+/// Lowercase ASCII words delimited by single spaces, outside math, braces and brackets (option
+/// lists: `\draw[line width=1pt]`), not part of a control sequence: editing them cannot break
+/// the paragraph's syntax.
 fn safe_words(par: &str) -> Vec<(usize, usize)> {
     let b = par.as_bytes();
-    let (mut depth, mut dollars) = (0i32, 0usize);
+    let (mut depth, mut brackets, mut dollars) = (0i32, 0i32, 0usize);
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
@@ -52,6 +56,8 @@ fn safe_words(par: &str) -> Vec<(usize, usize)> {
         match c {
             b'{' => depth += 1,
             b'}' => depth -= 1,
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
             b'$' => dollars += 1,
             b'\\' => {
                 // skip the control sequence / escaped character
@@ -63,7 +69,7 @@ fn safe_words(par: &str) -> Vec<(usize, usize)> {
             }
             _ => {}
         }
-        if c.is_ascii_lowercase() && depth == 0 && dollars % 2 == 0 && (i == 0 || b[i - 1] == b' ')
+        if c.is_ascii_lowercase() && depth == 0 && brackets <= 0 && dollars % 2 == 0 && (i == 0 || b[i - 1] == b' ')
         {
             let s = i;
             while i < b.len() && b[i].is_ascii_lowercase() {
@@ -81,6 +87,14 @@ fn safe_words(par: &str) -> Vec<(usize, usize)> {
 
 /// A random mutation of the paragraph at `base` (absolute byte offset of `par`): (name, edit).
 fn mutate(rng: &mut Rng, par: &str, base: usize) -> Option<(&'static str, Edit)> {
+    // picture code in a paragraph (an inline tikzpicture or plot) is not text: a word there is
+    // a key or a coordinate name
+    if ["\\begin{tikzpicture}", "\\tikz", "\\begin{axis}", "\\addplot", "\\draw", "\\begin{circuitikz}"]
+        .iter()
+        .any(|k| par.contains(k))
+    {
+        return None;
+    }
     let words = safe_words(par);
     if words.len() < 3 {
         return None;
@@ -127,13 +141,52 @@ struct State {
     eligible: Vec<ParaId>,
     versions: Option<Versions>,
     converged: bool,
+    /// The run ended (`Converged` or `PassLimitReached`): no further pass comes on its own.
+    ended: bool,
     // keyed by (edit, paragraph): one edit can touch several spans (a split), each answers on its own
     updates: HashMap<(u64, ParaId), (ParaId, String, Vec<String>, bool, DisplayList)>,
     layouts: u32,
+    /// The last events, one line each, with the time since the test started.
+    log: std::collections::VecDeque<String>,
+    t0: Instant,
 }
 
 impl State {
+    fn note(&mut self, e: &Event) {
+        let line = match e {
+            Event::LayoutUpdate { versions, compile, convergence, passes, pages_changed, pages_total, wall_ms, .. } => format!(
+                "LayoutUpdate rev {} layout_v {} gen {} compile {:?} convergence {:?} passes {} pages_changed {} of {} wall {} ms",
+                versions.source_revision, versions.layout_version, versions.engine_generation, compile, convergence, passes, pages_changed.len(), pages_total, wall_ms
+            ),
+            Event::ParagraphUpdate { par_id, edit_id, status, reasons, versions, .. } => {
+                format!("ParagraphUpdate par {par_id:?} edit {edit_id} status {status} reasons {reasons:?} rev {}", versions.source_revision)
+            }
+            Event::Diagnostics { source, items } => format!(
+                "Diagnostics {source}: {} item(s){}",
+                items.len(),
+                items.iter().find(|d| d.severity == "error").or(items.first()).map(|d| format!(", first error (or item): {}", serde_json::to_string(d).unwrap_or_default().chars().take(300).collect::<String>())).unwrap_or_default()
+            ),
+            Event::EngineState { engine_generation, state, reason } => format!("EngineState gen {engine_generation} {state} {reason:?}"),
+            Event::BackgroundScheduled { par_id, reasons, edit_id } => format!("BackgroundScheduled par {par_id:?} edit {edit_id} reasons {reasons:?}"),
+            Event::PdfExported { job_id, status, converged, passes, .. } => format!("PdfExported job {job_id} {status:?} converged {converged} passes {passes}"),
+        };
+        self.log.push_back(format!("{:9.3}s {line}", self.t0.elapsed().as_secs_f64()));
+        if self.log.len() > 60 {
+            self.log.pop_front();
+        }
+    }
+    fn dump(&self, s: &Session, what: &str) -> String {
+        format!(
+            "{what}\n  state: layouts {} converged {} versions {:?} session versions {:?}\n  last events:\n    {}",
+            self.layouts,
+            self.converged,
+            self.versions,
+            s.versions(),
+            self.log.iter().cloned().collect::<Vec<_>>().join("\n    ")
+        )
+    }
     fn absorb(&mut self, e: Event) {
+        self.note(&e);
         match e {
             Event::LayoutUpdate {
                 versions,
@@ -151,6 +204,7 @@ impl State {
                 self.kinds = pl.iter().map(|p| (p.par_id, p.kind.clone())).collect();
                 self.eligible = eligible_paragraphs;
                 self.converged = matches!(convergence, Convergence::Converged);
+                self.ended = matches!(convergence, Convergence::Converged | Convergence::PassLimitReached { .. });
                 self.versions = Some(versions);
                 self.layouts += 1;
             }
@@ -269,10 +323,15 @@ fn diff(fast: &DisplayList, rows: &[(&Line, &DisplayList)]) -> Vec<String> {
 
 #[test]
 fn random_edits_are_never_served_wrong() {
-    if rtex_core::texlive::TexLive::discover().is_err() {
+    if let Err(e) = rtex_core::texlive::TexLive::discover() {
+        assert!(
+            std::env::var("RTEX_MUTATION_PROJECT").is_err(),
+            "RTEX_MUTATION_PROJECT is set but TeX Live was not found: {e:#}"
+        );
         eprintln!("SKIP: no TeX Live");
         return;
     }
+    let wait = Duration::from_secs(env_or("RTEX_MUTATION_WAIT", 900));
     let root = std::env::temp_dir().join(format!("rtex-mutation-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let project = root.join("project");
@@ -300,13 +359,15 @@ fn random_edits_are_never_served_wrong() {
         eligible: vec![],
         versions: None,
         converged: false,
+        ended: false,
         updates: HashMap::new(),
         layouts: 0,
+        log: Default::default(),
+        t0: Instant::now(),
     };
-    assert!(
-        st.pump(&s, Duration::from_secs(900), |st| st.layouts > 0),
-        "no first layout"
-    );
+    if !st.pump(&s, wait, |st| st.layouts > 0) {
+        panic!("{}", st.dump(&s, "no first layout"));
+    }
     let mut report: Vec<serde_json::Value> = Vec::new();
     let (mut matched, mut wrong, mut declined, mut no_update, mut skipped, mut attribution_only) = (0, 0, 0, 0, 0, 0);
     let mut done = 0;
@@ -355,10 +416,15 @@ fn random_edits_are_never_served_wrong() {
         let rev = s.versions().source_revision;
         let before = st.layouts;
         s.request_layout();
-        let ok = st.pump(&s, Duration::from_secs(900), |st| {
-            st.layouts > before && st.converged && st.versions.as_ref().map(|v| v.source_revision >= rev).unwrap_or(false)
+        let ok = st.pump(&s, wait, |st| {
+            st.layouts > before && st.ended && st.versions.as_ref().map(|v| v.source_revision >= rev).unwrap_or(false)
         });
-        assert!(ok, "the clean pass did not converge");
+        if ok && !st.converged {
+            panic!("{}", st.dump(&s, "the clean pass ended without converging"));
+        }
+        if !ok {
+            panic!("{}", st.dump(&s, &format!("the clean pass did not converge (waited {} s for source revision {rev:?}, layouts before request {before})", wait.as_secs())));
+        }
         for (name, id, eid, note) in &applied {
             done += 1;
             let verdict;

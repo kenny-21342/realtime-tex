@@ -40,6 +40,46 @@
 \directlua{token.set_macro("rtex@picenvs", table.concat(rtex_capture.PICTURE_ENVS, ","))}
 \input{rtex-pic.tex}
 \AddToHook{begindocument/end}{\rtex@wrappicall}
+% pgf's PDF literals, made from Lua so the display list can read their operators (see
+% rtex_capture.literal). \protected: like the primitive, never expanded inside an \edef.
+\def\rtex@hookpgfliterals{%
+  \ifdefined\pgfsys@invoke
+    \protected\def\pgfsys@invoke##1{\directlua{rtex_capture.literal("\luaescapestring{##1}")}}%
+    \protected\def\pgfsys@color@unstacked##1{\directlua{rtex_capture.literal("\luaescapestring{\csname\string\color@##1\endcsname}")}}%
+  \fi}
+\AddToHook{begindocument/before}{\rtex@hookpgfliterals}
+% pgf's axial and radial shadings: record what each saved form paints (rtex_capture.shading).
+% The coordinates are computed exactly as pgfsys-luatex.def computes them. Installed when the
+% driver is read (shadings declared in the preamble are saved there) and, failing that, at
+% \begin{document}.
+\def\rtex@shadinginfo#1#2#3#4{{%
+  \pgf@parsefunc{#4}%
+  \ifx#1r%
+    \pgf@process{#3}\pgf@xa=\pgf@x \pgf@ya=\pgf@y
+    \pgf@process{\pgfpoint{\pgf@max}{\pgf@max}}%
+    \advance\pgf@xa by \pgf@x \advance\pgf@ya by \pgf@y
+    \pgf@sys@bp@correct{\pgf@x}\pgf@sys@bp@correct{\pgf@y}%
+    \pgf@sys@bp@correct{\pgf@xa}\pgf@sys@bp@correct{\pgf@ya}%
+    \edef\rtex@tmp{\pgf@sys@tonumber{\pgf@xa} \pgf@sys@tonumber{\pgf@ya} \pgf@doma\space \pgf@sys@tonumber{\pgf@x} \pgf@sys@tonumber{\pgf@y} \pgf@domb}%
+    \def\rtex@kind{radial}\def\rtex@ext{true false}%
+  \else
+    \ifx#1h\edef\rtex@tmp{\pgf@doma\space0 \pgf@domb\space0}\else\edef\rtex@tmp{0 \pgf@doma\space0 \pgf@domb}\fi
+    \def\rtex@kind{axial}\def\rtex@ext{false false}%
+  \fi
+  \directlua{rtex_capture.shading(\the\lastsavedboxresourceindex, "\rtex@kind",
+    "\luaescapestring{\pgf@shading@device}", "\luaescapestring{\pgf@pdfparseddomain}",
+    "\luaescapestring{\rtex@tmp}", "\luaescapestring{\pgf@pdfparsedfunction}", "\rtex@ext")}}}
+\def\rtex@hookpgfshadings{%
+  \ifdefined\rtex@pgf@horishading\else\ifdefined\pgfsys@horishading
+    \let\rtex@pgf@horishading\pgfsys@horishading
+    \def\pgfsys@horishading##1##2##3{\rtex@pgf@horishading{##1}{##2}{##3}\rtex@shadinginfo h{##2}{}{##3}}%
+    \let\rtex@pgf@vertshading\pgfsys@vertshading
+    \def\pgfsys@vertshading##1##2##3{\rtex@pgf@vertshading{##1}{##2}{##3}\rtex@shadinginfo v{##2}{}{##3}}%
+    \let\rtex@pgf@radialshading\pgfsys@radialshading
+    \def\pgfsys@radialshading##1##2##3{\rtex@pgf@radialshading{##1}{##2}{##3}\rtex@shadinginfo r{}{##2}{##3}}%
+  \fi\fi}
+\AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfshadings}
+\AddToHook{begindocument/before}{\rtex@hookpgfshadings}
 % Map image resource indices to files so IMAGE display-list items can name their source.
 \AddToHook{package/graphicx/after}{%
   \AddToHook{cmd/Gin@setfile/after}{%

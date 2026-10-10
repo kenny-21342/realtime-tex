@@ -179,6 +179,10 @@ pub struct PageUpdate {
     pub exact: bool,
     pub hash: u64,
     pub dl: DisplayList,
+    /// A degraded page that native drawing resolves (TikZ / pgf literals and shadings): the
+    /// drawing operations (docs/DISPLAY_LIST.md, Native drawing). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<rtex_dl::gfx::NativePage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2557,16 +2561,22 @@ fn run_background_pass_inner(s: &Shared) {
     };
     let pic_cache =
         std::sync::Mutex::new(crate::piccache::PicCache::open(&out_dir.join("pic-cache")));
+    // the drawings of the pictures the manifest offers: a pass that takes them from the cache
+    // gets them back in its page lists (native drawing of cached pictures)
+    let pic_fragments = std::sync::Mutex::new(BTreeMap::new());
     // written into the directory of the pass about to run (the capture reads it from there)
     let refresh_manifest = |dir: &Path| {
         let manifest = dir.join("pic-manifest.json");
         if pics.is_empty() {
             let _ = std::fs::remove_file(&manifest);
+            *pic_fragments.lock().unwrap() = BTreeMap::new();
             return;
         }
-        if let Err(e) = pic_cache.lock().unwrap().write_manifest(&pics, &manifest) {
+        let mut cache = pic_cache.lock().unwrap();
+        if let Err(e) = cache.write_manifest(&pics, &manifest) {
             log::warn!("picture cache manifest: {e:#}");
         }
+        *pic_fragments.lock().unwrap() = cache.fragments(&pics);
     };
     let absorb = |cap: &crate::capture::CaptureResult| {
         if pics.is_empty() {
@@ -2675,7 +2685,8 @@ fn run_background_pass_inner(s: &Shared) {
             ) {
                 *s.standby.lock() = Some(next);
             }
-            let cap = w.run(&s.cfg.project_root, &texts, &s.cfg.main_file)?;
+            let mut cap = w.run(&s.cfg.project_root, &texts, &s.cfg.main_file)?;
+            cap.pic_fragments = pic_fragments.lock().unwrap().clone();
             finished(&cap);
             Ok(cap)
         };
@@ -2694,7 +2705,7 @@ fn run_background_pass_inner(s: &Shared) {
         let dir = pass_dir(s, 0);
         let mut runner = |_pass: u32| -> Result<crate::capture::CaptureResult> {
             prepare_dir(&dir);
-            let cap = crate::capture::run_capture_with(
+            let mut cap = crate::capture::run_capture_with(
                 &s.tl,
                 &snap_dir,
                 &s.cfg.main_file,
@@ -2702,6 +2713,7 @@ fn run_background_pass_inner(s: &Shared) {
                 true,
                 &unit_envs,
             )?;
+            cap.pic_fragments = pic_fragments.lock().unwrap().clone();
             finished(&cap);
             Ok(cap)
         };
@@ -3027,7 +3039,9 @@ fn deliver_layout(
         }
     } else if aux_stable && errors == 0 {
         Convergence::Converged
-    } else if !aux_stable && passes >= s.cfg.max_passes {
+    } else if (!aux_stable && passes >= s.cfg.max_passes) || (aux_stable && errors > 0) {
+        // the run is over: either out of passes, or stable with errors that another pass over
+        // the same input would repeat. `Converging` here would promise a pass that never runs.
         Convergence::PassLimitReached {
             passes: passes,
             reasons: reasons.clone(),
@@ -3049,6 +3063,9 @@ fn deliver_layout(
                     exact: dl.is_exact(),
                     hash: layout.page_hashes[n],
                     dl: dl.clone(),
+                    native: rtex_dl::gfx::only_literals(dl)
+                        .then(|| rtex_dl::gfx::native_graphics(dl).ok())
+                        .flatten(),
                 })
             })
             .collect()

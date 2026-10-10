@@ -4,6 +4,7 @@
 //! binary encoding is revision 1 (docs/DISPLAY_LIST.md). Coordinates are in scaled points (sp); y grows down.
 
 pub mod binary;
+pub mod gfx;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -91,8 +92,13 @@ pub enum Item {
         cmd: Option<i64>,
         data: String,
     },
-    /// pdf_literal / special passthrough (mode -1 = \special).
-    Literal { mode: i64, data: String },
+    /// pdf_literal / special passthrough (mode -1 = \special), with the position it was
+    /// output at (x, baseline y; absent in lists from before positions were recorded).
+    Literal {
+        mode: i64,
+        data: String,
+        at: Option<(Sp, Sp)>,
+    },
     /// Something the extractor cannot represent; the page is degraded.
     Unsupported {
         kind: String,
@@ -140,7 +146,8 @@ impl Serialize for Item {
                 height,
             } => json!(["r", x, y_top, width, height]),
             Item::Color { stack, cmd, data } => json!(["c", stack, cmd, data]),
-            Item::Literal { mode, data } => json!(["l", mode, data]),
+            Item::Literal { mode, data, at: None } => json!(["l", mode, data]),
+            Item::Literal { mode, data, at: Some((x, y)) } => json!(["l", mode, data, x, y]),
             Item::Unsupported { kind, detail } => json!(["u", kind, detail]),
             Item::Math { on, x } => json!(["m", if *on { "on" } else { "off" }, x]),
             Item::Image {
@@ -208,6 +215,10 @@ impl<'de> Deserialize<'de> for Item {
                     .and_then(|d| d.as_str())
                     .unwrap_or("")
                     .to_string(),
+                at: match (arr.get(3).and_then(num), arr.get(4).and_then(num)) {
+                    (Some(x), Some(y)) => Some((x, y)),
+                    _ => None,
+                },
             },
             "u" => Item::Unsupported {
                 kind: arr
@@ -249,7 +260,7 @@ impl<'de> Deserialize<'de> for Item {
 
 /// A typeset line (an hlist). In paragraph lists `par` is 0; in page lists it is the capture
 /// paragraph sequence number.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Line {
     #[serde(default)]
     pub par: i64,
@@ -281,7 +292,8 @@ fn is_zero(v: &i64) -> bool {
 }
 
 /// Lua encodes an empty table as `[]`; accept that where a map is expected.
-fn map_or_empty_array<'de, D: serde::Deserializer<'de>, V: serde::de::DeserializeOwned>(
+/// Deserialize a map that Lua's JSON encoder may have written as `[]` (an empty table).
+pub fn map_or_empty_array<'de, D: serde::Deserializer<'de>, V: serde::de::DeserializeOwned>(
     d: D,
 ) -> Result<BTreeMap<String, V>, D::Error> {
     let v = serde_json::Value::deserialize(d)?;

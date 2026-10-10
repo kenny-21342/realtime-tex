@@ -10,7 +10,9 @@
 //! order TeX reads them (`\input` chains followed). The font, color and width in force at the
 //! picture are recorded by the capture and compared at use (`RecordedPic::state`). Pictures
 //! that depend on more than that (labels, references, counters, external files, data files,
-//! `remember picture`/`overlay`, group-escaping assignments) are never cached.
+//! `remember picture`/`overlay`, group-escaping assignments) are never cached. Neither are two
+//! pictures linked by a node name: pgf names are global, so a picture can use a node another
+//! picture defines; the defining body must run, and the using picture depends on it.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -51,6 +53,43 @@ pub struct RecordedPic {
     /// using the cached picture).
     #[serde(default)]
     pub state: String,
+    /// The picture's display-list items relative to its origin (left edge, baseline), absent
+    /// when it has anything native drawing cannot take back (see [`Fragment`]).
+    #[serde(default)]
+    pub items: Option<Vec<rtex_dl::Item>>,
+    /// (An empty Lua table arrives as `[]`.)
+    #[serde(default, deserialize_with = "rtex_dl::map_or_empty_array")]
+    pub fonts: BTreeMap<String, rtex_dl::FontDesc>,
+}
+
+/// What a cached picture draws, kept with its PDF region: the items of its display list
+/// relative to its origin and the fonts they name. A later pass that takes the picture from the
+/// cache gets them back at the picture's new place ([`substitute`]), so its page can still be
+/// drawn natively; the `cached_picture` item only says where the PDF region goes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Fragment {
+    pub items: Vec<rtex_dl::Item>,
+    pub fonts: BTreeMap<String, rtex_dl::FontDesc>,
+    /// The picture's height above its baseline (sp).
+    pub h: i64,
+}
+
+impl Fragment {
+    /// Only what a page can be drawn from natively: glyphs, rules, literals, colors, matrices,
+    /// math markers and recorded shadings.
+    fn from_recorded(r: &RecordedPic) -> Option<Fragment> {
+        let items = r.items.as_ref()?;
+        let ok = items.iter().all(|i| match i {
+            rtex_dl::Item::Unsupported { kind, .. } => kind == "shading",
+            rtex_dl::Item::Image { .. } => false,
+            _ => true,
+        });
+        ok.then(|| Fragment {
+            items: items.clone(),
+            fonts: r.fonts.clone(),
+            h: r.h,
+        })
+    }
 }
 
 /// A cached picture: a region of a kept pass PDF.
@@ -68,6 +107,8 @@ pub struct CacheEntry {
     pub d: i64,
     /// Pass serial the entry was last wanted in (for eviction).
     pub last_used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<Fragment>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -145,6 +186,18 @@ impl PicCache {
         }
         let _ = self.save();
         Ok(m.len())
+    }
+
+    /// The fragments of the pictures a manifest offers (by `file:line` key): what a pass that
+    /// takes them from the cache splices back into its page lists.
+    pub fn fragments(&self, pics: &[PictureRef]) -> BTreeMap<String, Fragment> {
+        pics.iter()
+            .filter(|p| p.cacheable && !self.index.bad.contains_key(&p.key))
+            .filter_map(|p| {
+                let e = self.index.entries.get(&p.hash.to_string())?;
+                (e.env == p.env).then(|| e.native.clone()).flatten().map(|f| (p.key.clone(), f))
+            })
+            .collect()
     }
 
     /// The cache entry for a picture, as the capture and the live engine read it (`pdf` by
@@ -261,6 +314,7 @@ impl PicCache {
                         h: r.h,
                         d: r.d,
                         last_used: serial,
+                        native: Fragment::from_recorded(r),
                     },
                 );
             }
@@ -590,6 +644,8 @@ pub fn scan_pictures(
         /// How often each file was read: a file `\input` twice yields two pictures per
         /// `file:line` key, which the capture cannot tell apart.
         visits: BTreeMap<String, u32>,
+        /// Comment-stripped text of each picture in `out`, for the node-name links.
+        bodies: Vec<String>,
     }
     impl Walker<'_> {
         fn walk(&mut self, name: &str, start: usize) {
@@ -640,6 +696,7 @@ pub fn scan_pictures(
                         && !uncacheable(&text_all);
                     let mut h = self.prelude.clone();
                     hash_bytes(&mut h, &text_all);
+                    self.bodies.push(text_all.clone());
                     self.out.push(PictureRef {
                         key: format!("{}:{}", name.trim_start_matches("./"), start + 1),
                         env: env.to_string(),
@@ -678,6 +735,7 @@ pub fn scan_pictures(
         has_remember,
         stack: Vec::new(),
         visits: BTreeMap::new(),
+        bodies: Vec::new(),
     };
     if texts.contains_key(main) {
         w.walk(main, body_start(main));
@@ -698,7 +756,188 @@ pub fn scan_pictures(
             }
         }
     }
+    for k in linked_by_names(&w.bodies) {
+        w.out[k].cacheable = false;
+    }
     w.out
+}
+
+/// Node and coordinate names a picture defines: `name=`/`alias=` options (pgfplots axes too),
+/// `node`/`coordinate`/`matrix`/`pic` followed by `(name)`, `\pgfcoordinate{name}`. Generous on
+/// purpose: a name taken for defined only costs caching.
+fn defined_names(text: &str) -> BTreeSet<String> {
+    use std::sync::OnceLock;
+    static RES: OnceLock<[regex::Regex; 3]> = OnceLock::new();
+    let res = RES.get_or_init(|| {
+        [
+            regex::Regex::new(r"(?:^|[^A-Za-z ])\s*(?:name|alias)\s*=\s*\{?\s*([A-Za-z0-9_:\-]+)").unwrap(),
+            regex::Regex::new(
+                r"\b(?:node|coordinate|matrix|pic)\s*(?:\[[^\]]*\]\s*)?(?:at\s*\([^)]*\)\s*)?\(\s*([A-Za-z0-9_:\-]+)\s*\)",
+            )
+            .unwrap(),
+            regex::Regex::new(r"\\pgf(?:coordinate|nodealias)\s*\{([^}]*)\}").unwrap(),
+        ]
+    });
+    res.iter()
+        .flat_map(|re| re.captures_iter(text).map(|c| c[1].trim().to_string()))
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Does `text` refer to the node `name`: `(name)`, `(name.anchor)`, `-| name`, `|- name`, `of name`?
+fn uses_name(text: &str, name: &str) -> bool {
+    let b = text.as_bytes();
+    let is_name = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'@' || c == b'\\';
+    let mut from = 0;
+    while let Some(k) = text[from..].find(name) {
+        let at = from + k;
+        let end = at + name.len();
+        from = at + 1;
+        if (at > 0 && is_name(b[at - 1])) || (end < b.len() && is_name(b[end])) {
+            continue;
+        }
+        let before = text[..at].trim_end();
+        if before.ends_with('(') || before.ends_with("-|") || before.ends_with("|-") || before.ends_with("of") || before.ends_with("of=") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Indices of the pictures linked by a node name: one uses a name another defines (and it does
+/// not define itself). Both must be drawn: the definition has to run, and the user's drawing
+/// depends on the definer.
+fn linked_by_names(bodies: &[String]) -> BTreeSet<usize> {
+    let defs: Vec<BTreeSet<String>> = bodies.iter().map(|t| defined_names(t)).collect();
+    let mut owners: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (k, d) in defs.iter().enumerate() {
+        for n in d {
+            owners.entry(n.as_str()).or_default().push(k);
+        }
+    }
+    let mut out = BTreeSet::new();
+    for (p, text) in bodies.iter().enumerate() {
+        for (name, qs) in &owners {
+            if defs[p].contains(*name) || !uses_name(text, name) {
+                continue;
+            }
+            out.insert(p);
+            out.extend(qs.iter().copied());
+        }
+    }
+    out
+}
+
+/// Put the drawing of cached pictures back into a page list: every `cached_picture` item whose
+/// detail names a key in `fragments` becomes that picture's items at the picture's place (fonts
+/// matched by identity or added), and the page's flags follow (`pic_cache` drops when no cached
+/// picture is left; `literal`/`shading` count what came back). Returns how many were replaced.
+pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fragment>) -> usize {
+    use rtex_dl::Item;
+    if fragments.is_empty() {
+        return 0;
+    }
+    let mut replaced = 0;
+    let mut added_flags: BTreeMap<String, i64> = BTreeMap::new();
+    let mut glyphs = 0;
+    let mut fonts = dl.fonts.clone();
+    let mut next_id = fonts.keys().filter_map(|k| k.parse::<i64>().ok()).max().unwrap_or(0) + 1;
+    let mut splice = |items: &mut Vec<Item>| {
+        let mut out = Vec::with_capacity(items.len());
+        for it in items.drain(..) {
+            let frag = match &it {
+                Item::Unsupported { kind, detail } if kind == "cached_picture" => detail.as_str().and_then(|d| {
+                    let mut f = d.splitn(6, ' ');
+                    let _idx = f.next()?;
+                    let x: i64 = f.next()?.parse().ok()?;
+                    let top: i64 = f.next()?.parse().ok()?;
+                    let (_w, _h) = (f.next()?, f.next()?);
+                    let frag = fragments.get(f.next()?)?;
+                    Some((frag, x, top + frag.h))
+                }),
+                _ => None,
+            };
+            let Some((frag, ox, oy)) = frag else {
+                out.push(it);
+                continue;
+            };
+            // the fragment's font ids are the recording pass's: map them onto this page's
+            let mut ids: BTreeMap<i64, i64> = BTreeMap::new();
+            for (k, fd) in &frag.fonts {
+                let Ok(old) = k.parse::<i64>() else { continue };
+                let id = match fonts.iter().find(|(_, f)| f.key() == fd.key()) {
+                    Some((pk, _)) => pk.parse().unwrap_or(old),
+                    None => {
+                        let id = next_id;
+                        next_id += 1;
+                        let mut nf = fd.clone();
+                        nf.id = id;
+                        fonts.insert(id.to_string(), nf);
+                        id
+                    }
+                };
+                ids.insert(old, id);
+            }
+            for i in &frag.items {
+                let moved = match i.clone() {
+                    Item::Glyph { font, char, index, x, y, width, expansion } => {
+                        glyphs += 1;
+                        Item::Glyph { font: *ids.get(&font).unwrap_or(&font), char, index, x: x + ox, y: y + oy, width, expansion }
+                    }
+                    Item::Rule { x, y_top, width, height } => Item::Rule { x: x + ox, y_top: y_top + oy, width, height },
+                    Item::Literal { mode, data, at } => {
+                        *added_flags.entry("literal".into()).or_default() += 1;
+                        Item::Literal { mode, data, at: at.map(|(x, y)| (x + ox, y + oy)) }
+                    }
+                    Item::Matrix { op, x, y, data } => Item::Matrix { op, x: x + ox, y: y + oy, data },
+                    Item::Math { on, x } => Item::Math { on, x: x + ox },
+                    Item::Unsupported { kind, detail } if kind == "shading" => {
+                        *added_flags.entry("shading".into()).or_default() += 1;
+                        let d = detail.as_str().unwrap_or("");
+                        let mut f = d.splitn(4, ' ');
+                        let moved = match (f.next(), f.next().and_then(|v| v.parse::<i64>().ok()), f.next().and_then(|v| v.parse::<i64>().ok()), f.next()) {
+                            (Some(idx), Some(x), Some(top), Some(rest)) => format!("{idx} {} {} {rest}", x + ox, top + oy),
+                            _ => d.to_string(),
+                        };
+                        Item::Unsupported { kind, detail: serde_json::Value::String(moved) }
+                    }
+                    other => other,
+                };
+                out.push(moved);
+            }
+            replaced += 1;
+        }
+        *items = out;
+    };
+    splice(&mut dl.other);
+    for l in &mut dl.lines {
+        splice(&mut l.items);
+    }
+    if replaced == 0 {
+        return 0;
+    }
+    dl.fonts = fonts;
+    dl.glyphs += glyphs;
+    let mut flags = dl.flags_map();
+    let still_cached = dl
+        .lines
+        .iter()
+        .flat_map(|l| l.items.iter())
+        .chain(dl.other.iter())
+        .filter(|i| matches!(i, Item::Unsupported { kind, .. } if kind == "cached_picture"))
+        .count();
+    if still_cached == 0 {
+        flags.remove("pic_cache");
+        flags.remove("pic_cache_detail");
+    } else {
+        flags.insert("pic_cache".into(), serde_json::json!(still_cached));
+    }
+    for (k, n) in added_flags {
+        let v = flags.get(&k).and_then(|v| v.as_i64()).unwrap_or(0) + n;
+        flags.insert(k, serde_json::json!(v));
+    }
+    dl.flags = serde_json::to_value(flags).unwrap_or_default();
+    replaced
 }
 
 #[cfg(test)]
@@ -811,6 +1050,29 @@ mod tests {
     }
 
     #[test]
+    fn pictures_linked_by_a_node_name_are_not_cached() {
+        let cacheable = |main: &str| -> Vec<bool> {
+            scan_pictures(&texts_of(main), "main.tex", 1)
+                .iter()
+                .map(|p| p.cacheable)
+                .collect()
+        };
+        // a pgfplots axis named in one picture, the next one placed below it
+        let doc = "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\begin{axis}[\n    name=upper,\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\begin{axis}[\n    at={(upper.below south west)},\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end{document}\n";
+        assert_eq!(cacheable(doc), vec![false, false, true]);
+        // a node, used with an anchor, `-|` and positioning's `of`
+        for using in ["\\draw (p.east) -- ++(1,0);", "\\draw (0,0) -| p;", "\\node[right=of p] {x};", "\\draw (p) -- (1,0);"] {
+            let doc = format!("\\documentclass{{article}}\n\\begin{{document}}\n\\begin{{tikzpicture}}\n\\node[draw] (p) {{P}};\n\\end{{tikzpicture}}\n\\begin{{tikzpicture}}\n{using}\n\\end{{tikzpicture}}\n\\end{{document}}\n");
+            assert_eq!(cacheable(&doc), vec![false, false], "{using}");
+        }
+        // every picture defining and using its own (A), or printing the letter: still cached
+        let doc = "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\coordinate (A) at (0,0);\n\\draw (A) -- (1,0);\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\node (A) at (0,0) {A};\n\\draw (A) -- (1,1) node {A};\n\\end{tikzpicture}\n\\end{document}\n";
+        assert_eq!(cacheable(doc), vec![true, true]);
+        // `legend to name` / `name path` are not node names
+        assert!(defined_names("\\begin{axis}[legend to name=leg, name path=curve]").is_empty());
+    }
+
+    #[test]
     fn cacheability_rules() {
         assert!(!uncacheable(
             "\\node {$\\alpha$}; \\draw (0,0) -- (\\theta:1);"
@@ -876,6 +1138,7 @@ mod tests {
                 d: 50,
                 page_height: 5000,
                 state: "font/0 g 0 G".into(),
+                ..Default::default()
             },
         );
         // not a real PDF: the whole file is copied and page numbers stay
