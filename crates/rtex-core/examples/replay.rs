@@ -636,8 +636,20 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         let t = to.join(e.file_name());
         let ft = e.file_type()?;
         if ft.is_symlink() {
-            let target = std::fs::read_link(&p)?;
-            let _ = std::os::unix::fs::symlink(target, &t);
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&p)?;
+                let _ = std::os::unix::fs::symlink(target, &t);
+            }
+            // elsewhere a link needs privileges: copy what it points at
+            #[cfg(not(unix))]
+            {
+                if p.is_dir() {
+                    copy_dir(&p, &t)?;
+                } else if p.exists() {
+                    std::fs::copy(&p, &t)?;
+                }
+            }
         } else if ft.is_dir() {
             if e.file_name() != "build" && e.file_name() != ".git" {
                 copy_dir(&p, &t)?;
