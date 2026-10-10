@@ -235,3 +235,33 @@ fn runin_heading_is_served_with_its_text() {
     }
     s.close();
 }
+
+/// Material LaTeX adds after `shipout/before` (the shipout/background and /foreground hooks:
+/// eso-pic, pdfpages' inserted pages, watermarks) is not in the captured page, which used to be
+/// reported exact without it (stress-test document, an `\includepdf` page drawn empty). Such a
+/// page is flagged `shipout_extras`: Degraded, drawn from its PDF.
+#[test]
+fn shipout_background_material_degrades_the_page() {
+    let Some(s) = open(
+        "esopic",
+        "\\documentclass{article}\n\\usepackage{eso-pic}\n\\begin{document}\n\\AddToShipoutPictureBG*{\\put(50,50){\\rule{2cm}{2cm}}}\nFirst page, with a background square.\n\\newpage\nSecond page, plain.\n\\end{document}\n",
+    ) else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut pages = std::collections::BTreeMap::new();
+    let mut done = false;
+    while !done {
+        assert!(Instant::now() < deadline, "no converged layout");
+        for e in s.poll(Duration::from_millis(100)) {
+            if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
+                for p in pages_changed {
+                    pages.insert(p.page, (p.dl.flags_map().contains_key("shipout_extras"), p.exact));
+                }
+                done |= matches!(convergence, Convergence::Converged);
+            }
+        }
+    }
+    assert_eq!(pages.into_iter().collect::<Vec<_>>(), vec![(1, (true, false)), (2, (false, true))]);
+    s.close();
+}

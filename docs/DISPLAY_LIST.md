@@ -38,7 +38,10 @@ Records: u8 tag, u32 payload_length, payload   (unknown tags must be skipped)
   0x03 FLAG     str key, i32 value            degradation flags (page is Degraded when any is present);
                 `transformed_rows`: rows typeset inside a transformed box (a landscape page's
                 table, a rotated \parbox) keep the box's own coordinates, and no record ties them
-                to the MATRIX that turns them: such a page is drawn from its PDF
+                to the MATRIX that turns them: such a page is drawn from its PDF;
+                `shipout_extras`: the box LaTeX shipped holds more marks than the one captured at
+                shipout/before (shipout/background and /foreground material: eso-pic, pdfpages,
+                watermarks): drawn from its PDF
   0x10 LINE     i32 par, i32 line_index, i32 x, i32 baseline_y, i32 width, i32 height, i32 depth,
                 f64 glue_set, u8 glue_sign, u8 glue_order
   0x12 LINE_UNIT i32 unit, i32 row          (page lists; directly after LINE) owning unit and row index

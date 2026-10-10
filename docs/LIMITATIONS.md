@@ -84,7 +84,8 @@ renderer. Type1 fonts (classic Computer Modern math without `unicode-math`) are 
 character code and must be rasterized by the host (the built-in verification rasterizer skips
 them). Pages containing `\pdfliteral`/`\special` drawing, non-left-to-right text, `\vadjust`
 material, unknown whatsits, unexpanded virtual-font commands or rows typeset inside a transformed
-box (a pdflscape landscape table, a rotated `\parbox`: `transformed_rows`) are marked *Degraded*
+box (a pdflscape landscape table, a rotated `\parbox`: `transformed_rows`) or material added at
+shipout (eso-pic backgrounds, pdfpages, watermarks: `shipout_extras`) are marked *Degraded*
 and come with a PDF fallback path. TikZ/PGF pictures (literals and shadings) are drawn from the
 display list's native drawing operations (docs/DISPLAY_LIST.md, "Native drawing"); tiling patterns
 and soft masks still fall back to the PDF. A page's `/Rotate` (pdflscape) is reported as

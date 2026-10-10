@@ -137,6 +137,7 @@ function C.setup(opts)
   C.attr_unit = luatexbase.new_attribute("rtex_unit")
   luatexbase.add_to_callback("pre_linebreak_filter", C.pre_linebreak, "rtex-capture")
   luatexbase.add_to_callback("post_linebreak_filter", C.post_linebreak, "rtex-capture")
+  luatexbase.add_to_callback("pre_shipout_filter", C.pre_shipout, "rtex-capture")
   local extra = os.getenv("RTEX_UNIT_ENVS") or ""
   for name in extra:gmatch("[^,%s]+") do C.BLOCK_ENVS[#C.BLOCK_ENVS + 1] = name end
 end
@@ -510,10 +511,52 @@ local function page_rotate(attrs)
 end
 C.page_rotate = page_rotate
 
+-- Marks a page leaves on paper: glyphs, rules (images and box resources included), literals and
+-- specials, anywhere in the box.
+local Dn = node.direct
+local INK = { [node.id("glyph")] = true, [node.id("rule")] = true }
+local LIST = { [node.id("hlist")] = true, [node.id("vlist")] = true }
+local WHATSIT = node.id("whatsit")
+local INK_WHATSITS = { [node.subtype("pdf_literal")] = true, [node.subtype("special")] = true }
+local function ink(head)
+  local n = 0
+  for x, id, sub in Dn.traverse(head) do
+    if INK[id] then
+      n = n + 1
+    elseif LIST[id] then
+      local h = Dn.getlist(x)
+      if h then n = n + ink(h) end
+    elseif id == WHATSIT and INK_WHATSITS[sub] then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- The box LaTeX finally ships: material added after shipout/before (shipout/background and
+-- /foreground: eso-pic, pdfpages, watermarks) is not in the captured page. Such a page says so
+-- (`shipout_extras`, Degraded): drawn from its PDF.
+function C.pre_shipout(head)
+  local want = C.pending_ink
+  C.pending_ink = nil
+  if want then
+    local d = Dn.todirect(head)
+    local id = Dn.getid(d)
+    local have = LIST[id] and ink(Dn.getlist(d)) or ink(d)
+    local page = C.pages[#C.pages]
+    if have > want and page then
+      page.flags = page.flags or {}
+      page.flags.shipout_extras = have - want
+    end
+  end
+  return true
+end
+
 function C.shipout(boxnum, pageattr)
   C.page = C.page + 1
   local b = tex.box[boxnum]
   if not b then return end
+  C.pending_ink = ink(Dn.getlist(Dn.todirect(b)))
   local page = dl.page(b, C.attr_par, C.attr_line, C.page, nil, C.attr_unit, is_insert,
                        { attr_pic = C.attr_pic, pic_images = C.cache_images })
   local rot = page_rotate(pageattr)
