@@ -44,6 +44,10 @@ pub enum Reason {
     KindMismatch,
     /// The last fast compile of this unit exceeded the session's budget (ms).
     OverBudget(u64),
+    /// A list that continues the numbering of an earlier one (enumitem `resume`, `resume*`,
+    /// `series=`): the number is saved globally when that list ends, where the fast path cannot
+    /// see it.
+    ListResumed,
 }
 
 impl std::fmt::Display for Reason {
@@ -78,6 +82,7 @@ impl std::fmt::Display for Reason {
                 "\\{m} before the unit's text runs before its counters are captured; put it inside the paragraph or environment, or on its own line"
             ),
             Reason::OverBudget(ms) => write!(f, "last fast compile took {ms} ms, over the budget"),
+            Reason::ListResumed => write!(f, "the list resumes the numbering of an earlier list"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -2313,10 +2318,30 @@ pub fn classify_source_with(
     if shape == UnitShape::Par && text.contains("\\maketitle") {
         shape = UnitShape::Env("center".into());
     }
+    if resumes_a_list(&text) {
+        push(&mut reasons, Reason::ListResumed);
+    }
     if permissive {
         reasons.retain(|r| !is_vocabulary_reason(r));
     }
     (shape, reasons)
+}
+
+/// A list environment whose options continue an earlier list (enumitem: `resume`, `resume*`,
+/// `series=…`).
+fn resumes_a_list(text: &str) -> bool {
+    LIST_ENVS.iter().any(|env| {
+        let open = format!("\\begin{{{env}}}");
+        text.match_indices(&open).any(|(i, _)| {
+            let rest = text[i + open.len()..].trim_start();
+            let Some(opts) = rest.strip_prefix('[') else { return false };
+            let opts = &opts[..opts.find(']').unwrap_or(opts.len())];
+            opts.split(',').any(|o| {
+                let k = o.trim();
+                k == "resume" || k == "resume*" || k.split('=').next().map(str::trim) == Some("series")
+            })
+        })
+    })
 }
 
 /// Length of the vertical material at the start of `s` (`\vspace`, `\noindent`, `\centering`,
@@ -2553,6 +2578,11 @@ mod tests {
         )
         .is_empty());
         assert!(reasons("\\begin{enumerate}[label=(\\alph*)]\\item a\\end{enumerate}").is_empty());
+        // a resumed list's first number is saved where the fast path cannot see it
+        for opts in ["[resume]", "[resume*]", "[label=(\\alph*), resume]", "[series=steps]"] {
+            let r = reasons(&format!("Then:\n\\begin{{enumerate}}{opts}\n\\item c\n\\end{{enumerate}}"));
+            assert!(r.contains(&Reason::ListResumed), "{opts}: {r:?}");
+        }
         let r = reasons("\\begin{table}\\setlength{\\tabcolsep}{2pt}\\renewcommand{\\arraystretch}{1.2}\\begin{tabular}{l}a\\end{tabular}\\end{table}");
         assert!(r.is_empty(), "{r:?}");
         assert!(reasons("\\setlength{\\parindent}{0pt} text")
