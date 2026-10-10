@@ -26,9 +26,10 @@ Branch `kenny/main` is the working branch (the fork's default); `main` mirrors u
    - `piccache.rs`: pictures linked by a pgf node name (one names a node, another uses it) are not cached.
 4. `scripts/fixtures-verify.sh`, `scripts/fixtures-mutation.sh`, `scripts/serve_convergence.py`, `scripts/cloud-setup.sh` (light), `scripts/cloud-texlive.sh`.
 
-Native TikZ drawing (Phase C: pgf literals, shadings and cached pictures drawn from the display list,
-checked against MuPDF by `scripts/gfx_compare.py` / `scripts/gfx_shading_check.py`) is on branch
-`claude/sharp-mayer-f5z1vz` for review, not yet on `kenny/main`.
+5. Native TikZ drawing (merged, PR #2): pgf literals, shadings and cached pictures drawn from the display list
+   (`crates/rtex-dl/src/gfx.rs`, `LayoutUpdate.pages_changed[].native`, docs/DISPLAY_LIST.md "Native drawing"),
+   checked against MuPDF by `scripts/gfx_compare.py` / `scripts/gfx_shading_check.py` (inputs from the
+   `gfx_dump` and `native_session` examples). Tiling patterns still fall back to the PDF.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by
@@ -44,7 +45,6 @@ Attach the private repo `kenny-21342/rtex-fixtures` to the session; it is cloned
 
 ## Linux control (done 2026-10-09; results in rtex-fixtures `notes/linux-cloud/`)
 Verify matches the macOS table on all four fixtures; econ-notes needs `makecell` (now in `install-texlive.sh`) and
-the DengXian font (Microsoft, not on Linux: run it from a copy with `WenQuanYi Zen Hei`, see
-`notes/linux-cloud/econ-font-substitution.diff`). After the fixes above, `scripts/fixtures-mutation.sh 30 21` gives
+the DengXian font: run `sh scripts/install-fonts.sh` in the rtex-fixtures clone after TeX Live is ready. After the fixes above, `scripts/fixtures-mutation.sh 30 21` gives
 30/30 served and equal on all four. `over_budget_units_fall_back_to_background` is load sensitive: run the suite
 on an otherwise idle machine.
