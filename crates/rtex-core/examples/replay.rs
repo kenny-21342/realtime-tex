@@ -18,7 +18,9 @@
 //!
 //! `check` opens a session on a copy of a project, waits (`--timeout` s, default 120) for the
 //! first run to end and reports its status, pages and error locations (what an editor's problem
-//! list shows): scripts/broken_errors.py runs it over the stress test's `broken` suite.
+//! list shows): scripts/broken_errors.py runs it over the stress test's `broken` suite. With
+//! `--build DIR` the session's build directory is DIR, kept across runs: a second run is a
+//! reopened session (`first_layout_ms`).
 //!
 //! `type` copies a project, then types ` WORD` one character at a time at the end of a word in
 //! N paragraphs spread over the project's files, CADENCE ms apart (continuous typing: background
@@ -528,8 +530,9 @@ fn type_words(run: &mut Run, src: &Path, main: &str, opt: &HashMap<String, Strin
             })
             .map(|sp| (f.clone(), sp.id))
             .collect();
-        // a few per file, spread over the file
-        while mine.len() > 3 {
+        // a few per file, spread over the file (enough for `units` when there are few files)
+        let per_file = n_units.div_ceil(files.len().max(1)).max(3);
+        while mine.len() > per_file {
             mine.remove(rng.below(mine.len()));
         }
         cands.extend(mine);
@@ -580,7 +583,8 @@ fn check(src: &Path, main: &str, opt: &HashMap<String, String>, out: &Path) -> R
     copy_dir(src, &project)?;
     let t0 = Instant::now();
     let mut cfg = SessionConfig::new(&project, main.to_string());
-    cfg.build_dir = out.join("build");
+    // `--build DIR` keeps the build directory across runs (a reopened session); OUT is cleared
+    cfg.build_dir = opt.get("build").map(PathBuf::from).unwrap_or_else(|| out.join("build"));
     let s = match Session::open(cfg) {
         Ok(s) => s,
         // a project rtex cannot open (a source file that is not UTF-8) is a result too
@@ -592,7 +596,10 @@ fn check(src: &Path, main: &str, opt: &HashMap<String, String>, out: &Path) -> R
         }
     };
     let mut o = Observer::new();
-    let ended = o.pump(&s, timeout, |o| o.ended);
+    // the first layout (a reopened build directory's saved one comes before any pass)
+    o.pump(&s, timeout, |o| o.layouts > 0);
+    let first_layout_ms = (o.layouts > 0).then(|| t0.elapsed().as_millis() as u64);
+    let ended = o.pump(&s, timeout.saturating_sub(t0.elapsed()), |o| o.ended);
     let errors: Vec<Value> = o
         .diagnostics
         .values()
@@ -603,7 +610,7 @@ fn check(src: &Path, main: &str, opt: &HashMap<String, String>, out: &Path) -> R
     let report = json!({
         "status": if ended { status_name(o.compile.as_ref()) } else { "timeout" },
         "converged": o.converged, "pages": o.pages_total, "layouts": o.layouts,
-        "wall_ms": t0.elapsed().as_millis() as u64, "errors": errors,
+        "wall_ms": t0.elapsed().as_millis() as u64, "first_layout_ms": first_layout_ms, "errors": errors,
         "engine": s.versions().engine_generation,
     });
     println!("{report}");
