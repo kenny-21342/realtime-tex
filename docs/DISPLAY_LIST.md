@@ -44,8 +44,17 @@ Records: u8 tag, u32 payload_length, payload   (unknown tags must be skipped)
                 n × { u32 char_code, u32 glyph_index (0xFFFFFFFF = none), i32 x, i32 advance }
   0x21 RULE     i32 x, i32 y_top, i32 width, i32 height
   0x22 COLOR    u8 cmd (0 set, 1 push, 2 pop, 3 current, 255 unknown), u8 reserved, u16 stack, str data
-  0x23 LITERAL  i32 mode, str data           raw pdf_literal / \special (mode −1); page is Degraded
-  0x24 UNSUPPORTED str kind, str detail      something not representable; page is Degraded
+                (lists from before rtex-dl.lua read the node's `command` field carry 255)
+  0x23 LITERAL  i32 mode, str data [, i32 x, i32 y]
+                                             raw pdf_literal / \special (mode −1); page is Degraded.
+                                             x, y: where it was output (baseline); present in lists
+                                             from rtex-capture with native drawing (a decoder reads
+                                             them when the payload has 8 more bytes)
+  0x24 UNSUPPORTED str kind, str detail      something not representable; page is Degraded.
+                                             kind `box_resource`: a \useboxresource form, detail
+                                             "index x top width height"; kind `shading`: a pgf
+                                             axial/radial shading form, detail "index x top width
+                                             height depth <JSON spec>" (see Native drawing)
   0x25 MATH     u8 on, i32 x                 inline math boundary (hit-testing aid)
   0x26 IMAGE    i32 resource_index, i32 x, i32 y_top, i32 width, i32 height
   0x27 IMAGE_INFO u32 resource_index, u32 page, u32 pages, str file     source file of an image index
@@ -75,8 +84,8 @@ until the next layout (`ParagraphUpdate.reasons` lists `inserts`).
   natural size inside a `MATRIX save` / `set` / `restore` group: apply the matrix about its
   point to the image rectangle (`verify.rs` shows the composition). A picture the background
   pass (or the live engine) took from the picture cache is not an image: it appears as
-  `UNSUPPORTED{kind: "cached_picture", detail: "<index> <x> <top> <width> <height>"}` (sp, the
-  picture's rectangle in the list's frame) and the page carries the `pic_cache` flag, so it is
+  `UNSUPPORTED{kind: "cached_picture", detail: "<index> <x> <top> <width> <height>[ <key>]"}` (sp,
+  the picture's rectangle in the list's frame; `key` is the picture's `file:line` cache key) and the page carries the `pic_cache` flag, so it is
   degraded and hosts render it from the pass PDF, exactly like a page with a drawn TikZ picture.
   In a live result the item marks where the picture now stands: a host that draws the layout
   page from the PDF can copy the picture's rectangle from that rendering (the same `width` and
@@ -87,14 +96,55 @@ until the next layout (`ParagraphUpdate.reasons` lists `inserts`).
 - **Fonts** are identified across processes by `FontDesc::key()` (file, subfont, size, slant,
   extend, squeeze); font ids are per-process.
 - Pages with any FLAG, LITERAL or UNSUPPORTED record are *Degraded*: draw the PDF fallback page
-  the `LayoutUpdate` names instead. MATRIX records do not degrade a page.
+  the `LayoutUpdate` names instead, unless the host draws them natively (below). MATRIX records
+  do not degrade a page.
+
+## Native drawing (TikZ / pgf pictures)
+
+A page whose flags are only `literal` and `shading` can be drawn without its PDF:
+`rtex_dl::gfx::native_graphics(&dl)` replays the page's literals, color stack operations,
+MATRIX records and shading forms the way LuaTeX writes them into the PDF and returns a
+`NativePage`, or the first thing it does not understand (`Unsupported`: text or XObjects in
+literals, tiling patterns, other graphics states, literal modes other than 0/1, `\special`,
+`box_resource`). It never returns a partial drawing. `LayoutUpdate.pages_changed[].native` carries
+it for every degraded page it resolves (absent otherwise); the page stays `exact: false`, so a host
+that does not draw natively keeps using the PDF.
+
+- `ops` are in content order; each names the item (`at`: row `line`, or `null` for the page's
+  `other` items, and `item` index) whose operator produced it. Draw them interleaved with the
+  list's glyphs, rules and images in that order: an op tagged with item *k* goes right after
+  item *k*.
+- `Save` / `Restore` bracket clip changes (PDF `q` / `Q`). `Clip` intersects the clip with a path
+  (nonzero or even-odd) **for everything drawn after it until the matching `Restore`, glyphs
+  included**: pgfplots clips its plot area, and a label outside it is invisible in the PDF.
+- `Paint` fills (nonzero or even-odd) and/or strokes (fill first) a path. `Shade` paints a linear
+  (`coords` x0 y0 x1 y1) or radial (x0 y0 r0 x1 y1 r1) gradient over `bbox`, with linear color
+  `stops` (offsets 0..1; `extend` continues the end colors) and opacity `alpha`; a host maps it
+  to its gradient primitive.
+- Paths and gradients are in user space (PDF units, y up); `ctm` maps them to the list's frame
+  (sp, y down). Stroke widths and dashes are in user space too. Set the transform, then draw.
+- Colors are `{comps, alpha}` with 1 (gray), 3 (RGB) or 4 (CMYK) components as the PDF gives
+  them; convert CMYK the way the host's color management does (`Color::rgb` is the plain
+  formula; MuPDF differs by up to a few percent).
+- Pictures the background pass took from the picture cache keep their drawing: the cache stores
+  each picture's display-list items with its PDF region, and a page list puts them back in place
+  of the `cached_picture` item (`pic_cache` flag gone when every cached picture on the page came
+  back), so a layout is drawn natively whether its pictures were typeset or cached. Live
+  (fast-path) results keep `cached_picture` items.
+- `transforms` lists glyphs, rules and images that a transformed pgf scope (rotated or scaled
+  node text, axis labels) moves away from their list position: draw them with that map (list
+  coordinates to list coordinates) instead of their MATRIX records.
+
+`scripts/gfx_compare.py` checks a capture's native drawing against MuPDF's reading of the PDF
+(every fill and stroke by type, geometry, color, width and opacity; display-list rules; moved
+glyph origins) and `scripts/gfx_shading_check.py` samples shadings against MuPDF's rendering.
 
 ## JSON mirror
 
 `rtex dl2json` / `rtex_dl_to_json` convert the binary form to the JSON shape used by
 `rtex-dl.lua` and `rtex_dl::DisplayList` (`{"kind","unit","fonts","lines":[{"par","i","x","y","w",
 "h","d","gs","gsign","gorder","items":[["g",font,char,index,x,y,w,ef],["r",x,y_top,w,h],
-["c",stack,cmd,data],["l",mode,data],["u",kind,detail],["m","on"|"off",x],["i",index,x,y_top,w,h],
+["c",stack,cmd,data],["l",mode,data,x,y],["u",kind,detail],["m","on"|"off",x],["i",index,x,y_top,w,h],
 ["M","save"|"set"|"restore",x,y,data]]}],
 "other":[…],"flags":{…},"glyphs":n,"inserts":n,"images_info":{index:{file,page,pages}},"width","height","depth","page","page_width","page_height","origin"}`;
 page lines also carry `"unit"` and `"row"`).

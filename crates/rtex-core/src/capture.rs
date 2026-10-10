@@ -199,8 +199,21 @@ pub struct CaptureJson {
 
 impl CaptureJson {
     /// `pics` as a map (empty when the pass recorded none).
+    /// Entry by entry: one picture the capture describes in a way this version cannot read
+    /// costs that picture its cache entry, not every picture of the pass.
     pub fn recorded_pics(&self) -> BTreeMap<String, crate::piccache::RecordedPic> {
-        serde_json::from_value(self.pics.clone()).unwrap_or_default()
+        let serde_json::Value::Object(m) = &self.pics else {
+            return BTreeMap::new();
+        };
+        m.iter()
+            .filter_map(|(k, v)| match serde_json::from_value(v.clone()) {
+                Ok(r) => Some((k.clone(), r)),
+                Err(e) => {
+                    log::warn!("picture {k}: unreadable record ({e})");
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Reconstruct absolute counter values from the per-unit deltas (units are in document order).
@@ -249,6 +262,9 @@ pub struct CaptureResult {
     pub log: PathBuf,
     pub wall: std::time::Duration,
     pub exit_ok: bool,
+    /// Drawings of the pictures the pass could take from the picture cache (by `file:line`
+    /// key): [`CaptureResult::page`] splices them back in place of the cached regions.
+    pub pic_fragments: BTreeMap<String, crate::piccache::Fragment>,
 }
 
 impl CaptureResult {
@@ -257,7 +273,9 @@ impl CaptureResult {
             .out_dir
             .join(format!("{}.rtex-page{}.json", self.jobname, n));
         let s = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        Ok(DisplayList::from_json(&s)?)
+        let mut dl = DisplayList::from_json(&s)?;
+        crate::piccache::substitute(&mut dl, &self.pic_fragments);
+        Ok(dl)
     }
     pub fn paragraph(&self, seq: i64) -> Option<&CapturedParagraph> {
         self.json.paragraphs.iter().find(|p| p.seq == seq)
@@ -384,5 +402,6 @@ pub fn collect_capture(
         log,
         wall,
         exit_ok,
+        pic_fragments: BTreeMap::new(),
     })
 }

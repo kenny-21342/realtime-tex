@@ -53,6 +53,43 @@ pub struct RecordedPic {
     /// using the cached picture).
     #[serde(default)]
     pub state: String,
+    /// The picture's display-list items relative to its origin (left edge, baseline), absent
+    /// when it has anything native drawing cannot take back (see [`Fragment`]).
+    #[serde(default)]
+    pub items: Option<Vec<rtex_dl::Item>>,
+    /// (An empty Lua table arrives as `[]`.)
+    #[serde(default, deserialize_with = "rtex_dl::map_or_empty_array")]
+    pub fonts: BTreeMap<String, rtex_dl::FontDesc>,
+}
+
+/// What a cached picture draws, kept with its PDF region: the items of its display list
+/// relative to its origin and the fonts they name. A later pass that takes the picture from the
+/// cache gets them back at the picture's new place ([`substitute`]), so its page can still be
+/// drawn natively; the `cached_picture` item only says where the PDF region goes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Fragment {
+    pub items: Vec<rtex_dl::Item>,
+    pub fonts: BTreeMap<String, rtex_dl::FontDesc>,
+    /// The picture's height above its baseline (sp).
+    pub h: i64,
+}
+
+impl Fragment {
+    /// Only what a page can be drawn from natively: glyphs, rules, literals, colors, matrices,
+    /// math markers and recorded shadings.
+    fn from_recorded(r: &RecordedPic) -> Option<Fragment> {
+        let items = r.items.as_ref()?;
+        let ok = items.iter().all(|i| match i {
+            rtex_dl::Item::Unsupported { kind, .. } => kind == "shading",
+            rtex_dl::Item::Image { .. } => false,
+            _ => true,
+        });
+        ok.then(|| Fragment {
+            items: items.clone(),
+            fonts: r.fonts.clone(),
+            h: r.h,
+        })
+    }
 }
 
 /// A cached picture: a region of a kept pass PDF.
@@ -70,6 +107,8 @@ pub struct CacheEntry {
     pub d: i64,
     /// Pass serial the entry was last wanted in (for eviction).
     pub last_used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<Fragment>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -147,6 +186,18 @@ impl PicCache {
         }
         let _ = self.save();
         Ok(m.len())
+    }
+
+    /// The fragments of the pictures a manifest offers (by `file:line` key): what a pass that
+    /// takes them from the cache splices back into its page lists.
+    pub fn fragments(&self, pics: &[PictureRef]) -> BTreeMap<String, Fragment> {
+        pics.iter()
+            .filter(|p| p.cacheable && !self.index.bad.contains_key(&p.key))
+            .filter_map(|p| {
+                let e = self.index.entries.get(&p.hash.to_string())?;
+                (e.env == p.env).then(|| e.native.clone()).flatten().map(|f| (p.key.clone(), f))
+            })
+            .collect()
     }
 
     /// The cache entry for a picture, as the capture and the live engine read it (`pdf` by
@@ -263,6 +314,7 @@ impl PicCache {
                         h: r.h,
                         d: r.d,
                         last_used: serial,
+                        native: Fragment::from_recorded(r),
                     },
                 );
             }
@@ -776,6 +828,118 @@ fn linked_by_names(bodies: &[String]) -> BTreeSet<usize> {
     out
 }
 
+/// Put the drawing of cached pictures back into a page list: every `cached_picture` item whose
+/// detail names a key in `fragments` becomes that picture's items at the picture's place (fonts
+/// matched by identity or added), and the page's flags follow (`pic_cache` drops when no cached
+/// picture is left; `literal`/`shading` count what came back). Returns how many were replaced.
+pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fragment>) -> usize {
+    use rtex_dl::Item;
+    if fragments.is_empty() {
+        return 0;
+    }
+    let mut replaced = 0;
+    let mut added_flags: BTreeMap<String, i64> = BTreeMap::new();
+    let mut glyphs = 0;
+    let mut fonts = dl.fonts.clone();
+    let mut next_id = fonts.keys().filter_map(|k| k.parse::<i64>().ok()).max().unwrap_or(0) + 1;
+    let mut splice = |items: &mut Vec<Item>| {
+        let mut out = Vec::with_capacity(items.len());
+        for it in items.drain(..) {
+            let frag = match &it {
+                Item::Unsupported { kind, detail } if kind == "cached_picture" => detail.as_str().and_then(|d| {
+                    let mut f = d.splitn(6, ' ');
+                    let _idx = f.next()?;
+                    let x: i64 = f.next()?.parse().ok()?;
+                    let top: i64 = f.next()?.parse().ok()?;
+                    let (_w, _h) = (f.next()?, f.next()?);
+                    let frag = fragments.get(f.next()?)?;
+                    Some((frag, x, top + frag.h))
+                }),
+                _ => None,
+            };
+            let Some((frag, ox, oy)) = frag else {
+                out.push(it);
+                continue;
+            };
+            // the fragment's font ids are the recording pass's: map them onto this page's
+            let mut ids: BTreeMap<i64, i64> = BTreeMap::new();
+            for (k, fd) in &frag.fonts {
+                let Ok(old) = k.parse::<i64>() else { continue };
+                let id = match fonts.iter().find(|(_, f)| f.key() == fd.key()) {
+                    Some((pk, _)) => pk.parse().unwrap_or(old),
+                    None => {
+                        let id = next_id;
+                        next_id += 1;
+                        let mut nf = fd.clone();
+                        nf.id = id;
+                        fonts.insert(id.to_string(), nf);
+                        id
+                    }
+                };
+                ids.insert(old, id);
+            }
+            for i in &frag.items {
+                let moved = match i.clone() {
+                    Item::Glyph { font, char, index, x, y, width, expansion } => {
+                        glyphs += 1;
+                        Item::Glyph { font: *ids.get(&font).unwrap_or(&font), char, index, x: x + ox, y: y + oy, width, expansion }
+                    }
+                    Item::Rule { x, y_top, width, height } => Item::Rule { x: x + ox, y_top: y_top + oy, width, height },
+                    Item::Literal { mode, data, at } => {
+                        *added_flags.entry("literal".into()).or_default() += 1;
+                        Item::Literal { mode, data, at: at.map(|(x, y)| (x + ox, y + oy)) }
+                    }
+                    Item::Matrix { op, x, y, data } => Item::Matrix { op, x: x + ox, y: y + oy, data },
+                    Item::Math { on, x } => Item::Math { on, x: x + ox },
+                    Item::Unsupported { kind, detail } if kind == "shading" => {
+                        *added_flags.entry("shading".into()).or_default() += 1;
+                        let d = detail.as_str().unwrap_or("");
+                        let mut f = d.splitn(4, ' ');
+                        let moved = match (f.next(), f.next().and_then(|v| v.parse::<i64>().ok()), f.next().and_then(|v| v.parse::<i64>().ok()), f.next()) {
+                            (Some(idx), Some(x), Some(top), Some(rest)) => format!("{idx} {} {} {rest}", x + ox, top + oy),
+                            _ => d.to_string(),
+                        };
+                        Item::Unsupported { kind, detail: serde_json::Value::String(moved) }
+                    }
+                    other => other,
+                };
+                out.push(moved);
+            }
+            replaced += 1;
+        }
+        *items = out;
+    };
+    splice(&mut dl.other);
+    for l in &mut dl.lines {
+        splice(&mut l.items);
+    }
+    if replaced == 0 {
+        return 0;
+    }
+    dl.fonts = fonts;
+    dl.glyphs += glyphs;
+    let mut flags = dl.flags_map();
+    let still_cached = dl
+        .lines
+        .iter()
+        .flat_map(|l| l.items.iter())
+        .chain(dl.other.iter())
+        .filter(|i| matches!(i, Item::Unsupported { kind, .. } if kind == "cached_picture"))
+        .count();
+    if still_cached == 0 {
+        flags.remove("pic_cache");
+        flags.remove("pic_cache_detail");
+    } else {
+        flags.insert("pic_cache".into(), serde_json::json!(still_cached));
+    }
+    for (k, n) in added_flags {
+        let v = flags.get(&k).and_then(|v| v.as_i64()).unwrap_or(0) + n;
+        flags.insert(k, serde_json::json!(v));
+    }
+    dl.flags = serde_json::to_value(flags).unwrap_or_default();
+    replaced
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1138,7 @@ mod tests {
                 d: 50,
                 page_height: 5000,
                 state: "font/0 g 0 G".into(),
+                ..Default::default()
             },
         );
         // not a real PDF: the whole file is copied and page numbers stay

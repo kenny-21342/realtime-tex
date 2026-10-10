@@ -48,10 +48,13 @@ local function write_items(buf, items)
       elseif t == "c" then
         local cmd = it[3]; if type(cmd) ~= "number" then cmd = 255 end
         rec(buf, 0x22, pack("<BBI2", cmd, 0, it[2] or 0) .. str(it[4]))
-      elseif t == "l" then rec(buf, 0x23, pack("<i4", it[2] or 0) .. str(it[3]))
+      elseif t == "l" then rec(buf, 0x23, pack("<i4", it[2] or 0) .. str(it[3]) .. (it[4] and pack("<i4i4", it[4], it[5]) or ""))
       elseif t == "u" then rec(buf, 0x24, str(it[2]) .. str(type(it[3]) == "table" and "" or it[3]))
       elseif t == "m" then rec(buf, 0x25, pack("<Bi4", it[2] == "on" and 1 or 0, it[3]))
       elseif t == "i" then rec(buf, 0x26, pack("<i4i4i4i4i4", it[2] or 0, it[3], it[4], it[5], it[6]))
+      elseif t == "M" then
+        local op = it[2] == "save" and 0 or (it[2] == "set" and 1 or 2)
+        rec(buf, 0x28, pack("<Bi4i4", op, it[3], it[4]) .. str(it[5]))
       end
     end
   end
