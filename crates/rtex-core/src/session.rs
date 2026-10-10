@@ -41,6 +41,12 @@ pub struct SessionConfig {
     /// Units whose last fast compile took longer than this are routed to the background path
     /// until the next layout (the host keeps its real-time guarantee).
     pub fast_budget: Duration,
+    /// The budget follows the document (default 4): a compile is over budget when it takes
+    /// longer than `fast_budget` and than this many times the median of the session's recent
+    /// live compiles. A font stack that makes every paragraph cost 8 ms (luaotfload node mode)
+    /// keeps its paragraphs live while a unit far slower than them (a plot) still leaves.
+    /// No unit is judged before the session has `BUDGET_SAMPLES` compiles. 0: `fast_budget` alone.
+    pub fast_budget_factor: f64,
     /// Extra block environments (theorem-like) treated as units, besides those found by scanning
     /// the preamble for `\newtheorem`.
     pub unit_envs: Vec<String>,
@@ -126,6 +132,7 @@ impl SessionConfig {
             compile_timeout: Duration::from_secs(5),
             pass_timeout: Duration::from_secs(120),
             fast_budget: Duration::from_millis(5),
+            fast_budget_factor: 4.0,
             unit_envs: Vec::new(),
             warm_background: true,
             eligibility: EligibilityMode::Probe,
@@ -356,6 +363,8 @@ struct Shared {
     slow_units: Mutex<HashMap<ParaId, (u64, u64)>>,
     /// Consecutive over-budget compiles per unit (the first ones may be loading fonts).
     slow_candidates: Mutex<HashMap<ParaId, u32>>,
+    /// Round trips of the latest live compiles (µs, newest last; `fast_budget_factor`).
+    live_compile_us: Mutex<std::collections::VecDeque<u64>>,
     edit_counter: AtomicU64,
     convergence: Mutex<Option<Convergence>>,
     overlays: Mutex<HashMap<ParaId, Revision>>,
@@ -477,6 +486,7 @@ impl Session {
             inputted: Mutex::new(crate::document::inputted_files(&texts)),
             slow_units: Mutex::new(HashMap::new()),
             slow_candidates: Mutex::new(HashMap::new()),
+            live_compile_us: Mutex::new(std::collections::VecDeque::new()),
             edit_counter: AtomicU64::new(0),
             convergence: Mutex::new(None),
             overlays: Mutex::new(HashMap::new()),
@@ -2333,7 +2343,19 @@ fn handle_result(
     // layout. The first slow compiles of a unit are forgiven (font loading, cold caches); three
     // in a row mark the unit.
     const STRIKES: u32 = 3;
-    if total_us > s.cfg.fast_budget.as_micros() as u64 {
+    let budget_us = {
+        let mut recent = s.live_compile_us.lock();
+        let b = effective_budget_us(s.cfg.fast_budget.as_micros() as u64, s.cfg.fast_budget_factor, &recent);
+        if recent.len() == BUDGET_WINDOW {
+            recent.pop_front();
+        }
+        recent.push_back(total_us);
+        b
+    };
+    let Some(budget_us) = budget_us else {
+        return;
+    };
+    if total_us > budget_us {
         if s.bg_running.load(Ordering::SeqCst) {
             // a layout pass is using the CPU: a slow round trip now says nothing about the unit
             return;
@@ -2359,10 +2381,31 @@ fn handle_result(
     }
 }
 
+/// Live compiles the budget's median is taken over, and how many it needs before it judges.
+const BUDGET_WINDOW: usize = 64;
+const BUDGET_SAMPLES: usize = 8;
+
+/// The budget a live compile is held to (µs): `floor_us` (`fast_budget`), or `factor` times the
+/// median of the session's recent compiles when that is larger. `None` (judge nothing) while
+/// fewer than `BUDGET_SAMPLES` compiles are known, unless `factor` is 0 (the floor alone).
+fn effective_budget_us(floor_us: u64, factor: f64, recent: &std::collections::VecDeque<u64>) -> Option<u64> {
+    if factor <= 0.0 {
+        return Some(floor_us);
+    }
+    if recent.len() < BUDGET_SAMPLES {
+        return None;
+    }
+    let mut v: Vec<u64> = recent.iter().copied().collect();
+    v.sort_unstable();
+    let median = v[v.len() / 2];
+    Some(floor_us.max((median as f64 * factor) as u64))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Background thread: debounced full passes with capture, layout installation, exports.
 // ---------------------------------------------------------------------------------------------
 fn background_thread(s: Arc<Shared>) {
+    warm_start(&s);
     prepare_standby(&s);
     loop {
         let cmd = match s.bg_signal.1.recv() {
@@ -2720,6 +2763,8 @@ fn run_background_pass_inner(s: &Shared) {
     let aux_dir = last_pass_dir(s).unwrap_or_else(|| pass_dir(s, 0));
     // before a pass runs in its directory: the previous pass's aux family and the manifest
     let prepare_dir = |dir: &Path| {
+        // the directory's capture is about to change: it no longer matches its sources hash
+        let _ = std::fs::remove_file(dir.join(SOURCES_HASH_FILE));
         if let Some(from) = last_pass_dir(s) {
             if let Err(e) = crate::background::copy_aux_family(&from, dir) {
                 log::warn!("aux family: {e:#}");
@@ -2922,6 +2967,61 @@ fn run_background_pass_inner(s: &Shared) {
         rev,
         false,
     );
+    // the sources this capture was made from: a later session on the same build directory
+    // shows it at once when they have not changed (warm_start)
+    if outcome_cap.json.pages > 0 && !outcome_cap.fatal() {
+        log::debug!("sources hash of {} files written to {}", texts.len(), outcome_cap.out_dir.display());
+        let _ = std::fs::write(
+            outcome_cap.out_dir.join(SOURCES_HASH_FILE),
+            format!("{:016x}\n", sources_hash(&texts)),
+        );
+    }
+}
+
+/// Next to a finished run's capture: the hash of the sources it compiled (`sources_hash`).
+const SOURCES_HASH_FILE: &str = "rtex-sources";
+
+/// The texts a pass compiles, and the rtex version that captured them.
+fn sources_hash(texts: &BTreeMap<String, String>) -> u64 {
+    let mut all = String::from(env!("CARGO_PKG_VERSION"));
+    for (name, text) in texts {
+        all.push('\0');
+        all.push_str(name);
+        all.push('\0');
+        all.push_str(text);
+    }
+    crate::document::hash_str(&all)
+}
+
+/// A session reopened on a build directory whose last finished run compiled the very sources
+/// it has now shows that run's layout before its first pass, as a provisional layout (the pass
+/// runs anyway and replaces it): no blank preview for the length of a pass, and live edits
+/// right away. Files other than the tracked sources (figures, `.bib`) are not hashed; the
+/// first pass brings their changes.
+fn warm_start(s: &Shared) {
+    let (texts, spans, rev) = snapshot(s);
+    let h = format!("{:016x}", sources_hash(&texts));
+    let jobname = jobname_of(&s.cfg.main_file);
+    for dir in [pass_dir(s, 0), pass_dir(s, 1)] {
+        let Ok(saved) = std::fs::read_to_string(dir.join(SOURCES_HASH_FILE)) else {
+            continue;
+        };
+        if saved.trim() != h {
+            log::debug!("warm start: {} holds a run of other sources ({} files now)", dir.display(), texts.len());
+            continue;
+        }
+        let t0 = Instant::now();
+        match crate::capture::load_capture(&dir, &jobname) {
+            Ok(cap) if cap.json.pages > 0 && !cap.fatal() => {
+                log::debug!("warm start: the previous session's layout from {}", dir.display());
+                *s.last_pass_dir.lock() = Some(dir.clone());
+                deliver_layout(s, t0, &cap, 1, true, spans, rev, true);
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => log::debug!("warm start: {}: {e:#}", dir.display()),
+        }
+    }
 }
 
 fn layout_failed(s: &Shared, t0: Instant, rev: Revision, msg: String) {
@@ -3445,5 +3545,26 @@ fn locate_standby_diagnostics(s: &Shared, items: &mut [Diagnostic]) {
             });
             d.line = line;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn the_budget_follows_the_document() {
+        let of = |v: &[u64]| v.iter().copied().collect::<VecDeque<u64>>();
+        // nothing is judged before the document's cost is known; factor 0 is the floor alone
+        assert_eq!(effective_budget_us(5000, 4.0, &of(&[9000; 7])), None);
+        assert_eq!(effective_budget_us(5000, 0.0, &of(&[])), Some(5000));
+        // a fast document keeps the floor
+        assert_eq!(effective_budget_us(5000, 4.0, &of(&[900, 1000, 1100, 800, 1200, 1000, 950, 1050])), Some(5000));
+        // OpenType node mode: paragraphs at ~8 ms stay under the budget, a 60 ms plot does not
+        let slow = of(&[7000, 8000, 9000, 6500, 12000, 8500, 60000, 7500]);
+        let b = effective_budget_us(5000, 4.0, &slow).unwrap();
+        assert_eq!(b, 34000);
+        assert!(16000 < b && 60000 > b);
     }
 }

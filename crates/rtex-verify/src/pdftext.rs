@@ -233,6 +233,41 @@ fn page_fonts(doc: &Document, page_id: ObjectId) -> Result<HashMap<String, PdfFo
     Ok(fonts)
 }
 
+/// The page's form XObjects (included PDF figures, saved boxes) by resource name: their
+/// `/BBox` and `/Matrix`. A form is drawn over its BBox, not over the unit square an image
+/// XObject fills.
+fn page_forms(doc: &Document, page_id: ObjectId) -> Result<HashMap<String, ([f64; 4], Matrix)>> {
+    let (res, res_ids) = doc.get_page_resources(page_id)?;
+    let mut dicts: Vec<Dictionary> = res.into_iter().cloned().collect();
+    dicts.extend(res_ids.into_iter().filter_map(|id| doc.get_dictionary(id).ok().cloned()));
+    let nums = |o: &Object| -> Option<Vec<f64>> {
+        doc.dereference(o).ok()?.1.as_array().ok()?.iter().map(|v| f(v).ok()).collect()
+    };
+    let mut forms = HashMap::new();
+    for d in dicts {
+        let Ok(xd) = d.get(b"XObject") else { continue };
+        let Ok(xd) = doc.dereference(xd)?.1.as_dict().cloned() else { continue };
+        for (name, obj) in xd.iter() {
+            let Ok(id) = obj.as_reference() else { continue };
+            let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else { continue };
+            let sd = &stream.dict;
+            if sd.get(b"Subtype").ok().and_then(|o| o.as_name().ok()) != Some(b"Form".as_slice()) {
+                continue;
+            }
+            let Some(bbox) = sd.get(b"BBox").ok().and_then(nums).filter(|v| v.len() == 4) else { continue };
+            let m = sd
+                .get(b"Matrix")
+                .ok()
+                .and_then(nums)
+                .filter(|v| v.len() == 6)
+                .map(|v| Matrix { a: v[0], b: v[1], c: v[2], d: v[3], e: v[4], f: v[5] })
+                .unwrap_or(Matrix::IDENTITY);
+            forms.insert(String::from_utf8_lossy(name).to_string(), ([bbox[0], bbox[1], bbox[2], bbox[3]], m));
+        }
+    }
+    Ok(forms)
+}
+
 fn media_box(doc: &Document, page_id: ObjectId) -> Result<(f64, f64)> {
     let mut id = page_id;
     for _ in 0..16 {
@@ -270,6 +305,7 @@ pub fn extract(path: &Path) -> Result<Vec<PdfPage>> {
     for (num, page_id) in doc.get_pages() {
         let (width, height) = media_box(&doc, page_id)?;
         let fonts = page_fonts(&doc, page_id)?;
+        let forms = page_forms(&doc, page_id)?;
         let data = doc.get_page_content(page_id)?;
         let content = Content::decode(&data)?;
         let mut page = PdfPage {
@@ -472,19 +508,20 @@ pub fn extract(path: &Path) -> Result<Vec<PdfPage>> {
                     path_start = None;
                 }
                 "Do" if ops.len() == 1 => {
-                    // unit square mapped by the CTM
-                    let (x0, y0) = ctm.apply(0.0, 0.0);
-                    let (x1, y1) = ctm.apply(1.0, 1.0);
-                    page.images.push(PdfImage {
-                        name: ops[0]
-                            .as_name()
-                            .map(|n| String::from_utf8_lossy(n).to_string())
-                            .unwrap_or_default(),
-                        x: x0.min(x1),
-                        y: y0.min(y1),
-                        w: (x1 - x0).abs(),
-                        h: (y1 - y0).abs(),
-                    });
+                    let name = ops[0]
+                        .as_name()
+                        .map(|n| String::from_utf8_lossy(n).to_string())
+                        .unwrap_or_default();
+                    // an image fills the unit square, a form (an included PDF) its BBox under
+                    // its Matrix; both then mapped by the CTM (the corners' bounding box)
+                    let (corners, m) = match forms.get(&name) {
+                        Some(([x0, y0, x1, y1], fm)) => ([(*x0, *y0), (*x1, *y0), (*x0, *y1), (*x1, *y1)], fm.mul(&ctm)),
+                        None => ([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)], ctm),
+                    };
+                    let pts: Vec<(f64, f64)> = corners.iter().map(|(x, y)| m.apply(*x, *y)).collect();
+                    let (minx, maxx) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+                    let (miny, maxy) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+                    page.images.push(PdfImage { name, x: minx, y: miny, w: maxx - minx, h: maxy - miny });
                 }
                 "re" if ops.len() == 4 => {
                     let (x, y, w, h) = (f(&ops[0])?, f(&ops[1])?, f(&ops[2])?, f(&ops[3])?);
@@ -517,4 +554,46 @@ pub fn extract(path: &Path) -> Result<Vec<PdfPage>> {
         pages.push(page);
     }
     Ok(pages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Stream};
+
+    /// An included PDF figure is a form XObject: drawn over its BBox, not the unit square an
+    /// image fills (the stress test's PDF figures read as 0.3 bp squares).
+    #[test]
+    fn forms_are_measured_by_their_bbox() {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let form = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 700.into(), 350.into()] },
+            b"0 0 700 350 re f".to_vec(),
+        ));
+        let image = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 },
+            vec![0],
+        ));
+        let content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q 0.5 0 0 0.5 10 20 cm /Fm1 Do Q q 100 0 0 50 300 400 cm /Im1 Do Q".to_vec(),
+        ));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Contents" => content,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Fm1" => form, "Im1" => image } },
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let path = std::env::temp_dir().join(format!("rtex-forms-{}.pdf", std::process::id()));
+        doc.save(&path).unwrap();
+        let pages = extract(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let rects: Vec<(f64, f64, f64, f64)> = pages[0].images.iter().map(|i| (i.x, i.y, i.w, i.h)).collect();
+        assert_eq!(rects, vec![(10.0, 20.0, 350.0, 175.0), (300.0, 400.0, 100.0, 50.0)]);
+    }
 }

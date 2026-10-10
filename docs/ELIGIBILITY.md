@@ -151,9 +151,19 @@ Cost: one extra compile (1–5 ms) per not-allow-listed unit per layout, on its 
 
 ## The fast budget is a parameter
 
-`fast_budget_ms` (default 5): a unit whose fast compiles exceed it three times in a row goes to
-the background path until the next layout. Session config `SessionConfig::fast_budget`, C ABI
-JSON `"fast_budget_ms"`, CLI `rtex serve --fast-budget-ms`. TikZ-style units would want a
+`fast_budget_ms` (default 5): a unit whose fast compiles exceed the budget three times in a row
+goes to the background path until the next layout. Session config `SessionConfig::fast_budget`,
+C ABI JSON `"fast_budget_ms"`, CLI `rtex serve --fast-budget-ms`.
+
+The budget follows the document: a compile is over budget only when it also takes longer than
+`fast_budget_factor` (default 4; C ABI `"fast_budget_factor"`, CLI `--fast-budget-factor`) times
+the median of the session's last 64 live compiles, and no unit is judged before the session has
+8. With fontspec's default node mode every paragraph pays luaotfload's shaping. On two
+luatexja-fontspec documents (Linux control, 2026-10-10), plain paragraphs cost 6–16 ms. With
+the fixed 5 ms budget, typing after a pause sent 5 and 4 of 8 typed words to the background
+after their third keystroke. The median there is about 7 ms, so the budget becomes about
+28 ms: paragraphs stay live and a plot at 50 ms or more still leaves. On a TFM document (1 ms
+paragraphs) the budget stays `fast_budget_ms`. Factor 0 is the fixed budget alone. TikZ-style units would want a
 larger value (a three-node flowchart costs about 17 ms in the engine, a 100-sample plot
 about 56 ms): the budget is per session for now. A picture the picture cache holds costs
 nothing to draw in the live engine (ARCHITECTURE.md), so only a picture being edited, or one

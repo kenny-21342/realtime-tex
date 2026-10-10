@@ -289,22 +289,27 @@ fn repeated_images_keep_their_files() {
     let mut cfg = SessionConfig::new(&project, "main.tex");
     cfg.build_dir = root.join("build");
     let s = Session::open(cfg).unwrap();
+    // the pages as the run leaves them: a provisional layout (a first pass over 2 s, when the
+    // machine is busy) may deliver them, and the converged one then changes none
     let deadline = Instant::now() + Duration::from_secs(120);
-    let mut files = vec![];
-    while files.is_empty() {
+    let mut pages = std::collections::BTreeMap::new();
+    let mut converged = false;
+    while !converged {
         assert!(Instant::now() < deadline, "no converged layout");
         for e in s.poll(Duration::from_millis(100)) {
             if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
-                if matches!(convergence, Convergence::Converged) {
-                    for p in pages_changed {
-                        let items = p.dl.other.iter().chain(p.dl.lines.iter().flat_map(|l| l.items.iter()));
-                        for it in items {
-                            if let rtex_dl::Item::Image { index, .. } = it {
-                                files.push(p.dl.images.get(&index.to_string()).map(|i| i.file.clone()));
-                            }
-                        }
-                    }
+                for p in pages_changed {
+                    pages.insert(p.page, p.dl);
                 }
+                converged |= matches!(convergence, Convergence::Converged);
+            }
+        }
+    }
+    let mut files = vec![];
+    for dl in pages.values() {
+        for it in dl.other.iter().chain(dl.lines.iter().flat_map(|l| l.items.iter())) {
+            if let rtex_dl::Item::Image { index, .. } = it {
+                files.push(dl.images.get(&index.to_string()).map(|i| i.file.clone()));
             }
         }
     }
@@ -643,5 +648,68 @@ fn removing_an_endless_loop_recovers_quickly() {
     }
     assert!(ok, "no clean layout of the fixed document within 60 s");
     assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
+    s.close();
+}
+
+/// A session reopened on the build directory of an earlier one showed nothing until its first
+/// pass ended (37 s on a TikZ-heavy 114-page document). With the sources unchanged it now shows
+/// the earlier session's layout at once, provisional while the pass runs; with them changed it
+/// waits for the pass as before.
+#[test]
+fn a_reopened_session_starts_from_its_last_layout() {
+    if TexLive::discover().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-regr-{}-warm", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let doc = "\\documentclass{article}\n\\begin{document}\nFirst page.\n\\clearpage\nSecond page.\n\\end{document}\n";
+    std::fs::write(project.join("main.tex"), doc).unwrap();
+    let open = || {
+        let mut cfg = SessionConfig::new(&project, "main.tex");
+        cfg.build_dir = root.join("build");
+        cfg.debounce = Duration::from_millis(50);
+        Session::open(cfg).unwrap()
+    };
+    // the first layout a session delivers: (provisional, pages, ms after open)
+    let first = |s: &Session| {
+        let t0 = Instant::now();
+        loop {
+            assert!(t0.elapsed() < Duration::from_secs(120), "no layout");
+            for e in s.poll(Duration::from_millis(50)) {
+                if let Event::LayoutUpdate { convergence, pages_total, .. } = e {
+                    let provisional = matches!(&convergence, Convergence::Converging { reasons, .. }
+                        if reasons.iter().any(|r| r == "another pass is running"));
+                    return (provisional, pages_total, t0.elapsed());
+                }
+            }
+        }
+    };
+    let s = open();
+    let (provisional, pages, _) = first(&s);
+    assert!(!provisional);
+    assert_eq!(pages, 2);
+    // the run's sources hash is written right after its layout
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        s.poll(Duration::from_millis(50));
+    }
+    s.close();
+    // same sources: the saved layout first, then the pass
+    let s = open();
+    let (provisional, pages, at) = first(&s);
+    assert!(provisional, "the reopened session waited for its pass");
+    assert_eq!(pages, 2);
+    assert!(at < Duration::from_secs(5), "{at:?}");
+    let (compile, convergence, ..) = final_layout(&s, 60, Duration::from_millis(300));
+    assert_eq!(compile, CompileStatus::Ok);
+    assert!(matches!(convergence, Convergence::Converged), "{convergence:?}");
+    s.close();
+    // changed sources: no saved layout
+    std::fs::write(project.join("main.tex"), doc.replace("Second page.", "Second page, edited.")).unwrap();
+    let s = open();
+    let (provisional, ..) = first(&s);
+    assert!(!provisional, "a layout of other sources was shown");
     s.close();
 }
