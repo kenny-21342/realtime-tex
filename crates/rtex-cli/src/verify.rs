@@ -493,7 +493,8 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
             .count();
         // image rectangles with the PDF transformation state applied (graphicx scales and
         // rotates bitmap images with save / setmatrix / restore around the image)
-        let dl_images: Vec<(f64, f64, f64, f64)> = {
+        // (x, y, w, h, tolerance) in bp
+        let dl_images: Vec<(f64, f64, f64, f64, f64)> = {
             let mut out = Vec::new();
             walk_transforms(&dl, |it, [a, b, c, d, tx, ty]| {
                 if let Item::Image { x, y_top, width, height, .. } = it {
@@ -505,24 +506,21 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
                     let maxx = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
                     let miny = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
                     let maxy = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-                    out.push((
-                        minx / rtex_dl::SP_PER_BP,
-                        pdf_page.height - maxy / rtex_dl::SP_PER_BP,
-                        (maxx - minx) / rtex_dl::SP_PER_BP,
-                        (maxy - miny) / rtex_dl::SP_PER_BP,
-                    ));
+                    let (x, y) = (minx / rtex_dl::SP_PER_BP, pdf_page.height - maxy / rtex_dl::SP_PER_BP);
+                    let (w, h) = ((maxx - minx) / rtex_dl::SP_PER_BP, (maxy - miny) / rtex_dl::SP_PER_BP);
+                    out.push((x, y, w, h, 0.01));
                 }
             });
             out
         };
         let images_matched = dl_images
             .iter()
-            .filter(|(x, y, w, h)| {
+            .filter(|(x, y, w, h, tol)| {
                 pdf_page.images.iter().any(|im| {
-                    (im.x - x).abs() < 0.01
-                        && (im.y - y).abs() < 0.01
-                        && (im.w - w).abs() < 0.01
-                        && (im.h - h).abs() < 0.01
+                    (im.x - x).abs() < *tol
+                        && (im.y - y).abs() < *tol
+                        && (im.w - w).abs() < *tol
+                        && (im.h - h).abs() < *tol
                 })
             })
             .count();
@@ -613,6 +611,14 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
                 rep.matched, rep.dl_glyphs, rep.pdf_glyphs, rep.anchored_max_dx_bp, interior_max, tj_quantum, rep.max_dy_bp, rep.rules_matched, rep.rules_dl, images_matched, dl_images.len(), pdf_page.images.len(), dl.flags);
             for w in rep.worst.iter().take(2) {
                 println!("    worst: par {} line {} idx {:?} font {:?} dl=({:.4},{:.4}) pdf=({:.4},{:.4}) dx={:.5}", w.par, w.line, w.index, w.pdf_font, w.dl_x_bp, w.dl_y_bp, w.pdf_x_bp.unwrap_or(0.0), w.pdf_y_bp.unwrap_or(0.0), w.dx_bp.unwrap_or(f64::NAN));
+            }
+            // each display-list image without a PDF image at its rectangle, and the closest one
+            for (x, y, w, h, tol) in &dl_images {
+                let d = |im: &&pdftext::PdfImage| (im.x - x).abs().max((im.y - y).abs()).max((im.w - w).abs()).max((im.h - h).abs());
+                let Some(near) = pdf_page.images.iter().min_by(|a, b| d(a).total_cmp(&d(b))) else { continue };
+                if d(&near) >= *tol {
+                    println!("    image unmatched: dl=({x:.4},{y:.4} {w:.4}x{h:.4}) nearest pdf=({:.4},{:.4} {:.4}x{:.4}) off {:.5} (tolerance {tol:.5})", near.x, near.y, near.w, near.h, d(&near));
+                }
             }
         }
         report.pages.push(pv);
