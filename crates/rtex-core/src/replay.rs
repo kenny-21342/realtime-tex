@@ -106,8 +106,11 @@ pub struct Observer {
     pub updates: HashMap<(u64, ParaId), Served>,
     /// Edits the session sent to the background path (`BackgroundScheduled`), with the arrival time.
     pub background: HashMap<u64, Instant>,
-    /// The latest diagnostics per source ("tex", "bib", ...).
+    /// The diagnostics in force per source ("background", "fast:<par>"), kept the way an editor
+    /// keeps them: a LayoutUpdate clears the background list unless the pass sent one, and clears
+    /// the fast-path lists.
     pub diagnostics: HashMap<String, Vec<Diagnostic>>,
+    background_diagnostics_this_pass: bool,
     pub layouts: u32,
     /// Arrival time of the latest LayoutUpdate.
     pub layout_at: Option<Instant>,
@@ -137,6 +140,7 @@ impl Observer {
             updates: HashMap::new(),
             background: HashMap::new(),
             diagnostics: HashMap::new(),
+            background_diagnostics_this_pass: false,
             layouts: 0,
             layout_at: None,
             log: VecDeque::new(),
@@ -208,6 +212,8 @@ impl Observer {
                 self.compile = Some(compile);
                 self.layouts += 1;
                 self.layout_at = Some(now);
+                let keep_background = std::mem::take(&mut self.background_diagnostics_this_pass);
+                self.diagnostics.retain(|src, _| keep_background && src == "background");
             }
             Event::ParagraphUpdate {
                 par_id,
@@ -228,6 +234,9 @@ impl Observer {
                 self.background.entry(edit_id).or_insert(now);
             }
             Event::Diagnostics { source, items } => {
+                if source == "background" {
+                    self.background_diagnostics_this_pass = true;
+                }
                 self.diagnostics.insert(source, items);
             }
             _ => {}
