@@ -211,6 +211,7 @@ impl PicCache {
             return None;
         }
         Some(serde_json::json!({
+            "key": p.key,
             "env": e.env,
             "state": e.state,
             "end_line": p.end_line,
@@ -841,6 +842,7 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
     let mut added_flags: BTreeMap<String, i64> = BTreeMap::new();
     let mut glyphs = 0;
     let mut fonts = dl.fonts.clone();
+    let mut spots: Vec<rtex_dl::PictureSpot> = Vec::new();
     let mut next_id = fonts.keys().filter_map(|k| k.parse::<i64>().ok()).max().unwrap_or(0) + 1;
     let mut splice = |items: &mut Vec<Item>| {
         let mut out = Vec::with_capacity(items.len());
@@ -861,6 +863,13 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
                 out.push(it);
                 continue;
             };
+            // where the picture is (a host copying a picture into a live unit needs it)
+            if let Item::Unsupported { detail, .. } = &it {
+                let f: Vec<&str> = detail.as_str().unwrap_or("").splitn(6, ' ').collect();
+                if let (Some(w), Some(h), Some(key)) = (f.get(3).and_then(|v| v.parse().ok()), f.get(4).and_then(|v| v.parse().ok()), f.get(5)) {
+                    spots.push(rtex_dl::PictureSpot { key: key.to_string(), x: ox, top: oy - frag.h, width: w, height: h });
+                }
+            }
             // the fragment's font ids are the recording pass's: map them onto this page's
             let mut ids: BTreeMap<i64, i64> = BTreeMap::new();
             for (k, fd) in &frag.fonts {
@@ -918,6 +927,7 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
     }
     dl.fonts = fonts;
     dl.glyphs += glyphs;
+    dl.pictures.extend(spots);
     let mut flags = dl.flags_map();
     let still_cached = dl
         .lines
@@ -1070,6 +1080,53 @@ mod tests {
         assert_eq!(cacheable(doc), vec![true, true]);
         // `legend to name` / `name path` are not node names
         assert!(defined_names("\\begin{axis}[legend to name=leg, name path=curve]").is_empty());
+    }
+
+    #[test]
+    fn substitute_puts_a_cached_picture_back_and_says_where() {
+        use rtex_dl::{DisplayList, FontDesc, Item, Line};
+        let font = FontDesc { id: 7, filename: Some("lmroman10-regular.otf".into()), size: Some(655360.0), ..Default::default() };
+        let mut frag_fonts = BTreeMap::new();
+        frag_fonts.insert("7".to_string(), font.clone());
+        let frag = Fragment {
+            items: vec![
+                Item::Literal { mode: 0, data: "0 0 m 10 0 l S".into(), at: Some((0, 0)) },
+                Item::Glyph { font: 7, char: 65, index: Some(36), x: 100, y: -50, width: 400, expansion: 0 },
+            ],
+            fonts: frag_fonts,
+            h: 3000,
+        };
+        let mut fragments = BTreeMap::new();
+        fragments.insert("main.tex:12".to_string(), frag);
+        // the same font under another id on the page
+        let mut page_font = font;
+        page_font.id = 3;
+        let mut dl = DisplayList {
+            kind: "page".into(),
+            lines: vec![Line {
+                items: vec![Item::Unsupported {
+                    kind: "cached_picture".into(),
+                    detail: serde_json::Value::String("5 1000 2000 4000 3500 main.tex:12".into()),
+                }],
+                ..Default::default()
+            }],
+            flags: serde_json::json!({"pic_cache": 1}),
+            ..Default::default()
+        };
+        dl.fonts.insert("3".into(), page_font);
+        assert_eq!(substitute(&mut dl, &fragments), 1);
+        let items = &dl.lines[0].items;
+        // baseline = top + h: 2000 + 3000
+        assert_eq!(items[0], Item::Literal { mode: 0, data: "0 0 m 10 0 l S".into(), at: Some((1000, 5000)) });
+        assert!(matches!(items[1], Item::Glyph { font: 3, x: 1100, y: 4950, .. }));
+        let flags = dl.flags_map();
+        assert!(!flags.contains_key("pic_cache"));
+        assert_eq!(flags.get("literal").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(dl.pictures, vec![rtex_dl::PictureSpot { key: "main.tex:12".into(), x: 1000, top: 2000, width: 4000, height: 3500 }]);
+        // an unknown key stays a cached region
+        let mut other = dl.clone();
+        other.lines[0].items = vec![Item::Unsupported { kind: "cached_picture".into(), detail: serde_json::Value::String("5 1 2 3 4 other.tex:1".into()) }];
+        assert_eq!(substitute(&mut other, &fragments), 0);
     }
 
     #[test]

@@ -61,6 +61,9 @@ Records: u8 tag, u32 payload_length, payload   (unknown tags must be skipped)
   0x28 MATRIX   u8 op (0 save, 1 set, 2 restore), i32 x, i32 y, str data
                 PDF transformation state (graphicx scaling/rotation): `set` applies the matrix
                 "a b c d" about the point (x, y) to everything up to the matching `restore`
+  0x29 PICTURE  str key, i32 x, i32 top, i32 width, i32 height
+                a picture this page draws from the picture cache's stored drawing (its
+                `cached_picture` item was replaced): where it is, by its cache key
   0xFF END
 
 In unit lists the META record's `origin_y` slot carries the number of insert nodes (footnotes,
@@ -129,8 +132,10 @@ that does not draw natively keeps using the PDF.
 - Pictures the background pass took from the picture cache keep their drawing: the cache stores
   each picture's display-list items with its PDF region, and a page list puts them back in place
   of the `cached_picture` item (`pic_cache` flag gone when every cached picture on the page came
-  back), so a layout is drawn natively whether its pictures were typeset or cached. Live
-  (fast-path) results keep `cached_picture` items.
+  back), so a layout is drawn natively whether its pictures were typeset or cached. The page
+  lists each such picture in `pictures` (PICTURE records: key and rectangle). Live (fast-path)
+  results keep `cached_picture` items, whose detail ends with the same key: a host that copies a
+  cached picture into a live unit finds its pixels on the page by key.
 - `transforms` lists glyphs, rules and images that a transformed pgf scope (rotated or scaled
   node text, axis labels) moves away from their list position: draw them with that map (list
   coordinates to list coordinates) instead of their MATRIX records.
@@ -146,6 +151,6 @@ glyph origins) and `scripts/gfx_shading_check.py` samples shadings against MuPDF
 "h","d","gs","gsign","gorder","items":[["g",font,char,index,x,y,w,ef],["r",x,y_top,w,h],
 ["c",stack,cmd,data],["l",mode,data,x,y],["u",kind,detail],["m","on"|"off",x],["i",index,x,y_top,w,h],
 ["M","save"|"set"|"restore",x,y,data]]}],
-"other":[…],"flags":{…},"glyphs":n,"inserts":n,"images_info":{index:{file,page,pages}},"width","height","depth","page","page_width","page_height","origin"}`;
+"other":[…],"flags":{…},"pictures":[{"key","x","top","width","height"}],"glyphs":n,"inserts":n,"images_info":{index:{file,page,pages}},"width","height","depth","page","page_width","page_height","origin"}`;
 page lines also carry `"unit"` and `"row"`).
 Both encodings carry the same information; the binary one is what the engine emits.
