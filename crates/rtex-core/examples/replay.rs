@@ -25,6 +25,7 @@
 //! compile status, pages, and the verdict of the last result served for each edited paragraph
 //! against the settled layout (`rtex_core::replay`, as in tests/mutation.rs). Writes
 //! DIR/report.json and prints a summary; exits 1 if any served result was wrong.
+//! REPLAY_EVENTS=1 prints the session's events at every settle.
 use anyhow::{anyhow, bail, Context, Result};
 use rtex_core::replay::{edit_at, has_picture_code, safe_words, Observer, Rng, Verdict};
 use rtex_core::session::CompileStatus;
@@ -237,6 +238,11 @@ impl Run {
             bail!("{}", o.dump(s, &format!("no settled layout for revision {rev}")));
         }
         let settle_ms = (o.layout_at.unwrap() - last_sent).as_secs_f64() * 1e3;
+        if std::env::var("REPLAY_EVENTS").is_ok() {
+            for l in o.log.drain(..) {
+                println!("      | {l}");
+            }
+        }
         self.settle_ms.push(settle_ms);
         // per paragraph, the last edit that touched it: only a result served for that edit shows
         // the paragraph's final text (a later keystroke may have gone to the background path)
@@ -284,15 +290,22 @@ impl Run {
                 }
             }
             *self.verdicts.entry(name).or_default() += 1;
+            let excerpt = s
+                .spans(&a.file)
+                .into_iter()
+                .find(|sp| sp.id == *p)
+                .and_then(|sp| s.document_text(&a.file).map(|t| t[sp.range].chars().take(400).collect::<String>()));
             if name == "MISMATCH" {
                 self.wrong += 1;
                 println!("  MISMATCH par {p:?} after edit '{}' in {}:", a.label, a.file);
+                println!("      source: {:?}", excerpt.as_deref().unwrap_or(""));
                 for d in &details {
                     println!("      {d}");
                 }
             }
             verdicts.push(json!({"par": format!("{p:?}"), "edit_id": a.edit_id, "verdict": name, "status": served.status,
-                                 "reasons": served.reasons, "details": details, "reserve": reserve}));
+                                 "reasons": served.reasons, "details": details, "reserve": reserve,
+                                 "source": if name == "match" { None } else { excerpt }}));
         }
         o.updates.retain(|(e, _), _| !ids.contains(e));
         let errors: Vec<Value> = o

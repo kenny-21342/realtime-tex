@@ -28,11 +28,13 @@ impl Rng {
 }
 
 /// Lowercase ASCII words delimited by single spaces, outside math, braces and brackets (option
-/// lists: `\draw[line width=1pt]`), not part of a control sequence: editing them cannot break
-/// the paragraph's syntax. Byte ranges into `par`.
+/// lists: `\draw[line width=1pt]`), not part of a control sequence and not right after one (a
+/// primitive's keyword: `\pdfextension info {...}`): editing them cannot break the paragraph's
+/// syntax. Byte ranges into `par`.
 pub fn safe_words(par: &str) -> Vec<(usize, usize)> {
     let b = par.as_bytes();
     let (mut depth, mut brackets, mut dollars) = (0i32, 0i32, 0usize);
+    let mut after_cs = false;
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
@@ -46,14 +48,25 @@ pub fn safe_words(par: &str) -> Vec<(usize, usize)> {
             b'\\' => {
                 // skip the control sequence / escaped character
                 i += 1;
+                after_cs = i < b.len() && b[i].is_ascii_alphabetic();
                 while i < b.len() && b[i].is_ascii_alphabetic() {
                     i += 1;
                 }
                 continue;
             }
+            b' ' => {
+                i += 1;
+                continue;
+            }
             _ => {}
         }
-        if c.is_ascii_lowercase() && depth == 0 && brackets <= 0 && dollars % 2 == 0 && (i == 0 || b[i - 1] == b' ')
+        let keyword = std::mem::take(&mut after_cs);
+        if c.is_ascii_lowercase()
+            && !keyword
+            && depth == 0
+            && brackets <= 0
+            && dollars % 2 == 0
+            && (i == 0 || b[i - 1] == b' ')
         {
             let s = i;
             while i < b.len() && b[i].is_ascii_lowercase() {
@@ -445,8 +458,8 @@ mod tests {
 
     #[test]
     fn safe_words_skip_commands_math_and_options() {
-        let p = "the \\emph{word} and $x$ math [opt] plain words.";
+        let p = "the \\emph{word} and $x$ math [opt] plain words. \\pdfextension info {x} done.";
         let w: Vec<&str> = safe_words(p).iter().map(|&(s, e)| &p[s..e]).collect();
-        assert_eq!(w, ["the", "and", "math", "plain", "words"]);
+        assert_eq!(w, ["the", "and", "math", "plain", "words", "done"]);
     }
 }
