@@ -98,6 +98,9 @@ struct Run {
     routed: BTreeMap<String, usize>,
     /// Fast-routed edits whose result did not arrive within FAST_TIMEOUT.
     fast_missing: usize,
+    /// Fast-routed edits the session then sent to the background (a probe that failed, a unit
+    /// over budget): BackgroundScheduled instead of a result.
+    fast_demoted: usize,
     settle_ms: Vec<f64>,
     verdicts: BTreeMap<&'static str, usize>,
     wrong: usize,
@@ -125,6 +128,7 @@ impl Run {
             "fast_result_ms": stats(&self.fast_ms),
             "fast_engine_ms": stats(&self.engine_ms),
             "fast_missing": self.fast_missing,
+            "fast_demoted": self.fast_demoted,
             "settle_ms": stats(&self.settle_ms),
             "verdicts": self.verdicts,
         })
@@ -135,7 +139,10 @@ impl Run {
         };
         println!("replay summary");
         println!("  open: {}", self.open);
-        println!("  edits by route: {:?}  (fast results missing: {})", self.routed, self.fast_missing);
+        println!(
+            "  edits by route: {:?}  (fast, then sent to the background: {}; fast results missing: {})",
+            self.routed, self.fast_demoted, self.fast_missing
+        );
         f("fast result, host (ms)", &self.fast_ms);
         f("fast result, engine (ms)", &self.engine_ms);
         f("edit -> settled layout (ms)", &self.settle_ms);
@@ -199,7 +206,11 @@ impl Run {
         });
         if a.routed == "fast" {
             let eid = a.edit_id;
-            let got = o.pump(s, FAST_TIMEOUT, |o| o.updates.keys().any(|(e, _)| *e == eid));
+            let got = o.pump(s, FAST_TIMEOUT, |o| {
+                o.updates.keys().any(|(e, _)| *e == eid) || o.background.contains_key(&eid)
+            });
+            let got = got && o.updates.keys().any(|(e, _)| *e == eid);
+            let demoted = o.background.contains_key(&eid);
             if got {
                 // all paragraphs of the edit answer together; take what arrived for this edit
                 for e in s.poll(Duration::from_millis(0)) {
@@ -214,6 +225,10 @@ impl Run {
                 rec["fast_ms"] = json!(host);
                 rec["engine_ms"] = json!(engine);
                 rec["statuses"] = json!(statuses);
+            } else if demoted {
+                self.fast_demoted += 1;
+                rec["fast_ms"] = Value::Null;
+                rec["demoted"] = json!(true);
             } else {
                 self.fast_missing += 1;
                 rec["fast_ms"] = Value::Null;
