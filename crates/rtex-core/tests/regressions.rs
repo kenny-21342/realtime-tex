@@ -453,3 +453,33 @@ fn endinput_never_reaches_the_live_server() {
     assert_eq!(s.versions().engine_generation, gen, "the live engine was restarted");
     s.close();
 }
+
+/// `makeindex` runs between passes as bibtex does: the index of a document that prints one
+/// (`\makeindex`, `\index`, `\printindex`) used to be missing from every layout.
+#[test]
+fn the_index_is_built() {
+    let Some(s) = open(
+        "index",
+        "\\documentclass{article}\n\\usepackage{makeidx}\n\\makeindex\n\\begin{document}\nAlpha\\index{alpha} and beta\\index{beta}.\n\\printindex\n\\end{document}\n",
+    ) else {
+        return;
+    };
+    let mut o = rtex_core::replay::Observer::new();
+    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no layout");
+    assert!(o.converged, "{}", o.dump(&s, "did not converge"));
+    // the index starts a page of its own (article's theindex), with the entries on it
+    assert_eq!(o.pages_total, 2, "{}", o.dump(&s, "no index page"));
+    let page = &o.pages[&2];
+    let chars: String = page
+        .lines
+        .iter()
+        .flat_map(|l| l.items.iter())
+        .chain(page.other.iter())
+        .filter_map(|it| match it {
+            rtex_dl::Item::Glyph { char, .. } => char::from_u32(*char as u32),
+            _ => None,
+        })
+        .collect();
+    assert!(chars.contains("alpha") && chars.contains("beta"), "index page text: {chars}");
+    s.close();
+}

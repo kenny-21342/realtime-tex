@@ -140,7 +140,7 @@ pub fn mirror_dirs(src: &Path, out: &Path, depth: usize) -> Result<()> {
 fn aux_signature(out_dir: &Path, jobname: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     use std::hash::{Hash, Hasher};
-    for ext in ["aux", "toc", "lof", "lot", "out", "bcf", "bbl", "idx"] {
+    for ext in ["aux", "toc", "lof", "lot", "out", "bcf", "bbl", "idx", "ind"] {
         if let Ok(b) = std::fs::read(out_dir.join(format!("{jobname}.{ext}"))) {
             ext.hash(&mut h);
             b.hash(&mut h);
@@ -301,6 +301,8 @@ pub fn run_pass_with_runner(
         .to_string();
     let mut sig_before = aux_signature(aux_dir, &jobname);
     let mut bib_ran = false;
+    // the .idx makeindex last read: run again only when the entries or their pages changed
+    let mut indexed: Option<Vec<u8>> = None;
     let mut last: Option<CaptureResult> = None;
     let mut passes = 0;
     let mut stable = false;
@@ -345,6 +347,31 @@ pub fn run_pass_with_runner(
                 log::warn!("{tool} failed: {}", String::from_utf8_lossy(&out.stderr));
             }
             bib_ran = true;
+        }
+        // an index (\makeindex, \index, \printindex): makeindex turns the pass's .idx into the
+        // .ind the next pass prints. A changed .ind changes the signature: another pass.
+        let idx = out_dir.join(format!("{jobname}.idx"));
+        if let Ok(entries) = std::fs::read(&idx) {
+            if !entries.is_empty() && indexed.as_deref() != Some(entries.as_slice()) {
+                let mut cmd = Command::new("makeindex");
+                cmd.current_dir(out_dir).arg("-q").arg(format!("{jobname}.idx"));
+                if let Some(d) = &tl.bin_dir {
+                    cmd.env(
+                        "PATH",
+                        format!("{}:{}", d.display(), std::env::var("PATH").unwrap_or_default()),
+                    );
+                }
+                // a style file (-s) in the project is found through INDEXSTYLE
+                cmd.env("INDEXSTYLE", format!("{}:", snapshot_dir.display()));
+                match cmd.output() {
+                    Ok(out) if !out.status.success() => {
+                        log::warn!("makeindex failed: {}", String::from_utf8_lossy(&out.stderr))
+                    }
+                    Err(e) => log::warn!("makeindex: {e}"),
+                    _ => {}
+                }
+                indexed = Some(entries);
+            }
         }
         let sig_after = aux_signature(out_dir, &jobname);
         // a bibliography run that changed nothing (same .bbl) needs no extra pass: the .bbl is
