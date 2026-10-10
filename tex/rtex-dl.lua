@@ -264,6 +264,18 @@ function State:emit(item)
   -- the transformation state (pdf_save / pdf_setmatrix / pdf_restore): a row that starts
   -- under a matrix (a landscape page's table, a rotated \parbox) is drawn turned, but rows keep
   -- the coordinates of the untransformed box and no record ties them to the matrix
+  -- color stacks in the order LuaTeX writes them (the page's node order), from the stacks in
+  -- force at the page's start: what is in force at its end starts the next page
+  if item[1] == "c" and self.cstacks then
+    local id = tostring(item[2])
+    local st = self.cstacks[id]
+    if not st then st = {}; self.cstacks[id] = st end
+    local cmd = item[3]
+    if cmd == 0 then st[math.max(#st, 1)] = item[4]
+    elseif cmd == 1 then st[#st + 1] = item[4]
+    elseif cmd == 2 then st[#st] = nil end
+    item[5] = st[#st] or ""
+  end
   if item[1] == "M" then
     local ms = self.mstack
     if not ms then ms = {}; self.mstack = ms end
@@ -914,18 +926,33 @@ end
 
 -- Shipped page box. `attr_par`/`attr_line` identify tagged lines. Origin: page top-left;
 -- the box is offset by (1in + \hoffset, 1in + \voffset) like the PDF backend does.
+local function copy_stacks(t)
+  local c = {}
+  for id, st in pairs(t or {}) do
+    local v = {}
+    for i, d in ipairs(st) do v[i] = d end
+    c[id] = v
+  end
+  return c
+end
+
+-- `extra.color_base`: the color stacks in force when the page starts (stack id -> entries,
+-- bottom first), carried from page to page by the capture; the result's `color_end` holds them
+-- after the page.
 function M.page(boxnode, attr_par, attr_line, page_no, glyph_attr, attr_unit, is_insert, extra)
   local box = todirect(boxnode)
   local st = new_state({ attr_par = attr_par, attr_line = attr_line, glyph_attr = glyph_attr,
                          attr_unit = attr_unit, is_insert = is_insert,
                          attr_pic = extra and extra.attr_pic, pic_images = extra and extra.pic_images })
+  st.cstacks = copy_stacks(extra and extra.color_base)
   local one_inch = 4736286  -- 72.27pt in sp
   local ox = one_inch + tex.hoffset
   local oy = one_inch + tex.voffset
   local w, h, d = getwhd(box)
   vlist_out(st, box, ox, oy)
   return result(st, "page", { page = page_no, width = w, height = h, depth = d,
-    page_width = tex.pagewidth, page_height = tex.pageheight, origin = { ox, oy }, pics = st.pics })
+    page_width = tex.pagewidth, page_height = tex.pageheight, origin = { ox, oy }, pics = st.pics,
+    color_end = st.cstacks })
 end
 
 return M

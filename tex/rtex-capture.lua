@@ -581,8 +581,18 @@ function C.shipout(boxnum, pageattr)
   local b = tex.box[boxnum]
   if not b then return end
   C.pending_ink = ink(Dn.getlist(Dn.todirect(b)))
+  -- color stacks carry over from page to page (\pdfcolorstackinit page): the page records the
+  -- stacks it starts with when they are not the color package's initial black
+  local base = C.color_carry or { ["0"] = { "0 g 0 G" } }
   local page = dl.page(b, C.attr_par, C.attr_line, C.page, nil, C.attr_unit, is_insert,
-                       { attr_pic = C.attr_pic, pic_images = C.cache_images })
+                       { attr_pic = C.attr_pic, pic_images = C.cache_images, color_base = base })
+  C.color_carry = page.color_end
+  page.color_end = nil
+  local plain = true
+  for id, st in pairs(base) do
+    if not (id == "0" and #st == 1 and st[1] == "0 g 0 G") and #st > 0 then plain = false end
+  end
+  if not plain then page.color_base = base end
   local rot = page_rotate(pageattr)
   if rot ~= 0 then page.rotate = rot end
   for _, pc in ipairs(page.pics or {}) do

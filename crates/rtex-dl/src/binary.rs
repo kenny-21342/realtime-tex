@@ -346,6 +346,7 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                             stack,
                             cmd: if cmd == 255 { None } else { Some(cmd as i64) },
                             data,
+                            after: None,
                         }
                     }
                     0x23 => {
@@ -480,7 +481,7 @@ fn write_items(out: &mut Writer, items: &[Item]) {
                 p.i32(*height);
                 out.rec(0x21, &p.0);
             }
-            Item::Color { stack, cmd, data } => {
+            Item::Color { stack, cmd, data, .. } => {
                 let mut p = Writer(Vec::new());
                 p.u8(cmd.map(|c| c as u8).unwrap_or(255));
                 p.u8(0);
@@ -724,6 +725,7 @@ mod tests {
                         stack: 0,
                         cmd: Some(1),
                         data: "1 0 0 rg".into(),
+                        after: None,
                     },
                     Item::Glyph {
                         font: 27,
@@ -738,6 +740,7 @@ mod tests {
                         stack: 0,
                         cmd: Some(2),
                         data: String::new(),
+                        after: None,
                     },
                     Item::Math { on: true, x: 1400 },
                     Item::Image {
@@ -772,6 +775,7 @@ mod tests {
                 stack: 0,
                 cmd: Some(0),
                 data: "0 g 0 G".into(),
+                after: None,
             }],
             flags: serde_json::json!({"literal": 1}),
             pictures: vec![crate::PictureSpot { key: "main.tex:12".into(), x: 100, top: 200, width: 3000, height: 1500 }],

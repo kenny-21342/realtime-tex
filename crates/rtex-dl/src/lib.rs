@@ -86,11 +86,15 @@ pub enum Item {
         width: Sp,
         height: Sp,
     },
-    /// pdf_colorstack whatsit: stack id, command, data (raw PDF color operators).
+    /// pdf_colorstack whatsit: stack id, command, data (raw PDF color operators), and in capture
+    /// pages the stack's top after the command in LuaTeX's order (`after`; JSON's fifth element):
+    /// rows and `other` interleave on the page, so replaying the commands in list order can pop
+    /// what a later row pushed.
     Color {
         stack: i64,
         cmd: Option<i64>,
         data: String,
+        after: Option<String>,
     },
     /// pdf_literal / special passthrough (mode -1 = \special), with the position it was
     /// output at (x, baseline y; absent in lists from before positions were recorded).
@@ -145,7 +149,8 @@ impl Serialize for Item {
                 width,
                 height,
             } => json!(["r", x, y_top, width, height]),
-            Item::Color { stack, cmd, data } => json!(["c", stack, cmd, data]),
+            Item::Color { stack, cmd, data, after: None } => json!(["c", stack, cmd, data]),
+            Item::Color { stack, cmd, data, after: Some(a) } => json!(["c", stack, cmd, data, a]),
             Item::Literal { mode, data, at: None } => json!(["l", mode, data]),
             Item::Literal { mode, data, at: Some((x, y)) } => json!(["l", mode, data, x, y]),
             Item::Unsupported { kind, detail } => json!(["u", kind, detail]),
@@ -207,6 +212,7 @@ impl<'de> Deserialize<'de> for Item {
                     .and_then(|d| d.as_str())
                     .unwrap_or("")
                     .to_string(),
+                after: arr.get(4).and_then(|d| d.as_str()).map(String::from),
             },
             "l" => Item::Literal {
                 mode: g(1).unwrap_or(0),
@@ -370,6 +376,12 @@ pub struct DisplayList {
     /// Coordinates are those of the unrotated page; viewers turn the whole page, so should hosts.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub rotate: i64,
+    /// Color stacks in force when the page starts (stack id → entries, bottom first), when they
+    /// are not the color package's initial black: LuaTeX carries its color stacks across pages,
+    /// so a page that starts inside a color group pops entries pushed on an earlier one. Capture
+    /// pages only; the native drawing starts from it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "map_or_empty_array")]
+    pub color_base: BTreeMap<String, Vec<String>>,
     /// Pictures this page draws from the picture cache's stored drawings (their `cached_picture`
     /// items were replaced by the drawing): where each is, by its cache key. A host that copies
     /// a cached picture into a live unit takes its pixels from here.

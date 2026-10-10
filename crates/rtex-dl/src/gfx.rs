@@ -572,7 +572,9 @@ impl Interp {
         cur
     }
 
-    fn color_stack(&mut self, stack: i64, cmd: Option<i64>, data: &str, at: ItemRef) -> Result<(), String> {
+    /// `after`: the stack's top after the command in LuaTeX's order (capture pages), which wins
+    /// over the replay in list order (rows and `other` interleave on the page).
+    fn color_stack(&mut self, stack: i64, cmd: Option<i64>, data: &str, after: Option<&str>, at: ItemRef) -> Result<(), String> {
         // LuaTeX: 0 set (replace the top), 1 push, 2 pop (the new top is written), 3 current.
         // Stack 0 (the color package's) starts at black; another stack's base is unknown.
         let st = self
@@ -593,12 +595,25 @@ impl Interp {
             Some(2) => {
                 st.pop();
                 if st.is_empty() {
-                    return Err(format!("color stack {stack} popped below its base"));
+                    match after {
+                        Some(a) => st.push(a.to_string()),
+                        None => return Err(format!("color stack {stack} popped below its base")),
+                    }
                 }
                 st.last().cloned()
             }
             Some(3) => st.last().cloned(),
             _ => return Err(format!("color stack command {cmd:?}")),
+        };
+        let emit = match (emit, after) {
+            // the true top, where the replay in list order lost track of it
+            (Some(e), Some(a)) if !a.is_empty() && e != a => {
+                if let Some(top) = st.last_mut() {
+                    *top = a.to_string();
+                }
+                Some(a.to_string())
+            }
+            (e, _) => e,
         };
         if let Some(d) = emit {
             self.run(&d, at, true)?;
@@ -826,7 +841,13 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
         clip: None,
         ops: Vec::new(),
         transforms: Vec::new(),
-        colors: ColorStacks { stacks: BTreeMap::new() },
+        colors: ColorStacks {
+            stacks: dl
+                .color_base
+                .iter()
+                .filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.clone())))
+                .collect(),
+        },
         depth: 0,
     };
     // `other` comes first in the page's content, then the rows in order
@@ -849,7 +870,9 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
                     (-1, _) => return Err(fail("\\special".into())),
                     (m, _) => return Err(fail(format!("literal mode {m}"))),
                 },
-                Item::Color { stack, cmd, data } => it.color_stack(*stack, *cmd, data, at).map_err(fail)?,
+                Item::Color { stack, cmd, data, after } => {
+                    it.color_stack(*stack, *cmd, data, after.as_deref(), at).map_err(fail)?
+                }
                 Item::Matrix { op, x, y, data } => {
                     it.move_to(*x, *y);
                     match op.as_str() {
@@ -995,9 +1018,9 @@ mod tests {
     fn opacity_clip_dash_and_color_stack() {
         let (x, y) = (1000, 1000);
         let p = page(vec![
-            Item::Color { stack: 0, cmd: Some(1), data: "0 0 1 rg 0 0 1 RG".into() },
+            Item::Color { stack: 0, cmd: Some(1), data: "0 0 1 rg 0 0 1 RG".into(), after: None },
             lit("q /pgf@ca0.5 gs [3 1] 0 d 0 0 10 10 re W n 0 0 5 5 re B Q", x, y),
-            Item::Color { stack: 0, cmd: Some(2), data: String::new() },
+            Item::Color { stack: 0, cmd: Some(2), data: String::new(), after: None },
         ]);
         let n = native_graphics(&p).unwrap();
         assert!(matches!(n.ops[0], GfxOp::Save { .. }));
