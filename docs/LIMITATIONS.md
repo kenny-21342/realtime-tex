@@ -91,8 +91,10 @@ display list's native drawing operations (docs/DISPLAY_LIST.md, "Native drawing"
 and soft masks still fall back to the PDF. A page's `/Rotate` (pdflscape) is reported as
 `rotate`: hosts turn the page.
 
-**Bibliographies and indices.** `biber` and `bibtex` run automatically; `makeindex`, `xindy` and
-glossaries do not (documented hook point: `background.rs::run_pass`).
+**Bibliographies and indices.** `biber`, `bibtex` and `makeindex` (default style, or a project
+`.ist` through `-s`) run between background passes; `xindy` and `makeglossaries` do not (hook
+point: `background.rs::run_pass_with_runner`). Glossaries printed without an external tool
+(`\printnoidxglossaries`) need nothing.
 
 **Determinism of exports.** Export equality with a clean build is byte-exact only when the
 document suppresses optional PDF info (the fixtures set `\pdfvariable suppressoptionalinfo 1023`);
