@@ -458,16 +458,35 @@ pub fn collect_capture(
     stdout: &[u8],
     wall: std::time::Duration,
 ) -> Result<CaptureResult> {
+    // written at \end{document}: a pass that stopped earlier (a fatal error) leaves the file of
+    // an earlier pass in the same directory, which is not this pass's capture
+    let started = std::time::SystemTime::now() - wall - std::time::Duration::from_secs(1);
+    collect_capture_since(out_dir, jobname, instrumented, exit_ok, exit_code, stdout, wall, Some(started))
+}
+
+/// The capture an earlier, finished pass left in `out_dir` (a previous session's last pass).
+pub fn load_capture(out_dir: &Path, jobname: &str) -> Result<CaptureResult> {
+    collect_capture_since(out_dir, jobname, true, true, Some(0), &[], std::time::Duration::ZERO, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_capture_since(
+    out_dir: &Path,
+    jobname: &str,
+    instrumented: bool,
+    exit_ok: bool,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    wall: std::time::Duration,
+    not_before: Option<std::time::SystemTime>,
+) -> Result<CaptureResult> {
     let log = out_dir.join(format!("{jobname}.log"));
     let pdf = out_dir.join(format!("{jobname}.pdf"));
     let json = if instrumented {
         let jp = out_dir.join(format!("{jobname}.rtex.json"));
-        // written at \end{document}: a pass that stopped earlier (a fatal error) leaves the file
-        // of an earlier pass in the same directory, which is not this pass's capture
-        let started = std::time::SystemTime::now() - wall - std::time::Duration::from_secs(1);
         let fresh = std::fs::metadata(&jp)
             .and_then(|m| m.modified())
-            .map(|t| t >= started)
+            .map(|t| not_before.is_none_or(|nb| t >= nb))
             .unwrap_or(false);
         if !fresh {
             bail!(

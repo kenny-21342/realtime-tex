@@ -2405,6 +2405,7 @@ fn effective_budget_us(floor_us: u64, factor: f64, recent: &std::collections::Ve
 // Background thread: debounced full passes with capture, layout installation, exports.
 // ---------------------------------------------------------------------------------------------
 fn background_thread(s: Arc<Shared>) {
+    warm_start(&s);
     prepare_standby(&s);
     loop {
         let cmd = match s.bg_signal.1.recv() {
@@ -2762,6 +2763,8 @@ fn run_background_pass_inner(s: &Shared) {
     let aux_dir = last_pass_dir(s).unwrap_or_else(|| pass_dir(s, 0));
     // before a pass runs in its directory: the previous pass's aux family and the manifest
     let prepare_dir = |dir: &Path| {
+        // the directory's capture is about to change: it no longer matches its sources hash
+        let _ = std::fs::remove_file(dir.join(SOURCES_HASH_FILE));
         if let Some(from) = last_pass_dir(s) {
             if let Err(e) = crate::background::copy_aux_family(&from, dir) {
                 log::warn!("aux family: {e:#}");
@@ -2964,6 +2967,61 @@ fn run_background_pass_inner(s: &Shared) {
         rev,
         false,
     );
+    // the sources this capture was made from: a later session on the same build directory
+    // shows it at once when they have not changed (warm_start)
+    if outcome_cap.json.pages > 0 && !outcome_cap.fatal() {
+        log::debug!("sources hash of {} files written to {}", texts.len(), outcome_cap.out_dir.display());
+        let _ = std::fs::write(
+            outcome_cap.out_dir.join(SOURCES_HASH_FILE),
+            format!("{:016x}\n", sources_hash(&texts)),
+        );
+    }
+}
+
+/// Next to a finished run's capture: the hash of the sources it compiled (`sources_hash`).
+const SOURCES_HASH_FILE: &str = "rtex-sources";
+
+/// The texts a pass compiles, and the rtex version that captured them.
+fn sources_hash(texts: &BTreeMap<String, String>) -> u64 {
+    let mut all = String::from(env!("CARGO_PKG_VERSION"));
+    for (name, text) in texts {
+        all.push('\0');
+        all.push_str(name);
+        all.push('\0');
+        all.push_str(text);
+    }
+    crate::document::hash_str(&all)
+}
+
+/// A session reopened on a build directory whose last finished run compiled the very sources
+/// it has now shows that run's layout before its first pass, as a provisional layout (the pass
+/// runs anyway and replaces it): no blank preview for the length of a pass, and live edits
+/// right away. Files other than the tracked sources (figures, `.bib`) are not hashed; the
+/// first pass brings their changes.
+fn warm_start(s: &Shared) {
+    let (texts, spans, rev) = snapshot(s);
+    let h = format!("{:016x}", sources_hash(&texts));
+    let jobname = jobname_of(&s.cfg.main_file);
+    for dir in [pass_dir(s, 0), pass_dir(s, 1)] {
+        let Ok(saved) = std::fs::read_to_string(dir.join(SOURCES_HASH_FILE)) else {
+            continue;
+        };
+        if saved.trim() != h {
+            log::debug!("warm start: {} holds a run of other sources ({} files now)", dir.display(), texts.len());
+            continue;
+        }
+        let t0 = Instant::now();
+        match crate::capture::load_capture(&dir, &jobname) {
+            Ok(cap) if cap.json.pages > 0 && !cap.fatal() => {
+                log::debug!("warm start: the previous session's layout from {}", dir.display());
+                *s.last_pass_dir.lock() = Some(dir.clone());
+                deliver_layout(s, t0, &cap, 1, true, spans, rev, true);
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => log::debug!("warm start: {}: {e:#}", dir.display()),
+        }
+    }
 }
 
 fn layout_failed(s: &Shared, t0: Instant, rev: Revision, msg: String) {

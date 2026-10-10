@@ -125,6 +125,14 @@ they run from: a standby opens its log, and with some preambles its PDF, the mom
 it must never share a directory with the pass that is running (two writers once produced PDFs
 with gaps that renderers showed as blank pages). Before a pass is released, the previous pass's
 aux family (`.aux .toc .bbl …`, chapter `.aux` files included) is copied into its directory.
+**Reopening.** A run that ends with pages writes `rtex-sources`, the hash of the sources it
+compiled and the rtex version, next to its capture. A pass clears the file before it reuses the
+directory. A session opened on that build directory with the same sources shows the run's
+layout before its first pass: a provisional `Converging` ("another pass is running") that the
+pass replaces, and it serves live edits at once. On two 114- and 134-page documents (Linux
+control, 2026-10-10) the first layout came after 0.2–0.3 s instead of 20–40 s. Files other
+than the tracked sources (figures, `.bib`) are not hashed: the first pass brings their changes.
+With other sources, the session waits for its pass as before.
 Degraded pages carry a PDF fallback path: `build/bg/layout-<layout_version>.pdf`, a copy of the
 pass PDF made before the layout is delivered (the two previous layouts' copies are kept, older ones
 are removed); `build/bg/<jobname>.pdf` is a link to the latest one and `<jobname>.log` a copy of its
