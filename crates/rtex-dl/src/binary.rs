@@ -265,6 +265,15 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
             0x2A => {
                 dl.rotate = p.i32().map_err(malformed)? as i64;
             }
+            0x2B => {
+                let stack = p.str().map_err(malformed)?;
+                let n = p.u16().map_err(malformed)?;
+                let mut entries = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    entries.push(p.str().map_err(malformed)?);
+                }
+                dl.color_base.insert(stack, entries);
+            }
             0x29 => {
                 let key = p.str().map_err(malformed)?;
                 dl.pictures.push(crate::PictureSpot {
@@ -342,11 +351,18 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                         let _pad = p.u8().map_err(malformed)?;
                         let stack = p.u16().map_err(malformed)? as i64;
                         let data = p.str().map_err(malformed)?;
+                        // the stack's top after the command: a later addition, absent in
+                        // older lists and in live results
+                        let after = if p.remaining() >= 2 {
+                            Some(p.str().map_err(malformed)?)
+                        } else {
+                            None
+                        };
                         Item::Color {
                             stack,
                             cmd: if cmd == 255 { None } else { Some(cmd as i64) },
                             data,
-                            after: None,
+                            after,
                         }
                     }
                     0x23 => {
@@ -481,12 +497,15 @@ fn write_items(out: &mut Writer, items: &[Item]) {
                 p.i32(*height);
                 out.rec(0x21, &p.0);
             }
-            Item::Color { stack, cmd, data, .. } => {
+            Item::Color { stack, cmd, data, after } => {
                 let mut p = Writer(Vec::new());
                 p.u8(cmd.map(|c| c as u8).unwrap_or(255));
                 p.u8(0);
                 p.u16(*stack as u16);
                 p.str(data);
+                if let Some(a) = after {
+                    p.str(a);
+                }
                 out.rec(0x22, &p.0);
             }
             Item::Literal { mode, data, at } => {
@@ -608,6 +627,15 @@ pub fn encode(dl: &DisplayList) -> Vec<u8> {
         let mut p = Writer(Vec::new());
         p.i32(dl.rotate);
         body.rec(0x2A, &p.0);
+    }
+    for (stack, entries) in &dl.color_base {
+        let mut p = Writer(Vec::new());
+        p.str(stack);
+        p.u16(entries.len() as u16);
+        for e in entries {
+            p.str(e);
+        }
+        body.rec(0x2B, &p.0);
     }
     for pic in &dl.pictures {
         let mut p = Writer(Vec::new());
@@ -740,7 +768,7 @@ mod tests {
                         stack: 0,
                         cmd: Some(2),
                         data: String::new(),
-                        after: None,
+                        after: Some("0 0 1 rg 0 0 1 RG".into()),
                     },
                     Item::Math { on: true, x: 1400 },
                     Item::Image {
@@ -780,6 +808,7 @@ mod tests {
             flags: serde_json::json!({"literal": 1}),
             pictures: vec![crate::PictureSpot { key: "main.tex:12".into(), x: 100, top: 200, width: 3000, height: 1500 }],
             rotate: 90,
+            color_base: BTreeMap::from([("0".to_string(), vec!["0 g 0 G".to_string(), "0 0 1 rg 0 0 1 RG".to_string()])]),
             glyphs: 3,
             width: 5000,
             height: 700,

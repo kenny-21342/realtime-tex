@@ -50,7 +50,10 @@ Records: u8 tag, u32 payload_length, payload   (unknown tags must be skipped)
                 n × { u32 char_code, u32 glyph_index (0xFFFFFFFF = none), i32 x, i32 advance }
   0x21 RULE     i32 x, i32 y_top, i32 width, i32 height
   0x22 COLOR    u8 cmd (0 set, 1 push, 2 pop, 3 current, 255 unknown), u8 reserved, u16 stack, str data
-                (lists from before rtex-dl.lua read the node's `command` field carry 255)
+                [, str after]
+                (lists from before rtex-dl.lua read the node's `command` field carry 255;
+                `after`, the stack's top after the command, is in capture pages only: a decoder
+                reads it when the payload has more bytes)
   0x23 LITERAL  i32 mode, str data [, i32 x, i32 y]
                                              raw pdf_literal / \special (mode −1); page is Degraded.
                                              x, y: where it was output (baseline); present in lists
@@ -73,6 +76,9 @@ Records: u8 tag, u32 payload_length, payload   (unknown tags must be skipped)
   0x2A ROTATE   i32 degrees                  the page's /Rotate (90, 180 or 270, clockwise) from
                 the page attributes at shipout (pdflscape): coordinates stay those of the
                 unrotated page; hosts turn the whole page as viewers do. Absent when 0
+  0x2B COLOR_BASE str stack, u16 n, n × str   a color stack's entries when the page starts (JSON
+                `color_base`), bottom first; one record per stack that is not at its initial
+                state
   0xFF END
 
 In unit lists the META record's `origin_y` slot carries the number of insert nodes (footnotes,
