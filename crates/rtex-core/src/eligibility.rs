@@ -48,6 +48,8 @@ pub enum Reason {
     /// `series=`): the number is saved globally when that list ends, where the fast path cannot
     /// see it.
     ListResumed,
+    /// `\endinput`: it ends the input file it is read from, in the live server the server's own.
+    EndInput,
 }
 
 impl std::fmt::Display for Reason {
@@ -83,6 +85,7 @@ impl std::fmt::Display for Reason {
             ),
             Reason::OverBudget(ms) => write!(f, "last fast compile took {ms} ms, over the budget"),
             Reason::ListResumed => write!(f, "the list resumes the numbering of an earlier list"),
+            Reason::EndInput => write!(f, "\\endinput ends the file it is read from"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -2321,6 +2324,9 @@ pub fn classify_source_with(
     if resumes_a_list(&text) {
         push(&mut reasons, Reason::ListResumed);
     }
+    if text.lines().any(|l| crate::document::has_control_word(l, "endinput")) {
+        push(&mut reasons, Reason::EndInput);
+    }
     if permissive {
         reasons.retain(|r| !is_vocabulary_reason(r));
     }
@@ -2578,6 +2584,8 @@ mod tests {
         )
         .is_empty());
         assert!(reasons("\\begin{enumerate}[label=(\\alph*)]\\item a\\end{enumerate}").is_empty());
+        // \endinput would end the live server's own input
+        assert!(reasons("The end of a file. \\endinput").contains(&Reason::EndInput));
         // a resumed list's first number is saved where the fast path cannot see it
         for opts in ["[resume]", "[resume*]", "[label=(\\alph*), resume]", "[series=steps]"] {
             let r = reasons(&format!("Then:\n\\begin{{enumerate}}{opts}\n\\item c\n\\end{{enumerate}}"));

@@ -545,11 +545,29 @@ fn segment_body(
                 }
             }
         }
+        // TeX reads the rest of the line that holds \endinput and nothing after it: the lines
+        // below are no part of the document (no units)
+        if has_control_word(stripped, "endinput") {
+            if let Some(s) = cur_start.take() {
+                flush(out, s, *lstart + line.len(), cur_kind);
+            }
+            return env_stack.is_empty();
+        }
     }
     if let Some(s) = cur_start {
         flush(out, s, body.len(), cur_kind);
     }
     env_stack.is_empty()
+}
+
+/// True when `line` holds the control word `\name` (not a longer name that starts with it).
+pub fn has_control_word(line: &str, name: &str) -> bool {
+    let pat = format!("\\{name}");
+    line.match_indices(&pat).any(|(i, _)| {
+        let after = &line[i + pat.len()..];
+        !after.starts_with(|c: char| c.is_ascii_alphabetic() || c == '@')
+            && (i == 0 || !line[..i].ends_with('\\'))
+    })
 }
 
 /// Strip an unescaped `%` comment from a source line.
@@ -1141,6 +1159,23 @@ mod tests {
         assert_eq!(texts[2], ("\\subparagraph{Next.} More.", SpanKind::Heading));
         assert_eq!(texts[3], ("\\section{Display}", SpanKind::Heading));
         assert_eq!(texts[4], ("Body text.", SpanKind::Body));
+    }
+
+    #[test]
+    fn nothing_after_endinput_is_a_unit() {
+        let doc = "\\documentclass{article}\n\\begin{document}\nText before.\nMore text, then the end. \\endinput\nIgnored by TeX: \\undefined {\n\nAlso ignored.\n\\end{document}\n";
+        let mut ids = IdAllocator(0);
+        let fb = FileBuf::new(doc, &mut ids, 1);
+        let texts: Vec<&str> = fb
+            .spans
+            .iter()
+            .filter(|s| s.kind != SpanKind::Preamble && s.kind != SpanKind::Trailer)
+            .map(|s| fb.text[s.range.clone()].trim_end())
+            .collect();
+        assert_eq!(texts, ["Text before.\nMore text, then the end. \\endinput"]);
+        assert!(has_control_word("a \\endinput b", "endinput"));
+        assert!(!has_control_word("a \\endinputx b", "endinput"));
+        assert!(!has_control_word("a \\\\endinput", "endinput"));
     }
 
     #[test]

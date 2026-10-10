@@ -411,3 +411,45 @@ fn a_preamble_with_inputs_uses_the_standby() {
     assert!(after.0 > before.0, "no warm pass after the edit: before {before:?}, after {after:?}");
     s.close();
 }
+
+/// TeX stops reading a file after the line that holds `\endinput`. A paragraph ending in it
+/// (with the file's junk after it, which TeX never reads) was a fast-path unit: compiled in the
+/// live server, `\endinput` ended the server's own input and the watchdog killed it after 5 s
+/// (stress-test document, an `\input` file at depth 4).
+#[test]
+fn endinput_never_reaches_the_live_server() {
+    if TexLive::discover().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-regr-{}-endinput", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\nFirst paragraph.\n\n\\input{part}\n\nLast paragraph.\n\\end{document}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("part.tex"),
+        "A paragraph of the part that ends\nthe file here.\n\\endinput\nNever read: \\undefinedmacro.\n",
+    )
+    .unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    let s = Session::open(cfg).unwrap();
+    let mut o = rtex_core::replay::Observer::new();
+    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    let gen = s.versions().engine_generation;
+    let at = s.document_text("part.tex").unwrap().find("ends").unwrap();
+    let r = s
+        .apply_edit("part.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "quickly ".into() })
+        .unwrap();
+    assert_ne!(r.routed, "fast", "a span with \\endinput went to the live server");
+    // the junk after \endinput is no unit either
+    let junk = s.document_text("part.tex").unwrap().find("Never").unwrap();
+    assert!(s.spans("part.tex").iter().all(|sp| !sp.range.contains(&junk)));
+    assert!(o.settle(&s, r.source_revision, Duration::from_secs(120)), "no settled layout");
+    assert_eq!(s.versions().engine_generation, gen, "the live engine was restarted");
+    s.close();
+}
