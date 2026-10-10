@@ -4,7 +4,7 @@
 //! it can be typeset in isolation with no effect on, and no dependence on, state outside the
 //! unit beyond what the captured context replays (parameters, fonts, counters, labels). Anything
 //! not explicitly allowed — including every macro defined in the preamble — sends the unit to the
-//! background path. See docs/ARCHITECTURE.md and docs/LIMITATIONS.md.
+//! background path. See docs/how-it-works.md and docs/live-editing.md.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,10 +44,12 @@ pub enum Reason {
     KindMismatch,
     /// The last fast compile of this unit exceeded the session's budget (ms).
     OverBudget(u64),
-    /// A list that continues the numbering of an earlier one (enumitem `resume`, `resume*`,
-    /// `series=`): the number is saved globally when that list ends, where the fast path cannot
-    /// see it.
-    ListResumed,
+    /// A run-in heading (`\paragraph`, `\subparagraph`): LaTeX typesets its title at the
+    /// start of the following paragraph, whose lines the unit then shares.
+    RunInHeading(String),
+    /// The unit reads state that its context does not carry (enumitem's `resume` and
+    /// `series`: the item count of an earlier list, kept in a macro, not a counter).
+    OutsideState(String),
     /// `\endinput`: it ends the input file it is read from, in the live server the server's own.
     EndInput,
 }
@@ -84,7 +86,14 @@ impl std::fmt::Display for Reason {
                 "\\{m} before the unit's text runs before its counters are captured; put it inside the paragraph or environment, or on its own line"
             ),
             Reason::OverBudget(ms) => write!(f, "last fast compile took {ms} ms, over the budget"),
-            Reason::ListResumed => write!(f, "the list resumes the numbering of an earlier list"),
+            Reason::OutsideState(what) => write!(
+                f,
+                "{what} reads state from earlier in the document that the fast path does not replay"
+            ),
+            Reason::RunInHeading(h) => write!(
+                f,
+                "\\{h} is a run-in heading: its title is set in the following paragraph"
+            ),
             Reason::EndInput => write!(f, "\\endinput ends the file it is read from"),
             other => write!(f, "{other:?}"),
         }
@@ -744,7 +753,8 @@ const MATH_MACROS: &[&str] = &[
 ];
 
 /// Patterns that make a unit background-only regardless of allow-lists.
-const HARD_STOPS: &[(&str, Reason)] = &[];
+/// Control words that keep a unit off the live server whatever its vocabulary.
+const HARD_STOPS: &[(&str, Reason)] = &[("\\endinput", Reason::EndInput)];
 
 /// Macros provided by a package: allowed when the package is loaded, `NeedsPackage` otherwise.
 const PKG_MACROS: &[(&str, &[&str])] = &[
@@ -1194,6 +1204,9 @@ pub struct Policy {
     /// allow-listed text (font switches, `\noindent`, a label): typeset inside the paragraph
     /// they wrap. Ones whose code opens a block environment are in `theorem_envs` instead.
     pub user_inner_envs: BTreeSet<String>,
+    /// Lists the preamble defines with enumitem's `\newlist`, besides `itemize`, `enumerate`
+    /// and `description` (their options are checked for `resume`/`series`).
+    pub list_envs: BTreeSet<String>,
 }
 
 impl Policy {
@@ -1237,6 +1250,17 @@ impl Policy {
         for e in unit_envs {
             theorem_envs.insert(e.clone());
         }
+        let mut list_envs = BTreeSet::new();
+        let mut idx = 0;
+        while let Some(p) = text[idx..].find("\\newlist") {
+            let s = idx + p + "\\newlist".len();
+            if let Some(b) = text[s..].trim_start().strip_prefix('{') {
+                if let Some(e) = b.find('}') {
+                    list_envs.insert(b[..e].trim().to_string());
+                }
+            }
+            idx = s;
+        }
         let mut packages = BTreeSet::new();
         for (opts, names) in usepackages(&text) {
             for n in names {
@@ -1269,6 +1293,7 @@ impl Policy {
             permissive: false,
             heading_macros: BTreeMap::new(),
             user_inner_envs: BTreeSet::new(),
+            list_envs,
         };
         // Macros defined in the preamble whose bodies are themselves allow-listed are trusted:
         // in text mode, in math mode, or both, depending on how the body classifies. Two rounds
@@ -1729,22 +1754,143 @@ pub fn classify_source_with(
     permissive: bool,
 ) -> (UnitShape, Vec<Reason>) {
     let text = strip_comments(src);
-    let mut reasons: Vec<Reason> = Vec::new();
-    let push = |reasons: &mut Vec<Reason>, r: Reason| {
-        if !reasons.contains(&r) {
-            reasons.push(r);
-        }
-    };
     if text.trim().is_empty() {
         return (UnitShape::Par, vec![Reason::Blank]);
     }
     if setup_statements(&text).is_some() {
         return (UnitShape::Par, vec![Reason::SetupStatement]);
     }
-    // shape: a block/float/theorem environment spanning the whole unit (possibly after setup
-    // statements and vertical material such as \vspace or \noindent, which the unit box
-    // absorbs), a heading, or a paragraph
-    let trimmed = text[setup_prefix(&text).0..].trim();
+    let (shape, heading_base) = unit_shape(&text, policy);
+    // a run-in heading whose paragraph is in the same span (the segmenter keeps them together
+    // when the text follows on the heading's lines) is that paragraph, compiled whole; alone in
+    // its span (its paragraph after a blank line) it is a fragment of a paragraph elsewhere
+    let run_in = match &shape {
+        UnitShape::Heading(h)
+            if (h == "paragraph" || h == "subparagraph") && heading_only(&text) =>
+        {
+            Some(h.clone())
+        }
+        _ => None,
+    };
+    let mut scan = Scan {
+        text: &text,
+        b: text.as_bytes(),
+        policy,
+        shape,
+        heading_base,
+        reasons: Vec::new(),
+        i: 0,
+        depth: 0,
+        stack: vec![Frame {
+            mode: Mode::Text,
+            env: None,
+            depth_at_entry: 0,
+        }],
+        env_depth: 0,
+        block_env_closed_at: None,
+        text_group_pending: false,
+        line_start: 0,
+    };
+    scan.hard_stops();
+    scan.leading_counter();
+    scan.run();
+    if let Some(h) = run_in {
+        scan.push(Reason::RunInHeading(h));
+    }
+    scan.finish(permissive)
+}
+
+/// True when `text` is a heading command and its arguments and nothing else (`\paragraph*[toc]{Title.}`).
+fn heading_only(text: &str) -> bool {
+    let t = text.trim_start();
+    let Some(rest) = t.strip_prefix('\\') else {
+        return false;
+    };
+    let name_len = rest.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    let mut r = rest[name_len..].trim_start();
+    r = r.strip_prefix('*').unwrap_or(r).trim_start();
+    if let Some(opt) = optional_arg(r) {
+        let at = r.find(opt).unwrap_or(0) + opt.len();
+        r = r[at..].strip_prefix(']').unwrap_or(&r[at..]).trim_start();
+    }
+    let b = r.as_bytes();
+    if b.first() != Some(&b'{') {
+        return false;
+    }
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return r[i + 1..].trim().is_empty();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The optional argument `[...]` at the start of `s` (after spaces), without its brackets;
+/// brackets inside braces (`label={[\arabic*]}`) do not end it.
+fn optional_arg(s: &str) -> Option<&str> {
+    let t = s.trim_start();
+    let off = s.len() - t.len();
+    if !t.starts_with('[') {
+        return None;
+    }
+    let b = t.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b']' if depth == 0 => return Some(&s[off + 1..off + i]),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `s` split at `sep` outside braces.
+fn top_level_split(s: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// The unit's shape: a block/float/theorem environment spanning the whole unit (possibly after
+/// setup statements and vertical material such as \vspace or \noindent, which the unit box
+/// absorbs), a heading, or a paragraph. Also returns where the unit's own heading command may
+/// start (a heading macro further in is not the unit's heading).
+fn unit_shape(text: &str, policy: &Policy) -> (UnitShape, usize) {
+    let trimmed = text[setup_prefix(text).0..].trim();
     let mut shape = UnitShape::Par;
     let env_start = vertical_prefix_len(trimmed);
     if let Some((name, _)) = env_name(trimmed, env_start, "\\begin") {
@@ -1765,593 +1911,671 @@ pub fn classify_source_with(
             shape = UnitShape::Heading(h.clone());
         }
     }
-    for (pat, r) in HARD_STOPS {
-        if let Some(mut idx) = text.find(pat) {
-            // must be a whole control word
-            let b = text.as_bytes();
-            loop {
-                let end = idx + pat.len();
-                if end >= b.len() || !is_letter(b[end]) {
-                    push(&mut reasons, r.clone());
+    (shape, env_start + text.len() - trimmed.len())
+}
+
+/// The scan state of `classify_source_with`: a position in the comment-stripped source, the
+/// brace depth, the open groups and environments, and the reasons found so far. One method per
+/// construct; a method returning means "go on with the next character".
+struct Scan<'a> {
+    text: &'a str,
+    b: &'a [u8],
+    policy: &'a Policy,
+    shape: UnitShape,
+    /// Where the unit's own heading command may start (see `unit_shape`).
+    heading_base: usize,
+    reasons: Vec<Reason>,
+    i: usize,
+    depth: i32,
+    stack: Vec<Frame>,
+    /// Block environments open.
+    env_depth: i32,
+    /// Index after the last `\end{block}` at env_depth 0.
+    block_env_closed_at: Option<usize>,
+    /// The next brace group is text mode (`\text{...}` in math).
+    text_group_pending: bool,
+    line_start: usize,
+}
+
+impl<'a> Scan<'a> {
+    fn push(&mut self, r: Reason) {
+        if !self.reasons.contains(&r) {
+            self.reasons.push(r);
+        }
+    }
+
+    fn in_math(&self) -> bool {
+        self.stack
+            .last()
+            .map(|f| f.mode == Mode::Math)
+            .unwrap_or(false)
+    }
+
+    /// Control words that stop the fast path wherever they are.
+    fn hard_stops(&mut self) {
+        let text = self.text;
+        for (pat, r) in HARD_STOPS {
+            if let Some(mut idx) = text.find(pat) {
+                // must be a whole control word
+                let b = text.as_bytes();
+                loop {
+                    let end = idx + pat.len();
+                    if end >= b.len() || !is_letter(b[end]) {
+                        self.push(r.clone());
+                        break;
+                    }
+                    match text[end..].find(pat) {
+                        Some(p) => idx = end + p,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// A leading counter assignment whose argument does not close the unit.
+    fn leading_counter(&mut self) {
+        let text = self.text;
+        {
+            let t = text.trim_start();
+            for m in [
+                "setcounter",
+                "addtocounter",
+                "stepcounter",
+                "refstepcounter",
+            ] {
+                if t.starts_with(&format!("\\{m}{{")) && !t.trim_end().ends_with('}') {
+                    self.push(Reason::LeadingCounter(m.into()));
                     break;
                 }
-                match text[end..].find(pat) {
-                    Some(p) => idx = end + p,
-                    None => break,
-                }
             }
         }
     }
-    {
-        let t = text.trim_start();
-        for m in [
-            "setcounter",
-            "addtocounter",
-            "stepcounter",
-            "refstepcounter",
-        ] {
-            if t.starts_with(&format!("\\{m}{{")) && !t.trim_end().ends_with('}') {
-                push(&mut reasons, Reason::LeadingCounter(m.into()));
-                break;
+
+    fn run(&mut self) {
+        while self.i < self.b.len() {
+            let c = self.b[self.i];
+            if c == b'\n' {
+                self.line_break();
+                continue;
             }
+            let in_math = self.in_math();
+            if c == b'\\' {
+                if !self.control_sequence(in_math) {
+                    break;
+                }
+                continue;
+            }
+            self.character(c, in_math);
+            self.i += 1;
         }
     }
-    let b = text.as_bytes();
-    let mut i = 0;
-    let mut depth: i32 = 0;
-    let mut stack: Vec<Frame> = vec![Frame {
-        mode: Mode::Text,
-        env: None,
-        depth_at_entry: 0,
-    }];
-    let mut env_depth = 0; // block environments open
-    let mut block_env_closed_at: Option<usize> = None; // index after the last `\end{block}` at env_depth 0
-    let mut text_group_pending = false; // next brace group is text mode (\text{...} in math)
-    let mut line_start = 0usize;
-    while i < b.len() {
-        let c = b[i];
-        // paragraph breaks (blank lines) are only fine inside block environments
-        if c == b'\n' {
-            let line = &text[line_start..i];
-            if line.trim().is_empty()
-                && i > 0
-                && env_depth == 0
-                && i + 1 < b.len()
-                && !text[i + 1..].trim().is_empty()
-                && line_start > 0
-            {
-                push(&mut reasons, Reason::ParagraphBreak);
-            }
-            line_start = i + 1;
-            i += 1;
-            continue;
+
+    /// Paragraph breaks (blank lines) are only fine inside block environments.
+    fn line_break(&mut self) {
+        let (text, b) = (self.text, self.b);
+        let line = &text[self.line_start..self.i];
+        if line.trim().is_empty()
+            && self.i > 0
+            && self.env_depth == 0
+            && self.i + 1 < b.len()
+            && !text[self.i + 1..].trim().is_empty()
+            && self.line_start > 0
+        {
+            self.push(Reason::ParagraphBreak);
         }
-        let in_math = stack.last().map(|f| f.mode == Mode::Math).unwrap_or(false);
-        if c == b'\\' {
-            if i + 1 >= b.len() {
-                break;
+        self.line_start = self.i + 1;
+        self.i += 1;
+    }
+
+    /// A control sequence at `i`: math delimiters, environments, opaque arguments, macros.
+    /// False at the end of the source.
+    fn control_sequence(&mut self, in_math: bool) -> bool {
+        let (text, b) = (self.text, self.b);
+        if self.i + 1 >= b.len() {
+            return false;
+        }
+        let n = b[self.i + 1];
+        let name: String;
+        if is_letter(n) {
+            let mut j = self.i + 1;
+            while j < b.len() && is_letter(b[j]) {
+                j += 1;
             }
-            let n = b[i + 1];
-            let name: String;
-            if is_letter(n) {
-                let mut j = i + 1;
-                while j < b.len() && is_letter(b[j]) {
-                    j += 1;
-                }
-                name = text[i + 1..j].to_string();
-                // `\tag*`, `\caption*`, `\hspace*`
-                if j < b.len()
-                    && b[j] == b'*'
-                    && matches!(
-                        name.as_str(),
-                        "tag"
-                            | "caption"
-                            | "hspace"
-                            | "vspace"
-                            | "section"
-                            | "subsection"
-                            | "subsubsection"
-                            | "chapter"
-                            | "part"
-                            | "paragraph"
-                            | "subparagraph"
-                            | "alph"
-                            | "Alph"
-                            | "arabic"
-                            | "roman"
-                            | "Roman"
-                            | "operatorname"
-                            | "verb"
-                    )
-                {
-                    i = j + 1;
-                } else {
-                    i = j;
-                }
-            } else if n == b'(' {
-                if in_math {
-                    push(&mut reasons, Reason::UnbalancedMath);
-                }
-                stack.push(Frame {
-                    mode: Mode::Math,
-                    env: None,
-                    depth_at_entry: depth,
-                });
-                i += 2;
-                continue;
-            } else if n == b')' {
-                if !in_math
-                    || stack
-                        .last()
-                        .map(|f| f.depth_at_entry != depth)
-                        .unwrap_or(true)
-                {
-                    push(&mut reasons, Reason::UnbalancedMath);
-                }
-                if in_math {
-                    stack.pop();
-                }
-                i += 2;
-                continue;
-            } else if n == b'[' {
-                if in_math {
-                    push(&mut reasons, Reason::UnbalancedMath);
-                }
-                stack.push(Frame {
-                    mode: Mode::Math,
-                    env: None,
-                    depth_at_entry: depth,
-                });
-                i += 2;
-                continue;
-            } else if n == b']' {
-                if !in_math {
-                    push(&mut reasons, Reason::UnbalancedMath);
-                } else {
-                    stack.pop();
-                }
-                i += 2;
-                continue;
+            name = text[self.i + 1..j].to_string();
+            // `\tag*`, `\caption*`, `\hspace*`
+            if j < b.len()
+                && b[j] == b'*'
+                && matches!(
+                    name.as_str(),
+                    "tag"
+                        | "caption"
+                        | "hspace"
+                        | "vspace"
+                        | "section"
+                        | "subsection"
+                        | "subsubsection"
+                        | "chapter"
+                        | "part"
+                        | "paragraph"
+                        | "subparagraph"
+                        | "alph"
+                        | "Alph"
+                        | "arabic"
+                        | "roman"
+                        | "Roman"
+                        | "operatorname"
+                        | "verb"
+                )
+            {
+                self.i = j + 1;
             } else {
-                name = (n as char).to_string();
-                i += 2;
+                self.i = j;
             }
-            // environments
-            if name == "begin" {
-                let begin_pos = i - 6;
-                let Some((env, after)) = env_name(&text, begin_pos, "\\begin") else {
-                    push(&mut reasons, Reason::UnbalancedEnvironment);
-                    continue;
-                };
-                i = after;
-                if block_env_closed_at.is_some() && env_depth == 0 {
-                    // a second block environment after one closed: still fine (both inside the unit)
-                }
-                let is_amsmath_display = AMSMATH_DISPLAY_ENVS.contains(&env.as_str());
-                let is_amsmath_inner = AMSMATH_INNER_ENVS.contains(&env.as_str());
-                if OPAQUE_ENVS.contains(&env.as_str()) {
-                    // verbatim material: skip to \end{env}; the environment is a block unit
-                    if env == "lstlisting" && !policy.has_package("listings") {
-                        push(&mut reasons, Reason::NeedsPackage("listings".into()));
-                    }
-                    let end = format!("\\end{{{env}}}");
-                    match text[i..].find(&end) {
-                        Some(e) => {
-                            i += e + end.len();
-                            if policy.is_block_env(&env) && env_depth == 0 {
-                                block_env_closed_at = Some(i);
-                            }
-                        }
-                        None => push(&mut reasons, Reason::UnbalancedEnvironment),
-                    }
-                    continue;
-                }
-                if policy.is_display_env(&env) {
-                    if is_amsmath_display && !policy.amsmath {
-                        push(&mut reasons, Reason::NeedsPackage("amsmath".into()));
-                    }
-                    if in_math {
-                        push(&mut reasons, Reason::UnbalancedMath);
-                    }
-                    stack.push(Frame {
-                        mode: Mode::Math,
-                        env: Some(env),
-                        depth_at_entry: depth,
-                    });
-                } else if policy.is_block_env(&env) {
-                    if in_math {
-                        push(&mut reasons, Reason::UnbalancedMath);
-                    }
-                    if block_env_closed_at.is_some() && env_depth == 0 && shape == UnitShape::Par {
-                        // text (or another environment) after a block environment: the capture
-                        // closes the paragraph unit at the first environment's end
-                        push(&mut reasons, Reason::TextAfterEnvironment);
-                    }
-                    if PICTURE_ENVS.contains(&env.as_str()) {
-                        // a unit of its own (block), but its drawing commands are not
-                        // allow-listed: probe mode compiles and compares it, or takes it from
-                        // the picture cache. The body is the environment's business (one
-                        // reason, not one per drawing command): skipped to its \end.
-                        push(&mut reasons, Reason::DisallowedEnvironment(env.clone()));
-                        // inside a paragraph's text it is an inline box: the paragraph goes on
-                        // after it (the capture keeps one unit)
-                        let inline = env_depth == 0
-                            && shape == UnitShape::Par
-                            && !text[content_start(&text).min(begin_pos)..begin_pos]
-                                .trim()
-                                .is_empty();
-                        match skip_env_body(&text, i, &env) {
-                            Some(e) => {
-                                i = e;
-                                if env_depth == 0 && !inline {
-                                    block_env_closed_at = Some(i);
-                                }
-                            }
-                            None => push(&mut reasons, Reason::UnbalancedEnvironment),
-                        }
-                        continue;
-                    }
-                    env_depth += 1;
-                    stack.push(Frame {
-                        mode: Mode::Text,
-                        env: Some(env),
-                        depth_at_entry: depth,
-                    });
-                } else if INNER_ENVS.contains(&env.as_str())
-                    || is_amsmath_inner
-                    || policy.user_inner_envs.contains(&env)
-                {
-                    if is_amsmath_inner && !policy.amsmath {
-                        push(&mut reasons, Reason::NeedsPackage("amsmath".into()));
-                    }
-                    if env == "tabularx" && !policy.tabularx {
-                        push(&mut reasons, Reason::NeedsPackage("tabularx".into()));
-                    }
-                    let mode = if is_amsmath_inner || env == "math" {
-                        Mode::Math
-                    } else {
-                        Mode::Text
-                    };
-                    if env == "math" && in_math {
-                        push(&mut reasons, Reason::UnbalancedMath);
-                    }
-                    stack.push(Frame {
-                        mode: if is_amsmath_inner { Mode::Math } else { mode },
-                        env: Some(env),
-                        depth_at_entry: depth,
-                    });
-                } else {
-                    push(&mut reasons, Reason::DisallowedEnvironment(env.clone()));
-                    stack.push(Frame {
-                        mode: Mode::Text,
-                        env: Some(env),
-                        depth_at_entry: depth,
-                    });
-                }
-                continue;
+        } else if n == b'(' {
+            if in_math {
+                self.push(Reason::UnbalancedMath);
             }
-            if name == "end" {
-                let Some((env, after)) = env_name(&text, i - 4, "\\end") else {
-                    push(&mut reasons, Reason::UnbalancedEnvironment);
-                    continue;
-                };
-                i = after;
-                match stack
-                    .iter()
-                    .rposition(|f| f.env.as_deref() == Some(env.as_str()))
-                {
-                    Some(pos) if pos == stack.len() - 1 => {
-                        let f = stack.pop().unwrap();
-                        if f.depth_at_entry != depth {
-                            push(&mut reasons, Reason::UnbalancedBraces);
-                            depth = f.depth_at_entry;
-                        }
-                        if policy.is_block_env(&env) {
-                            env_depth -= 1;
-                            if env_depth == 0 {
-                                block_env_closed_at = Some(i);
-                            }
-                        }
-                    }
-                    _ => push(&mut reasons, Reason::UnbalancedEnvironment),
-                }
-                continue;
-            }
-            // opaque arguments (URLs, units, verbatim): skip them, check the package
-            if let Some((_, nargs)) = OPAQUE_ARGS.iter().find(|(n, _)| *n == name.as_str()) {
-                if let Some(Err(pkg)) = package_macro(&name, policy) {
-                    push(&mut reasons, Reason::NeedsPackage(pkg.into()));
-                }
-                if *nargs == 0 {
-                    // \verb|...| / \lstinline|...| / \lstinline{...}
-                    if i < b.len() {
-                        let d = b[i];
-                        let close = if d == b'{' { b'}' } else { d };
-                        match text[i + 1..].find(close as char) {
-                            Some(e) => i = i + 1 + e + 1,
-                            None => push(&mut reasons, Reason::Verbatim),
-                        }
-                    }
-                } else {
-                    // optional argument, then n balanced brace groups
-                    while i < b.len() && b[i] == b' ' {
-                        i += 1;
-                    }
-                    if i < b.len() && b[i] == b'[' {
-                        if let Some(e) = text[i..].find(']') {
-                            i += e + 1;
-                        }
-                    }
-                    for _ in 0..*nargs {
-                        while i < b.len() && b[i] == b' ' {
-                            i += 1;
-                        }
-                        if i < b.len() && b[i] == b'{' {
-                            let mut d = 0i32;
-                            let mut k = i;
-                            while k < b.len() {
-                                match b[k] {
-                                    b'\\' => k += 1,
-                                    b'{' => d += 1,
-                                    b'}' => {
-                                        d -= 1;
-                                        if d == 0 {
-                                            break;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                k += 1;
-                            }
-                            i = (k + 1).min(b.len());
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-            // macros
-            let allowed = if let Some(provided) = package_macro(&name, policy) {
-                if let Err(pkg) = provided {
-                    push(&mut reasons, Reason::NeedsPackage(pkg.into()));
-                }
-                if in_math && matches!(name.as_str(), "text" | "mbox") {
-                    text_group_pending = true;
-                }
-                true
-            } else if GROUP_ONLY_SETTERS.contains(&name.as_str())
-                || ((name == "renewcommand" || name == "renewcommand*")
-                    && text[i..].trim_start().starts_with("{\\arraystretch}"))
+            self.stack.push(Frame {
+                mode: Mode::Math,
+                env: None,
+                depth_at_entry: self.depth,
+            });
+            self.i += 2;
+            return true;
+        } else if n == b')' {
+            if !in_math
+                || self
+                    .stack
+                    .last()
+                    .map(|f| f.depth_at_entry != self.depth)
+                    .unwrap_or(true)
             {
-                if depth == 0 && env_depth == 0 {
-                    push(
-                        &mut reasons,
-                        Reason::SizeDeclarationOutsideGroup(name.clone()),
-                    );
-                }
-                // the first argument names the length or macro being set: skip it
-                let rest = &text[i..];
-                let lead = rest.len() - rest.trim_start().len();
-                if let Some(after) = rest.trim_start().strip_prefix('{') {
-                    if let Some(e) = after.find('}') {
-                        i += lead + 1 + e + 1;
-                    }
-                }
-                true
-            } else if in_math {
-                let ok = MATH_MACROS.contains(&name.as_str())
-                    || policy.trusted_math.contains(&name)
-                    || policy.trusted_macros.contains(&name);
-                if ok
-                    && matches!(
-                        name.as_str(),
-                        "text" | "mbox" | "textrm" | "textit" | "textbf" | "intertext"
-                    )
-                {
-                    text_group_pending = true;
-                }
-                if (name == "tag"
-                    || name == "notag"
-                    || name == "nonumber"
-                    || name == "intertext"
-                    || name == "eqref")
-                    && !policy.amsmath
-                    && name != "nonumber"
-                {
-                    push(&mut reasons, Reason::NeedsPackage("amsmath".into()));
-                }
-                ok
-            } else if GROUP_ONLY_DECLARATIONS.contains(&name.as_str()) {
-                if depth == 0 && env_depth == 0 && !matches!(shape, UnitShape::Heading(_)) {
-                    push(
-                        &mut reasons,
-                        Reason::SizeDeclarationOutsideGroup(name.clone()),
-                    );
-                }
-                true
-            } else if HEADINGS.contains(&name.as_str()) || policy.heading_macros.contains_key(&name)
-            {
-                // only as the unit's own heading command (possibly after leading vertical
-                // material such as \newpage), or a user macro wrapping one
-                let h = policy
-                    .heading_macros
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_else(|| name.clone());
-                matches!(&shape, UnitShape::Heading(sh) if *sh == h)
-                    && i <= env_start + name.len() + 2 + text.len() - trimmed.len()
-            } else if name == "item" {
-                let in_list = stack.iter().any(|f| {
-                    f.env
-                        .as_deref()
-                        .map(|e| LIST_ENVS.contains(&e))
-                        .unwrap_or(false)
-                });
-                if !in_list {
-                    push(&mut reasons, Reason::MacroOutsideContext(name.clone()));
-                }
-                true
-            } else if FLOAT_MACROS.contains(&name.as_str()) {
-                let in_float = stack.iter().any(|f| {
-                    f.env
-                        .as_deref()
-                        .map(|e| FLOAT_ENVS.contains(&e))
-                        .unwrap_or(false)
-                });
-                if !in_float {
-                    push(&mut reasons, Reason::MacroOutsideContext(name.clone()));
-                }
-                true
-            } else if TABULAR_MACROS.contains(&name.as_str())
-                || BOOKTABS_MACROS.contains(&name.as_str())
-            {
-                let in_tab = stack.iter().any(|f| {
-                    f.env
-                        .as_deref()
-                        .map(|e| e.starts_with("tabular") || e == "array")
-                        .unwrap_or(false)
-                });
-                if !in_tab {
-                    push(&mut reasons, Reason::MacroOutsideContext(name.clone()));
-                }
-                if BOOKTABS_MACROS.contains(&name.as_str()) && !policy.booktabs {
-                    push(&mut reasons, Reason::NeedsPackage("booktabs".into()));
-                }
-                true
-            } else if name == "includegraphics" {
-                if !policy.graphicx {
-                    push(&mut reasons, Reason::NeedsPackage("graphicx".into()));
-                }
-                true
-            } else if name == "cite" {
-                if !policy.cite_ok {
-                    push(&mut reasons, Reason::DisallowedMacro(name.clone()));
-                }
-                true
-            } else if name == "eqref" {
-                if !policy.amsmath {
-                    push(&mut reasons, Reason::NeedsPackage("amsmath".into()));
-                }
-                true
+                self.push(Reason::UnbalancedMath);
+            }
+            if in_math {
+                self.stack.pop();
+            }
+            self.i += 2;
+            return true;
+        } else if n == b'[' {
+            if in_math {
+                self.push(Reason::UnbalancedMath);
+            }
+            self.stack.push(Frame {
+                mode: Mode::Math,
+                env: None,
+                depth_at_entry: self.depth,
+            });
+            self.i += 2;
+            return true;
+        } else if n == b']' {
+            if !in_math {
+                self.push(Reason::UnbalancedMath);
             } else {
-                TEXT_MACROS.contains(&name.as_str()) || policy.trusted_macros.contains(&name)
+                self.stack.pop();
+            }
+            self.i += 2;
+            return true;
+        } else {
+            name = (n as char).to_string();
+            self.i += 2;
+        }
+        if name == "begin" {
+            self.begin_environment(in_math);
+            return true;
+        }
+        if name == "end" {
+            self.end_environment();
+            return true;
+        }
+        // opaque arguments (URLs, units, verbatim): skip them, check the package
+        if let Some((_, nargs)) = OPAQUE_ARGS.iter().find(|(n, _)| *n == name.as_str()) {
+            self.opaque_arguments(&name, *nargs);
+            return true;
+        }
+        self.macro_word(name, in_math);
+        true
+    }
+
+    fn begin_environment(&mut self, in_math: bool) {
+        let (text, policy) = (self.text, self.policy);
+        let begin_pos = self.i - 6;
+        let Some((env, after)) = env_name(text, begin_pos, "\\begin") else {
+            self.push(Reason::UnbalancedEnvironment);
+            return;
+        };
+        self.i = after;
+        if self.block_env_closed_at.is_some() && self.env_depth == 0 {
+            // a second block environment after one closed: still fine (both inside the unit)
+        }
+        // enumitem: `resume`, `resume*` and `series=` continue an earlier list's numbering
+        let base = env.trim_end_matches('*');
+        if LIST_ENVS.contains(&base) || policy.list_envs.contains(base) {
+            if let Some(opts) = optional_arg(&text[after..]) {
+                let keys = top_level_split(opts, ',');
+                if keys.iter().any(|kv| {
+                    let key = kv.split('=').next().unwrap_or("").trim();
+                    matches!(key, "resume" | "resume*" | "series")
+                }) {
+                    self.push(Reason::OutsideState(format!("\\begin{{{env}}}[resume]")));
+                }
+            }
+        }
+        let is_amsmath_display = AMSMATH_DISPLAY_ENVS.contains(&env.as_str());
+        let is_amsmath_inner = AMSMATH_INNER_ENVS.contains(&env.as_str());
+        if OPAQUE_ENVS.contains(&env.as_str()) {
+            // verbatim material: skip to \end{env}; the environment is a block unit
+            if env == "lstlisting" && !policy.has_package("listings") {
+                self.push(Reason::NeedsPackage("listings".into()));
+            }
+            let end = format!("\\end{{{env}}}");
+            match text[self.i..].find(&end) {
+                Some(e) => {
+                    self.i += e + end.len();
+                    if policy.is_block_env(&env) && self.env_depth == 0 {
+                        self.block_env_closed_at = Some(self.i);
+                    }
+                }
+                None => self.push(Reason::UnbalancedEnvironment),
+            }
+            return;
+        }
+        if policy.is_display_env(&env) {
+            if is_amsmath_display && !policy.amsmath {
+                self.push(Reason::NeedsPackage("amsmath".into()));
+            }
+            if in_math {
+                self.push(Reason::UnbalancedMath);
+            }
+            self.stack.push(Frame {
+                mode: Mode::Math,
+                env: Some(env),
+                depth_at_entry: self.depth,
+            });
+        } else if policy.is_block_env(&env) {
+            if in_math {
+                self.push(Reason::UnbalancedMath);
+            }
+            if self.block_env_closed_at.is_some()
+                && self.env_depth == 0
+                && self.shape == UnitShape::Par
+            {
+                // text (or another environment) after a block environment: the capture
+                // closes the paragraph unit at the first environment's end
+                self.push(Reason::TextAfterEnvironment);
+            }
+            if PICTURE_ENVS.contains(&env.as_str()) {
+                // a unit of its own (block), but its drawing commands are not
+                // allow-listed: probe mode compiles and compares it, or takes it from
+                // the picture cache. The body is the environment's business (one
+                // reason, not one per drawing command): skipped to its \end.
+                self.push(Reason::DisallowedEnvironment(env.clone()));
+                // inside a paragraph's text it is an inline box: the paragraph goes on
+                // after it (the capture keeps one unit)
+                let inline = self.env_depth == 0
+                    && self.shape == UnitShape::Par
+                    && !text[content_start(text).min(begin_pos)..begin_pos]
+                        .trim()
+                        .is_empty();
+                match skip_env_body(text, self.i, &env) {
+                    Some(e) => {
+                        self.i = e;
+                        if self.env_depth == 0 && !inline {
+                            self.block_env_closed_at = Some(self.i);
+                        }
+                    }
+                    None => self.push(Reason::UnbalancedEnvironment),
+                }
+                return;
+            }
+            self.env_depth += 1;
+            self.stack.push(Frame {
+                mode: Mode::Text,
+                env: Some(env),
+                depth_at_entry: self.depth,
+            });
+        } else if INNER_ENVS.contains(&env.as_str())
+            || is_amsmath_inner
+            || policy.user_inner_envs.contains(&env)
+        {
+            if is_amsmath_inner && !policy.amsmath {
+                self.push(Reason::NeedsPackage("amsmath".into()));
+            }
+            if env == "tabularx" && !policy.tabularx {
+                self.push(Reason::NeedsPackage("tabularx".into()));
+            }
+            let mode = if is_amsmath_inner || env == "math" {
+                Mode::Math
+            } else {
+                Mode::Text
             };
-            if !allowed {
-                let r = if in_math {
-                    Reason::DisallowedMathMacro(name)
-                } else {
-                    Reason::DisallowedMacro(name)
-                };
-                push(&mut reasons, r);
+            if env == "math" && in_math {
+                self.push(Reason::UnbalancedMath);
             }
-            continue;
+            self.stack.push(Frame {
+                mode: if is_amsmath_inner { Mode::Math } else { mode },
+                env: Some(env),
+                depth_at_entry: self.depth,
+            });
+        } else {
+            self.push(Reason::DisallowedEnvironment(env.clone()));
+            self.stack.push(Frame {
+                mode: Mode::Text,
+                env: Some(env),
+                depth_at_entry: self.depth,
+            });
         }
+    }
+
+    fn end_environment(&mut self) {
+        let (text, policy) = (self.text, self.policy);
+        let Some((env, after)) = env_name(text, self.i - 4, "\\end") else {
+            self.push(Reason::UnbalancedEnvironment);
+            return;
+        };
+        self.i = after;
+        match self
+            .stack
+            .iter()
+            .rposition(|f| f.env.as_deref() == Some(env.as_str()))
+        {
+            Some(pos) if pos == self.stack.len() - 1 => {
+                let f = self.stack.pop().unwrap();
+                if f.depth_at_entry != self.depth {
+                    self.push(Reason::UnbalancedBraces);
+                    self.depth = f.depth_at_entry;
+                }
+                if policy.is_block_env(&env) {
+                    self.env_depth -= 1;
+                    if self.env_depth == 0 {
+                        self.block_env_closed_at = Some(self.i);
+                    }
+                }
+            }
+            _ => self.push(Reason::UnbalancedEnvironment),
+        }
+    }
+
+    /// Opaque arguments (URLs, units, verbatim): skipped; the package is checked.
+    fn opaque_arguments(&mut self, name: &str, nargs: usize) {
+        let (text, b, policy) = (self.text, self.b, self.policy);
+        let name = name.to_string();
+        if let Some(Err(pkg)) = package_macro(&name, policy) {
+            self.push(Reason::NeedsPackage(pkg.into()));
+        }
+        if nargs == 0 {
+            // \verb|...| / \lstinline|...| / \lstinline{...}
+            if self.i < b.len() {
+                let d = b[self.i];
+                let close = if d == b'{' { b'}' } else { d };
+                match text[self.i + 1..].find(close as char) {
+                    Some(e) => self.i = self.i + 1 + e + 1,
+                    None => self.push(Reason::Verbatim),
+                }
+            }
+        } else {
+            // optional argument, then n balanced brace groups
+            while self.i < b.len() && b[self.i] == b' ' {
+                self.i += 1;
+            }
+            if self.i < b.len() && b[self.i] == b'[' {
+                if let Some(e) = text[self.i..].find(']') {
+                    self.i += e + 1;
+                }
+            }
+            for _ in 0..nargs {
+                while self.i < b.len() && b[self.i] == b' ' {
+                    self.i += 1;
+                }
+                if self.i < b.len() && b[self.i] == b'{' {
+                    let mut d = 0i32;
+                    let mut k = self.i;
+                    while k < b.len() {
+                        match b[k] {
+                            b'\\' => k += 1,
+                            b'{' => d += 1,
+                            b'}' => {
+                                d -= 1;
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    self.i = (k + 1).min(b.len());
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A macro: allowed by the vocabulary for its mode and context, or a reason.
+    fn macro_word(&mut self, name: String, in_math: bool) {
+        let (text, policy) = (self.text, self.policy);
+        let allowed = if let Some(provided) = package_macro(&name, policy) {
+            if let Err(pkg) = provided {
+                self.push(Reason::NeedsPackage(pkg.into()));
+            }
+            if in_math && matches!(name.as_str(), "text" | "mbox") {
+                self.text_group_pending = true;
+            }
+            true
+        } else if GROUP_ONLY_SETTERS.contains(&name.as_str())
+            || ((name == "renewcommand" || name == "renewcommand*")
+                && text[self.i..].trim_start().starts_with("{\\arraystretch}"))
+        {
+            if self.depth == 0 && self.env_depth == 0 {
+                self.push(Reason::SizeDeclarationOutsideGroup(name.clone()));
+            }
+            // the first argument names the length or macro being set: skip it
+            let rest = &text[self.i..];
+            let lead = rest.len() - rest.trim_start().len();
+            if let Some(after) = rest.trim_start().strip_prefix('{') {
+                if let Some(e) = after.find('}') {
+                    self.i += lead + 1 + e + 1;
+                }
+            }
+            true
+        } else if in_math {
+            let ok = MATH_MACROS.contains(&name.as_str())
+                || policy.trusted_math.contains(&name)
+                || policy.trusted_macros.contains(&name);
+            if ok
+                && matches!(
+                    name.as_str(),
+                    "text" | "mbox" | "textrm" | "textit" | "textbf" | "intertext"
+                )
+            {
+                self.text_group_pending = true;
+            }
+            if (name == "tag"
+                || name == "notag"
+                || name == "nonumber"
+                || name == "intertext"
+                || name == "eqref")
+                && !policy.amsmath
+                && name != "nonumber"
+            {
+                self.push(Reason::NeedsPackage("amsmath".into()));
+            }
+            ok
+        } else if GROUP_ONLY_DECLARATIONS.contains(&name.as_str()) {
+            if self.depth == 0
+                && self.env_depth == 0
+                && !matches!(self.shape, UnitShape::Heading(_))
+            {
+                self.push(Reason::SizeDeclarationOutsideGroup(name.clone()));
+            }
+            true
+        } else if HEADINGS.contains(&name.as_str()) || policy.heading_macros.contains_key(&name) {
+            // only as the unit's own heading command (possibly after leading vertical
+            // material such as \newpage), or a user macro wrapping one
+            let h = policy
+                .heading_macros
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            matches!(&self.shape, UnitShape::Heading(sh) if *sh == h)
+                && self.i <= self.heading_base + name.len() + 2
+        } else if name == "item" {
+            let in_list = self.stack.iter().any(|f| {
+                f.env
+                    .as_deref()
+                    .map(|e| LIST_ENVS.contains(&e))
+                    .unwrap_or(false)
+            });
+            if !in_list {
+                self.push(Reason::MacroOutsideContext(name.clone()));
+            }
+            true
+        } else if FLOAT_MACROS.contains(&name.as_str()) {
+            let in_float = self.stack.iter().any(|f| {
+                f.env
+                    .as_deref()
+                    .map(|e| FLOAT_ENVS.contains(&e))
+                    .unwrap_or(false)
+            });
+            if !in_float {
+                self.push(Reason::MacroOutsideContext(name.clone()));
+            }
+            true
+        } else if TABULAR_MACROS.contains(&name.as_str())
+            || BOOKTABS_MACROS.contains(&name.as_str())
+        {
+            let in_tab = self.stack.iter().any(|f| {
+                f.env
+                    .as_deref()
+                    .map(|e| e.starts_with("tabular") || e == "array")
+                    .unwrap_or(false)
+            });
+            if !in_tab {
+                self.push(Reason::MacroOutsideContext(name.clone()));
+            }
+            if BOOKTABS_MACROS.contains(&name.as_str()) && !policy.booktabs {
+                self.push(Reason::NeedsPackage("booktabs".into()));
+            }
+            true
+        } else if name == "includegraphics" {
+            if !policy.graphicx {
+                self.push(Reason::NeedsPackage("graphicx".into()));
+            }
+            true
+        } else if name == "cite" {
+            if !policy.cite_ok {
+                self.push(Reason::DisallowedMacro(name.clone()));
+            }
+            true
+        } else if name == "eqref" {
+            if !policy.amsmath {
+                self.push(Reason::NeedsPackage("amsmath".into()));
+            }
+            true
+        } else {
+            TEXT_MACROS.contains(&name.as_str()) || policy.trusted_macros.contains(&name)
+        };
+        if !allowed {
+            let r = if in_math {
+                Reason::DisallowedMathMacro(name)
+            } else {
+                Reason::DisallowedMacro(name)
+            };
+            self.push(r);
+        }
+    }
+
+    /// A character other than a backslash or a newline: groups, math shifts, text after a
+    /// block environment.
+    fn character(&mut self, c: u8, in_math: bool) {
+        let b = self.b;
         match c {
             b'{' => {
-                depth += 1;
-                if text_group_pending {
-                    text_group_pending = false;
-                    stack.push(Frame {
+                self.depth += 1;
+                if self.text_group_pending {
+                    self.text_group_pending = false;
+                    self.stack.push(Frame {
                         mode: Mode::Text,
                         env: None,
-                        depth_at_entry: depth,
+                        depth_at_entry: self.depth,
                     });
                 }
             }
             b'}' => {
-                depth -= 1;
-                if depth < 0 {
-                    push(&mut reasons, Reason::UnbalancedBraces);
-                    depth = 0;
+                self.depth -= 1;
+                if self.depth < 0 {
+                    self.push(Reason::UnbalancedBraces);
+                    self.depth = 0;
                 }
                 // leaving a \text{...} group
-                if let Some(f) = stack.last() {
+                if let Some(f) = self.stack.last() {
                     if f.env.is_none()
                         && f.mode == Mode::Text
-                        && stack.len() > 1
-                        && f.depth_at_entry == depth + 1
+                        && self.stack.len() > 1
+                        && f.depth_at_entry == self.depth + 1
                     {
-                        stack.pop();
+                        self.stack.pop();
                     }
                 }
             }
             b'$' => {
-                let double = i + 1 < b.len() && b[i + 1] == b'$';
+                let double = self.i + 1 < b.len() && b[self.i + 1] == b'$';
                 if double {
-                    i += 1;
+                    self.i += 1;
                 }
                 if in_math {
-                    let f = stack.last().unwrap();
-                    if f.env.is_some() || f.depth_at_entry != depth {
-                        push(&mut reasons, Reason::UnbalancedMath);
+                    let f = self.stack.last().unwrap();
+                    if f.env.is_some() || f.depth_at_entry != self.depth {
+                        self.push(Reason::UnbalancedMath);
                     } else {
-                        stack.pop();
+                        self.stack.pop();
                     }
                 } else {
-                    stack.push(Frame {
+                    self.stack.push(Frame {
                         mode: Mode::Math,
                         env: None,
-                        depth_at_entry: depth,
+                        depth_at_entry: self.depth,
                     });
                 }
             }
             _ => {
-                if block_env_closed_at.is_some()
-                    && env_depth == 0
-                    && shape == UnitShape::Par
+                if self.block_env_closed_at.is_some()
+                    && self.env_depth == 0
+                    && self.shape == UnitShape::Par
                     && !c.is_ascii_whitespace()
                 {
-                    push(&mut reasons, Reason::TextAfterEnvironment);
+                    self.push(Reason::TextAfterEnvironment);
                 }
             }
         }
-        i += 1;
     }
-    if depth != 0 {
-        push(&mut reasons, Reason::UnbalancedBraces);
-    }
-    if stack.len() > 1 {
-        let f = stack.last().unwrap();
-        if f.env.is_some() {
-            push(&mut reasons, Reason::UnbalancedEnvironment);
-        } else if f.mode == Mode::Math {
-            push(&mut reasons, Reason::UnbalancedMath);
-        }
-    }
-    let _ = Reason::EnvironmentBoundary;
-    let _ = Reason::DisplayMath;
-    // the title block is a center environment in the capture (article's \@maketitle)
-    if shape == UnitShape::Par && text.contains("\\maketitle") {
-        shape = UnitShape::Env("center".into());
-    }
-    if resumes_a_list(&text) {
-        push(&mut reasons, Reason::ListResumed);
-    }
-    if text.lines().any(|l| crate::document::has_control_word(l, "endinput")) {
-        push(&mut reasons, Reason::EndInput);
-    }
-    if permissive {
-        reasons.retain(|r| !is_vocabulary_reason(r));
-    }
-    (shape, reasons)
-}
 
-/// A list environment whose options continue an earlier list (enumitem: `resume`, `resume*`,
-/// `series=…`).
-fn resumes_a_list(text: &str) -> bool {
-    LIST_ENVS.iter().any(|env| {
-        let open = format!("\\begin{{{env}}}");
-        text.match_indices(&open).any(|(i, _)| {
-            let rest = text[i + open.len()..].trim_start();
-            let Some(opts) = rest.strip_prefix('[') else { return false };
-            let opts = &opts[..opts.find(']').unwrap_or(opts.len())];
-            opts.split(',').any(|o| {
-                let k = o.trim();
-                k == "resume" || k == "resume*" || k.split('=').next().map(str::trim) == Some("series")
-            })
-        })
-    })
+    fn finish(mut self, permissive: bool) -> (UnitShape, Vec<Reason>) {
+        let text = self.text;
+        if self.depth != 0 {
+            self.push(Reason::UnbalancedBraces);
+        }
+        if self.stack.len() > 1 {
+            let f = self.stack.last().unwrap();
+            if f.env.is_some() {
+                self.push(Reason::UnbalancedEnvironment);
+            } else if f.mode == Mode::Math {
+                self.push(Reason::UnbalancedMath);
+            }
+        }
+        let _ = Reason::EnvironmentBoundary;
+        let _ = Reason::DisplayMath;
+        // the title block is a center environment in the capture (article's \@maketitle)
+        if self.shape == UnitShape::Par && text.contains("\\maketitle") {
+            self.shape = UnitShape::Env("center".into());
+        }
+        if permissive {
+            self.reasons.retain(|r| !is_vocabulary_reason(r));
+        }
+        (self.shape, self.reasons)
+    }
 }
 
 /// Length of the vertical material at the start of `s` (`\vspace`, `\noindent`, `\centering`,
@@ -2591,9 +2815,19 @@ mod tests {
         // \endinput would end the live server's own input
         assert!(reasons("The end of a file. \\endinput").contains(&Reason::EndInput));
         // a resumed list's first number is saved where the fast path cannot see it
-        for opts in ["[resume]", "[resume*]", "[label=(\\alph*), resume]", "[series=steps]"] {
-            let r = reasons(&format!("Then:\n\\begin{{enumerate}}{opts}\n\\item c\n\\end{{enumerate}}"));
-            assert!(r.contains(&Reason::ListResumed), "{opts}: {r:?}");
+        for opts in [
+            "[resume]",
+            "[resume*]",
+            "[label=(\\alph*), resume]",
+            "[series=steps]",
+        ] {
+            let r = reasons(&format!(
+                "Then:\n\\begin{{enumerate}}{opts}\n\\item c\n\\end{{enumerate}}"
+            ));
+            assert!(
+                r.iter().any(|x| matches!(x, Reason::OutsideState(_))),
+                "{opts}: {r:?}"
+            );
         }
         let r = reasons("\\begin{table}\\setlength{\\tabcolsep}{2pt}\\renewcommand{\\arraystretch}{1.2}\\begin{tabular}{l}a\\end{tabular}\\end{table}");
         assert!(r.is_empty(), "{r:?}");
@@ -2826,6 +3060,57 @@ mod tests {
         let (shape, r) = classify_source("\\newpage\n\\subsection{After a page break}", &p);
         assert!(r.is_empty(), "{r:?}");
         assert_eq!(shape, UnitShape::Heading("subsection".into()));
+        // enumitem's resume continues numbering kept outside the counters
+        let r = check_source(
+            "Then:\n\\begin{enumerate}[resume]\n  \\item Third\n\\end{enumerate}",
+            &p,
+        );
+        assert!(
+            r.contains(&Reason::OutsideState("\\begin{enumerate}[resume]".into())),
+            "{r:?}"
+        );
+        // ... matched as a key of a list's options, not as text in other environments' titles
+        let r = check_source(
+            "\\begin{enumerate}[label={[\\arabic*]}, resume]\n  \\item x\n\\end{enumerate}",
+            &p,
+        );
+        assert!(
+            r.iter().any(|x| matches!(x, Reason::OutsideState(_))),
+            "{r:?}"
+        );
+        let r = check_source(
+            "\\begin{enumerate}[label=\\roman*]\n  \\item A series of items\n\\end{enumerate}",
+            &p,
+        );
+        assert!(
+            !r.iter().any(|x| matches!(x, Reason::OutsideState(_))),
+            "{r:?}"
+        );
+        let r = check_source(
+            "\\begin{quote}[Convergence of the series]\nText.\n\\end{quote}",
+            &p,
+        );
+        assert!(
+            !r.iter().any(|x| matches!(x, Reason::OutsideState(_))),
+            "{r:?}"
+        );
+        let mut pl = p.clone();
+        pl.list_envs.insert("steps".into());
+        let r = check_source("\\begin{steps}[resume*]\n  \\item x\n\\end{steps}", &pl);
+        assert!(
+            r.iter().any(|x| matches!(x, Reason::OutsideState(_))),
+            "{r:?}"
+        );
+        assert_eq!(optional_arg(" [a={[x]}, b] tail"), Some("a={[x]}, b"));
+        // a run-in heading alone in its span is a fragment of the paragraph after it; with its
+        // text in the span it is that paragraph
+        let (shape, r) = classify_source("\\paragraph{Run-in.}", &p);
+        assert_eq!(shape, UnitShape::Heading("paragraph".into()));
+        assert_eq!(r, vec![Reason::RunInHeading("paragraph".into())]);
+        let (_, r) = classify_source_with("\\subparagraph*[toc]{Deeper {\\em one}.}\n", &p, true);
+        assert_eq!(r, vec![Reason::RunInHeading("subparagraph".into())]);
+        let (_, r) = classify_source("\\paragraph{Run-in.} With text.", &p);
+        assert!(r.is_empty(), "{r:?}");
         let r = check_source(
             "Text {\\rm roman} and $\\rm x \\uparrow \\iint$ and \\scalebox{2}{big}",
             &p,
@@ -2847,7 +3132,10 @@ mod tests {
         assert!(setup_statements("\\newcommand{\\kw}{x} Text after it").is_none());
         // a definition followed by a use of what it defines (an endless loop here)
         assert!(setup_statements("\\def\\x{\\x}\\x").is_none());
-        assert!(setup_statements("\\newcommand{\\a}{1}\\newcommand{\\b}[1]{#1}\\def\\c#1{#1}").is_some());
+        assert!(
+            setup_statements("\\newcommand{\\a}{1}\\newcommand{\\b}[1]{#1}\\def\\c#1{#1}")
+                .is_some()
+        );
         assert!(setup_statements("Text \\newcommand{\\kw}{x}").is_none());
         assert!(setup_statements("\\setcounter{page}{3}").is_none());
         assert!(setup_statements("\\newcommand{\\kw}{x").is_none());

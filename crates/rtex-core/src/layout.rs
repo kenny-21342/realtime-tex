@@ -191,6 +191,7 @@ impl LayoutStore {
         let mut per_span_count: HashMap<ParaId, usize> = HashMap::new();
         for u in &cap.json.units {
             let file = u.file.clone().unwrap_or_else(|| "./main.tex".into());
+            let file = crate::paths::key(&file);
             let file = file.trim_start_matches("./").to_string();
             let mut span = None;
             for s in &snapshot {
@@ -378,6 +379,30 @@ impl LayoutStore {
         self.by_span.get(&id).map(|i| &self.units[*i])
     }
 
+    /// The height of page `page` as the installed pass shipped it, when known.
+    pub fn page_height(&self, page: i64) -> Option<Sp> {
+        self.pages.get(&page).and_then(|d| d.page_height)
+    }
+
+    /// Does every row of `frags` sit on its page (a baseline strictly inside the page, after
+    /// the top margin and before the bottom edge)? A borrowed or relative placement is a
+    /// guess; one that lands above the page top or past its bottom is not trusted (the unit
+    /// waits for the pass instead of drawing an overlay in the wrong place). Pages whose height
+    /// is unknown are not checked.
+    pub fn fragments_on_page(&self, frags: &[Fragment]) -> bool {
+        for f in frags {
+            let Some(h) = self.page_height(f.page) else {
+                continue;
+            };
+            for &b in &f.baselines {
+                if b <= 0 || b >= h {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// What the host recorded about span `id` when the installed pass was started.
     pub fn snapshot_span(&self, id: ParaId) -> Option<&SnapshotSpan> {
         self.snapshot_index
@@ -445,8 +470,10 @@ impl LayoutStore {
     ) -> anyhow::Result<(LayoutStore, crate::document::FileSet)> {
         let texts = crate::document::load_project_files(project, main)?;
         let mut ids = crate::document::IdAllocator(0);
-        let mut set = crate::document::FileSet::default();
-        set.inputted = crate::document::inputted_files(&texts);
+        let mut set = crate::document::FileSet {
+            inputted: crate::document::inputted_files(&texts),
+            ..Default::default()
+        };
         let mut spans = Vec::new();
         // the main file first so its ids come first (tools pick "the middle paragraph" by id)
         for (name, text) in std::iter::once((main, texts[main].as_str())).chain(
@@ -478,7 +505,9 @@ impl LayoutStore {
     /// neighbouring unit that has one. `after`: the rows follow the parent's rows, of which the
     /// parent currently shows `parent_rows` (its last fast result; its placement count when
     /// unknown) — exact for consecutive paragraphs with the same baselineskip and no parskip;
-    /// otherwise the rows end one baselineskip above the parent's first row. Always approximate.
+    /// otherwise the rows end one baselineskip above the parent's first row. The x is the
+    /// parent's left edge (the leftmost of its rows: a display row or a centered line is not
+    /// where the text starts). Always approximate.
     pub fn fragments_relative(
         &self,
         parent: ParaId,
@@ -493,22 +522,23 @@ impl LayoutStore {
         }
         let bs = eu.baselineskip().max(1);
         let (_, fy) = rows[0];
-        let (page, ax, ay) = if after {
+        let left = pl.iter().map(|p| p.x).min().unwrap();
+        let (page, ay) = if after {
             let idx = parent_rows.unwrap_or(pl.len() as i64).max(0) as usize;
             if idx < pl.len() {
-                (pl[idx].page, pl[idx].x, pl[idx].y)
+                (pl[idx].page, pl[idx].y)
             } else {
                 let last = pl.last().unwrap();
                 (
                     last.page,
-                    last.x,
                     last.y + (idx as i64 - (pl.len() as i64 - 1)) * bs,
                 )
             }
         } else {
             let (_, ly) = rows[rows.len() - 1];
-            (pl[0].page, pl[0].x, pl[0].y - bs - (ly - fy))
+            (pl[0].page, pl[0].y - bs - (ly - fy))
         };
+        let ax = left;
         Some(Self::fragments_at(page, ax, ay, rows))
     }
 
@@ -743,4 +773,48 @@ pub fn compare_unit_rows(
         }
     }
     (same, total, notes)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn frag(page: i64, baselines: Vec<Sp>) -> Fragment {
+        Fragment {
+            page,
+            first_line: 1,
+            last_line: baselines.len() as i64,
+            x: 0,
+            xs: baselines.iter().map(|_| 0).collect(),
+            baselines,
+            approximate: true,
+        }
+    }
+
+    fn store_with_page(page: i64, height: Sp) -> LayoutStore {
+        let mut s = LayoutStore::default();
+        let dl = DisplayList {
+            page_height: Some(height),
+            ..DisplayList::default()
+        };
+        s.pages.insert(page, dl);
+        s
+    }
+
+    #[test]
+    fn a_placement_off_its_page_is_rejected() {
+        let h = 50 * 65536 * 12; // ~12 inch page in sp, order of magnitude only
+        let s = store_with_page(1, h);
+        // a baseline inside the page is fine
+        assert!(s.fragments_on_page(&[frag(1, vec![h / 2])]));
+        // a baseline above the page top (the top-of-page overlay bug) is rejected
+        assert!(!s.fragments_on_page(&[frag(1, vec![-10])]));
+        assert!(!s.fragments_on_page(&[frag(1, vec![0])]));
+        // a baseline past the page bottom is rejected
+        assert!(!s.fragments_on_page(&[frag(1, vec![h + 10])]));
+        // one bad row among good ones rejects the whole placement
+        assert!(!s.fragments_on_page(&[frag(1, vec![h / 2, h + 1])]));
+        // a page whose height is unknown is not checked (no false drop)
+        assert!(s.fragments_on_page(&[frag(9, vec![-100])]));
+    }
 }

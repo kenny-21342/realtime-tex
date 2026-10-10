@@ -39,22 +39,38 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let mut pages = BTreeMap::new();
     wait(&mut pages)?;
-    eprintln!("first layout converged in {:.1} s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "first layout converged in {:.1} s",
+        t0.elapsed().as_secs_f64()
+    );
     let doc = s.document_text(main).unwrap();
     let at = match &find {
         Some(f) => doc.find(f.as_str()).expect("FIND not in the document"),
         None => doc.find("\\begin{document}").unwrap() + "\\begin{document}".len(),
     };
     // a paragraph of its own before everything: every page moves, no picture changes
-    s.apply_edit(main, Edit { start_byte: at, end_byte: at, text: "\n\nInserted paragraph.\n\n".into() })?;
+    s.apply_edit(
+        main,
+        Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "\n\nInserted paragraph.\n\n".into(),
+        },
+    )?;
     s.request_layout();
     let t1 = Instant::now();
     let pdf = wait(&mut pages)?;
-    eprintln!("edited layout converged in {:.1} s", t1.elapsed().as_secs_f64());
+    eprintln!(
+        "edited layout converged in {:.1} s",
+        t1.elapsed().as_secs_f64()
+    );
     s.close();
     let (mut native, mut degraded) = (0, 0);
     for (n, p) in &pages {
-        std::fs::write(out.join(format!("page{n}.json")), serde_json::to_string(&p.dl)?)?;
+        std::fs::write(
+            out.join(format!("page{n}.json")),
+            serde_json::to_string(&p.dl)?,
+        )?;
         if !p.exact {
             degraded += 1;
         }
@@ -68,12 +84,24 @@ fn main() -> anyhow::Result<()> {
     // cached regions the last pass used (its own page lists, before the drawings went back)
     let mut cached = 0;
     for dir in ["pass-0", "pass-1"] {
-        for e in std::fs::read_dir(out.join("build/bg").join(dir)).into_iter().flatten().flatten() {
+        for e in std::fs::read_dir(out.join("build/bg").join(dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             if e.file_name().to_string_lossy().contains(".rtex-page") {
-                cached += std::fs::read_to_string(e.path())?.matches("\"cached_picture\"").count();
+                cached += std::fs::read_to_string(e.path())?
+                    .matches("\"cached_picture\"")
+                    .count();
             }
         }
     }
-    println!("pages {} degraded {} native {} cached pictures in the last pass {}", pages.len(), degraded, native, cached);
+    println!(
+        "pages {} degraded {} native {} cached pictures in the last pass {}",
+        pages.len(),
+        degraded,
+        native,
+        cached
+    );
     Ok(())
 }

@@ -274,7 +274,9 @@ const NO_PDF: &str = "no output PDF file produced";
 /// True when the end of `log` says LuaTeX stopped on a fatal error.
 pub fn log_says_fatal(log: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(log) else { return false };
+    let Ok(mut f) = std::fs::File::open(log) else {
+        return false;
+    };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let _ = f.seek(SeekFrom::Start(len.saturating_sub(4096)));
     let mut tail = Vec::new();
@@ -326,7 +328,15 @@ pub fn run_capture_with(
     instrumented: bool,
     unit_envs: &str,
 ) -> Result<CaptureResult> {
-    run_capture_until(tl, src_dir, main, out_dir, instrumented, unit_envs, &never_stop)
+    run_capture_until(
+        tl,
+        src_dir,
+        main,
+        out_dir,
+        instrumented,
+        unit_envs,
+        &never_stop,
+    )
 }
 
 /// `run_capture_with` that `stop` may end early (see [`StopCheck`]).
@@ -430,7 +440,7 @@ pub fn capture_command(
     unit_envs: &str,
 ) -> Result<(Command, String, std::path::PathBuf)> {
     std::fs::create_dir_all(out_dir)?;
-    let out_dir = out_dir.canonicalize()?;
+    let out_dir = crate::paths::canonical(out_dir)?;
     crate::background::mirror_dirs(src_dir, &out_dir, 0)?;
     let jobname = Path::new(main)
         .file_stem()
@@ -441,7 +451,10 @@ pub fn capture_command(
     cmd.arg("-interaction=nonstopmode")
         .arg("-file-line-error")
         .arg(format!("--jobname={jobname}"))
-        .arg(format!("--output-directory={}", out_dir.display()))
+        .arg(format!(
+            "--output-directory={}",
+            crate::paths::tex(&out_dir)
+        ))
         .env("RTEX_CAPTURE_DIR", &out_dir)
         .env("RTEX_UNIT_ENVS", unit_envs);
     let _ = instrumented;
@@ -461,12 +474,30 @@ pub fn collect_capture(
     // written at \end{document}: a pass that stopped earlier (a fatal error) leaves the file of
     // an earlier pass in the same directory, which is not this pass's capture
     let started = std::time::SystemTime::now() - wall - std::time::Duration::from_secs(1);
-    collect_capture_since(out_dir, jobname, instrumented, exit_ok, exit_code, stdout, wall, Some(started))
+    collect_capture_since(
+        out_dir,
+        jobname,
+        instrumented,
+        exit_ok,
+        exit_code,
+        stdout,
+        wall,
+        Some(started),
+    )
 }
 
 /// The capture an earlier, finished pass left in `out_dir` (a previous session's last pass).
 pub fn load_capture(out_dir: &Path, jobname: &str) -> Result<CaptureResult> {
-    collect_capture_since(out_dir, jobname, true, true, Some(0), &[], std::time::Duration::ZERO, None)
+    collect_capture_since(
+        out_dir,
+        jobname,
+        true,
+        true,
+        Some(0),
+        &[],
+        std::time::Duration::ZERO,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

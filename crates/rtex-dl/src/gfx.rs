@@ -55,7 +55,9 @@ fn translate(x: f64, y: f64) -> Matrix {
 }
 
 fn is_identity(m: &Matrix) -> bool {
-    m.iter().zip(IDENTITY.iter()).all(|(a, b)| (a - b).abs() < 1e-9)
+    m.iter()
+        .zip(IDENTITY.iter())
+        .all(|(a, b)| (a - b).abs() < 1e-9)
 }
 
 /// Where an item sits in a display list: a row (`line`) or the page's `other` items.
@@ -69,9 +71,22 @@ pub struct ItemRef {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "s")]
 pub enum Seg {
-    M { x: f64, y: f64 },
-    L { x: f64, y: f64 },
-    C { x1: f64, y1: f64, x2: f64, y2: f64, x: f64, y: f64 },
+    M {
+        x: f64,
+        y: f64,
+    },
+    L {
+        x: f64,
+        y: f64,
+    },
+    C {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        x: f64,
+        y: f64,
+    },
     Z,
 }
 
@@ -86,13 +101,20 @@ pub struct Color {
 
 impl Color {
     fn black() -> Color {
-        Color { comps: vec![0.0], alpha: 1.0 }
+        Color {
+            comps: vec![0.0],
+            alpha: 1.0,
+        }
     }
     pub fn rgb(&self) -> [f64; 3] {
         match self.comps.as_slice() {
             [g] => [*g, *g, *g],
             [r, g, b] => [*r, *g, *b],
-            [c, m, y, k] => [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)],
+            [c, m, y, k] => [
+                (1.0 - c) * (1.0 - k),
+                (1.0 - m) * (1.0 - k),
+                (1.0 - y) * (1.0 - k),
+            ],
             _ => [0.0, 0.0, 0.0],
         }
     }
@@ -123,7 +145,12 @@ pub enum GfxOp {
     /// Restore the clip saved by the matching `Save` (PDF `Q`).
     Restore { at: ItemRef },
     /// Intersect the clip with a path (nonzero, or even-odd).
-    Clip { at: ItemRef, ctm: Matrix, path: Vec<Seg>, even_odd: bool },
+    Clip {
+        at: ItemRef,
+        ctm: Matrix,
+        path: Vec<Seg>,
+        even_odd: bool,
+    },
     /// Paint a pgf shading (a form XObject `/Sh sh`) over `bbox` (form space, PDF units, `[x0
     /// y0 x1 y1]`), clipped by the current clip. Axial: `coords` `[x0 y0 x1 y1]`; radial: `[x0 y0
     /// r0 x1 y1 r1]` (form space). Colors vary linearly between `stops` (offsets 0..1 along the
@@ -232,7 +259,12 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    let is_delim = |c: u8| matches!(c, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%');
+    let is_delim = |c: u8| {
+        matches!(
+            c,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+    };
     while i < b.len() {
         let c = b[i];
         if c.is_ascii_whitespace() {
@@ -257,7 +289,10 @@ fn tokenize(s: &str) -> Result<Vec<Tok>, String> {
                 let end = s[i..].find(']').ok_or("unterminated array")? + i;
                 let mut v = Vec::new();
                 for t in s[i + 1..end].split_ascii_whitespace() {
-                    v.push(t.parse::<f64>().map_err(|_| format!("array element {t:?}"))?);
+                    v.push(
+                        t.parse::<f64>()
+                            .map_err(|_| format!("array element {t:?}"))?,
+                    );
                 }
                 out.push(Tok::Array(v));
                 i = end + 1;
@@ -328,7 +363,14 @@ impl Interp {
     fn output_map(&self) -> Matrix {
         let m = concat(&translate(-self.pos.0, -self.pos.1), &self.gs.ctm);
         let to_dl = pdf_to_dl(self.page_h);
-        let from_dl = [1.0 / SP_PER_BP, 0.0, 0.0, -1.0 / SP_PER_BP, 0.0, self.page_h];
+        let from_dl = [
+            1.0 / SP_PER_BP,
+            0.0,
+            0.0,
+            -1.0 / SP_PER_BP,
+            0.0,
+            self.page_h,
+        ];
         concat(&concat(&from_dl, &m), &to_dl)
     }
 
@@ -357,7 +399,10 @@ impl Interp {
                     continue;
                 }
             };
-            let nums: Vec<f64> = args.iter().filter_map(|a| if let Tok::Num(v) = a { Some(*v) } else { None }).collect();
+            let nums: Vec<f64> = args
+                .iter()
+                .filter_map(|a| if let Tok::Num(v) = a { Some(*v) } else { None })
+                .collect();
             let need = |n: usize| -> Result<(), String> {
                 if nums.len() == n && args.len() == n {
                     Ok(())
@@ -365,7 +410,10 @@ impl Interp {
                     Err(format!("operator {op} with operands {args:?}"))
                 }
             };
-            let is_color = matches!(op.as_str(), "g" | "G" | "rg" | "RG" | "k" | "K" | "cs" | "CS" | "sc" | "SC" | "scn" | "SCN");
+            let is_color = matches!(
+                op.as_str(),
+                "g" | "G" | "rg" | "RG" | "k" | "K" | "cs" | "CS" | "sc" | "SC" | "scn" | "SCN"
+            );
             if colors_only && !is_color {
                 return Err(format!("color stack entry with operator {op}"));
             }
@@ -373,23 +421,52 @@ impl Interp {
                 // path construction
                 "m" => {
                     need(2)?;
-                    self.path.push(Seg::M { x: nums[0], y: nums[1] })
+                    self.path.push(Seg::M {
+                        x: nums[0],
+                        y: nums[1],
+                    })
                 }
                 "l" => {
                     need(2)?;
-                    self.path.push(Seg::L { x: nums[0], y: nums[1] })
+                    self.path.push(Seg::L {
+                        x: nums[0],
+                        y: nums[1],
+                    })
                 }
                 "c" => {
                     need(6)?;
-                    self.path.push(Seg::C { x1: nums[0], y1: nums[1], x2: nums[2], y2: nums[3], x: nums[4], y: nums[5] })
+                    self.path.push(Seg::C {
+                        x1: nums[0],
+                        y1: nums[1],
+                        x2: nums[2],
+                        y2: nums[3],
+                        x: nums[4],
+                        y: nums[5],
+                    })
                 }
                 "v" | "y" => {
                     need(4)?;
-                    let cur = self.current_point().ok_or(format!("{op} without a current point"))?;
+                    let cur = self
+                        .current_point()
+                        .ok_or(format!("{op} without a current point"))?;
                     self.path.push(if op == "v" {
-                        Seg::C { x1: cur.0, y1: cur.1, x2: nums[0], y2: nums[1], x: nums[2], y: nums[3] }
+                        Seg::C {
+                            x1: cur.0,
+                            y1: cur.1,
+                            x2: nums[0],
+                            y2: nums[1],
+                            x: nums[2],
+                            y: nums[3],
+                        }
                     } else {
-                        Seg::C { x1: nums[0], y1: nums[1], x2: nums[2], y2: nums[3], x: nums[2], y: nums[3] }
+                        Seg::C {
+                            x1: nums[0],
+                            y1: nums[1],
+                            x2: nums[2],
+                            y2: nums[3],
+                            x: nums[2],
+                            y: nums[3],
+                        }
                     });
                 }
                 "h" => {
@@ -437,7 +514,12 @@ impl Interp {
                         });
                     }
                     if let Some(eo) = self.clip.take() {
-                        self.ops.push(GfxOp::Clip { at, ctm, path, even_odd: eo });
+                        self.ops.push(GfxOp::Clip {
+                            at,
+                            ctm,
+                            path,
+                            even_odd: eo,
+                        });
                     }
                 }
                 "W" | "W*" => {
@@ -494,9 +576,11 @@ impl Interp {
                 "gs" => match args.as_slice() {
                     [Tok::Name(n)] => {
                         if let Some(v) = n.strip_prefix("pgf@ca") {
-                            self.gs.fill.alpha = v.parse::<f64>().map_err(|_| format!("gs /{n}"))?;
+                            self.gs.fill.alpha =
+                                v.parse::<f64>().map_err(|_| format!("gs /{n}"))?;
                         } else if let Some(v) = n.strip_prefix("pgf@CA") {
-                            self.gs.stroke.alpha = v.parse::<f64>().map_err(|_| format!("gs /{n}"))?;
+                            self.gs.stroke.alpha =
+                                v.parse::<f64>().map_err(|_| format!("gs /{n}"))?;
                         } else {
                             return Err(format!("graphics state /{n}"));
                         }
@@ -542,7 +626,11 @@ impl Interp {
                 }
                 "sc" | "SC" | "scn" | "SCN" => {
                     let fill = op.starts_with('s');
-                    let n = if fill { self.gs.fill_space } else { self.gs.stroke_space };
+                    let n = if fill {
+                        self.gs.fill_space
+                    } else {
+                        self.gs.stroke_space
+                    };
                     need(n)?;
                     Self::set_color(fill, &mut self.gs, &nums)?;
                 }
@@ -574,14 +662,23 @@ impl Interp {
 
     /// `after`: the stack's top after the command in LuaTeX's order (capture pages), which wins
     /// over the replay in list order (rows and `other` interleave on the page).
-    fn color_stack(&mut self, stack: i64, cmd: Option<i64>, data: &str, after: Option<&str>, at: ItemRef) -> Result<(), String> {
+    fn color_stack(
+        &mut self,
+        stack: i64,
+        cmd: Option<i64>,
+        data: &str,
+        after: Option<&str>,
+        at: ItemRef,
+    ) -> Result<(), String> {
         // LuaTeX: 0 set (replace the top), 1 push, 2 pop (the new top is written), 3 current.
         // Stack 0 (the color package's) starts at black; another stack's base is unknown.
-        let st = self
-            .colors
-            .stacks
-            .entry(stack)
-            .or_insert_with(|| if stack == 0 { vec!["0 g 0 G".to_string()] } else { Vec::new() });
+        let st = self.colors.stacks.entry(stack).or_insert_with(|| {
+            if stack == 0 {
+                vec!["0 g 0 G".to_string()]
+            } else {
+                Vec::new()
+            }
+        });
         let emit = match cmd {
             Some(0) => {
                 st.pop();
@@ -660,7 +757,10 @@ fn parse_obj(toks: &[String], i: &mut usize) -> Result<Obj, String> {
                     *i += 1;
                     break;
                 }
-                let key = k.strip_prefix('/').ok_or(format!("dictionary key {k}"))?.to_string();
+                let key = k
+                    .strip_prefix('/')
+                    .ok_or(format!("dictionary key {k}"))?
+                    .to_string();
                 *i += 1;
                 d.insert(key, parse_obj(toks, i)?);
             }
@@ -708,14 +808,22 @@ fn pdf_tokens(s: &str) -> Vec<String> {
             _ => spaced.push(c),
         }
     }
-    spaced.split_ascii_whitespace().map(str::to_string).collect()
+    spaced
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect()
 }
 
 /// A PDF function of one input as piecewise linear stops over its domain: type 2 with N = 1
 /// (linear between C0 and C1) and type 3 stitching of those (pgf's color specifications).
 fn function_stops(f: &Obj, t0: f64, t1: f64) -> Result<Vec<(f64, Vec<f64>)>, String> {
-    let Obj::Dict(d) = f else { return Err("function is not a dictionary".into()) };
-    let ty = d.get("FunctionType").and_then(Obj::num).ok_or("FunctionType")?;
+    let Obj::Dict(d) = f else {
+        return Err("function is not a dictionary".into());
+    };
+    let ty = d
+        .get("FunctionType")
+        .and_then(Obj::num)
+        .ok_or("FunctionType")?;
     let domain = d.get("Domain").and_then(Obj::nums).ok_or("Domain")?;
     let eval2 = |d: &BTreeMap<String, Obj>, x: f64| -> Result<Vec<f64>, String> {
         let c0 = d.get("C0").and_then(Obj::nums).unwrap_or(vec![0.0]);
@@ -724,13 +832,20 @@ fn function_stops(f: &Obj, t0: f64, t1: f64) -> Result<Vec<(f64, Vec<f64>)>, Str
         if n != 1.0 {
             return Err(format!("exponential function with N = {n}"));
         }
-        Ok(c0.iter().zip(c1.iter()).map(|(a, b)| a + x * (b - a)).collect())
+        Ok(c0
+            .iter()
+            .zip(c1.iter())
+            .map(|(a, b)| a + x * (b - a))
+            .collect())
     };
     let clamp = |x: f64, lo: f64, hi: f64| x.max(lo.min(hi)).min(hi.max(lo));
     match ty as i64 {
         2 => {
             // linear in its own input: two stops at t0 and t1
-            let (a, b) = (clamp(t0, domain[0], domain[1]), clamp(t1, domain[0], domain[1]));
+            let (a, b) = (
+                clamp(t0, domain[0], domain[1]),
+                clamp(t1, domain[0], domain[1]),
+            );
             Ok(vec![(t0, eval2(d, a)?), (t1, eval2(d, b)?)])
         }
         3 => {
@@ -752,7 +867,9 @@ fn function_stops(f: &Obj, t0: f64, t1: f64) -> Result<Vec<(f64, Vec<f64>)>, Str
                 if b <= a {
                     continue;
                 }
-                let Obj::Dict(sd) = sub else { return Err("sub-function".into()) };
+                let Obj::Dict(sd) = sub else {
+                    return Err("sub-function".into());
+                };
                 if sd.get("FunctionType").and_then(Obj::num) != Some(2.0) {
                     return Err("stitched function is not exponential".into());
                 }
@@ -773,11 +890,20 @@ impl Interp {
     fn shade(&mut self, detail: &str, at: ItemRef) -> Result<(), String> {
         let mut parts = detail.splitn(7, ' ');
         let mut num = || -> Result<i64, String> {
-            parts.next().and_then(|t| t.parse().ok()).ok_or_else(|| format!("shading detail {detail:?}"))
+            parts
+                .next()
+                .and_then(|t| t.parse().ok())
+                .ok_or_else(|| format!("shading detail {detail:?}"))
         };
         let (_idx, x, top, w, h, d) = (num()?, num()?, num()?, num()?, num()?, num()?);
-        let spec: serde_json::Value = serde_json::from_str(parts.next().ok_or("shading spec")?).map_err(|e| e.to_string())?;
-        let field = |k: &str| spec.get(k).and_then(|v| v.as_str()).map(str::to_string).ok_or(format!("shading spec {k}"));
+        let spec: serde_json::Value =
+            serde_json::from_str(parts.next().ok_or("shading spec")?).map_err(|e| e.to_string())?;
+        let field = |k: &str| {
+            spec.get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or(format!("shading spec {k}"))
+        };
         let radial = match field("kind")?.as_str() {
             "axial" => false,
             "radial" => true,
@@ -790,13 +916,20 @@ impl Interp {
             "/DeviceCMYK" => 4,
             s => return Err(format!("shading color space {s}")),
         };
-        let nums = |s: &str| -> Result<Vec<f64>, String> { s.split_ascii_whitespace().map(|t| t.parse::<f64>().map_err(|_| format!("number {t:?}"))).collect() };
+        let nums = |s: &str| -> Result<Vec<f64>, String> {
+            s.split_ascii_whitespace()
+                .map(|t| t.parse::<f64>().map_err(|_| format!("number {t:?}")))
+                .collect()
+        };
         let coords = nums(&field("coords")?)?;
         let domain = nums(&field("domain")?)?;
         if coords.len() != if radial { 6 } else { 4 } || domain.len() != 2 {
             return Err("shading coords or domain".into());
         }
-        let ext: Vec<bool> = field("extend")?.split_ascii_whitespace().map(|t| t == "true").collect();
+        let ext: Vec<bool> = field("extend")?
+            .split_ascii_whitespace()
+            .map(|t| t == "true")
+            .collect();
         let toks = pdf_tokens(&field("function")?);
         let f = parse_obj(&toks, &mut 0)?;
         let (t0, t1) = (domain[0], domain[1]);
@@ -806,7 +939,13 @@ impl Interp {
                 if c.len() != ncomp {
                     return Err(format!("function gives {} components for {space}", c.len()));
                 }
-                Ok(((t - t0) / (t1 - t0), Color { comps: c, alpha: 1.0 }))
+                Ok((
+                    (t - t0) / (t1 - t0),
+                    Color {
+                        comps: c,
+                        alpha: 1.0,
+                    },
+                ))
             })
             .collect::<Result<Vec<_>, String>>()?;
         // LuaTeX places the form at its reference point (the baseline): q, a move there, Do, Q
@@ -820,7 +959,10 @@ impl Interp {
             bbox: [0.0, -(d as f64) / k, w as f64 / k, h as f64 / k],
             radial,
             coords,
-            extend: [ext.first().copied().unwrap_or(false), ext.get(1).copied().unwrap_or(false)],
+            extend: [
+                ext.first().copied().unwrap_or(false),
+                ext.get(1).copied().unwrap_or(false),
+            ],
             stops,
             alpha: self.gs.fill.alpha,
         });
@@ -831,7 +973,11 @@ impl Interp {
 /// Interpret the literals of a page display list. `Ok` only when every literal, color stack
 /// operation and transform on the page is understood.
 pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
-    let page_h = dl.page_height.ok_or(Unsupported { at: None, what: "no page height".into() })? as f64 / SP_PER_BP;
+    let page_h = dl.page_height.ok_or(Unsupported {
+        at: None,
+        what: "no page height".into(),
+    })? as f64
+        / SP_PER_BP;
     let mut it = Interp {
         page_h,
         gs: GState::default(),
@@ -852,7 +998,12 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
     };
     // `other` comes first in the page's content, then the rows in order
     let rows: Vec<(Option<usize>, &[Item])> = std::iter::once((None, dl.other.as_slice()))
-        .chain(dl.lines.iter().enumerate().map(|(k, l): (usize, &Line)| (Some(k), l.items.as_slice())))
+        .chain(
+            dl.lines
+                .iter()
+                .enumerate()
+                .map(|(k, l): (usize, &Line)| (Some(k), l.items.as_slice())),
+        )
         .collect();
     for (line, items) in rows {
         let base_depth = it.depth;
@@ -860,7 +1011,11 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
             let at = ItemRef { line, item: k };
             let fail = |what: String| Unsupported { at: Some(at), what };
             match item {
-                Item::Literal { mode, data, at: pos } => match (mode, pos) {
+                Item::Literal {
+                    mode,
+                    data,
+                    at: pos,
+                } => match (mode, pos) {
                     (0, Some((x, y))) => {
                         it.move_to(*x, *y);
                         it.run(data, at, false).map_err(fail)?;
@@ -870,20 +1025,33 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
                     (-1, _) => return Err(fail("\\special".into())),
                     (m, _) => return Err(fail(format!("literal mode {m}"))),
                 },
-                Item::Color { stack, cmd, data, after } => {
-                    it.color_stack(*stack, *cmd, data, after.as_deref(), at).map_err(fail)?
-                }
+                Item::Color {
+                    stack,
+                    cmd,
+                    data,
+                    after,
+                } => it
+                    .color_stack(*stack, *cmd, data, after.as_deref(), at)
+                    .map_err(fail)?,
                 Item::Matrix { op, x, y, data } => {
                     it.move_to(*x, *y);
                     match op.as_str() {
                         "save" => it.run("q", at, false).map_err(fail)?,
                         "restore" => it.run("Q", at, false).map_err(fail)?,
                         "set" => {
-                            let v: Vec<f64> = data.split_ascii_whitespace().filter_map(|t| t.parse().ok()).collect();
+                            let v: Vec<f64> = data
+                                .split_ascii_whitespace()
+                                .filter_map(|t| t.parse().ok())
+                                .collect();
                             if v.len() != 4 {
                                 return Err(fail(format!("matrix {data:?}")));
                             }
-                            it.run(&format!("{} {} {} {} 0 0 cm", v[0], v[1], v[2], v[3]), at, false).map_err(fail)?;
+                            it.run(
+                                &format!("{} {} {} {} 0 0 cm", v[0], v[1], v[2], v[3]),
+                                at,
+                                false,
+                            )
+                            .map_err(fail)?;
                         }
                         o => return Err(fail(format!("matrix op {o}"))),
                     }
@@ -899,17 +1067,28 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
                     let d = detail.as_str().unwrap_or("");
                     it.shade(d, at).map_err(fail)?;
                 }
-                Item::Unsupported { kind, .. } => return Err(fail(format!("unsupported item {kind}"))),
+                Item::Unsupported { kind, .. } => {
+                    return Err(fail(format!("unsupported item {kind}")))
+                }
             }
         }
         if !it.path.is_empty() || it.clip.is_some() {
-            return Err(Unsupported { at: None, what: "path left open at the end of a row".into() });
+            return Err(Unsupported {
+                at: None,
+                what: "path left open at the end of a row".into(),
+            });
         }
         if it.depth != base_depth {
-            return Err(Unsupported { at: None, what: "q without Q in a row".into() });
+            return Err(Unsupported {
+                at: None,
+                what: "q without Q in a row".into(),
+            });
         }
     }
-    Ok(NativePage { ops: it.ops, transforms: it.transforms })
+    Ok(NativePage {
+        ops: it.ops,
+        transforms: it.transforms,
+    })
 }
 
 #[cfg(test)]
@@ -919,7 +1098,10 @@ mod tests {
     fn page(items: Vec<Item>) -> DisplayList {
         DisplayList {
             kind: "page".into(),
-            lines: vec![Line { items, ..Default::default() }],
+            lines: vec![Line {
+                items,
+                ..Default::default()
+            }],
             flags: serde_json::json!({"literal": 1}),
             page_height: Some((800.0 * SP_PER_BP) as Sp),
             ..Default::default()
@@ -927,7 +1109,11 @@ mod tests {
     }
 
     fn lit(data: &str, x: Sp, y: Sp) -> Item {
-        Item::Literal { mode: 0, data: data.into(), at: Some((x, y)) }
+        Item::Literal {
+            mode: 0,
+            data: data.into(),
+            at: Some((x, y)),
+        }
     }
 
     fn dl_point(op: &GfxOp, x: f64, y: f64) -> (f64, f64) {
@@ -941,16 +1127,43 @@ mod tests {
     fn a_line_lands_at_its_literal_position() {
         // a pgf picture at (100 bp, 50 bp from the top): red line from the origin to (10, 10)
         let (x, y) = ((100.0 * SP_PER_BP) as Sp, (50.0 * SP_PER_BP) as Sp);
-        let p = page(vec![lit("q 0.4 w", x, y), lit("1 0 0 rg 1 0 0 RG 0 0 m 10 10 l S", x, y), lit("Q", x, y)]);
+        let p = page(vec![
+            lit("q 0.4 w", x, y),
+            lit("1 0 0 rg 1 0 0 RG 0 0 m 10 10 l S", x, y),
+            lit("Q", x, y),
+        ]);
         let n = native_graphics(&p).unwrap();
-        let paint = n.ops.iter().find(|o| matches!(o, GfxOp::Paint { .. })).unwrap();
+        let paint = n
+            .ops
+            .iter()
+            .find(|o| matches!(o, GfxOp::Paint { .. }))
+            .unwrap();
         let (sx, sy) = dl_point(paint, 0.0, 0.0);
-        assert!((sx - x as f64).abs() < 1.0 && (sy - y as f64).abs() < 1.0, "{sx} {sy}");
+        assert!(
+            (sx - x as f64).abs() < 1.0 && (sy - y as f64).abs() < 1.0,
+            "{sx} {sy}"
+        );
         let (ex, ey) = dl_point(paint, 10.0, 10.0);
         // y grows down in the display list
-        assert!((ex - (x as f64 + 10.0 * SP_PER_BP)).abs() < 1.0 && (ey - (y as f64 - 10.0 * SP_PER_BP)).abs() < 1.0);
-        let GfxOp::Paint { stroke: Some(s), fill: None, .. } = paint else { panic!() };
-        assert_eq!(s.color, Color { comps: vec![1.0, 0.0, 0.0], alpha: 1.0 });
+        assert!(
+            (ex - (x as f64 + 10.0 * SP_PER_BP)).abs() < 1.0
+                && (ey - (y as f64 - 10.0 * SP_PER_BP)).abs() < 1.0
+        );
+        let GfxOp::Paint {
+            stroke: Some(s),
+            fill: None,
+            ..
+        } = paint
+        else {
+            panic!()
+        };
+        assert_eq!(
+            s.color,
+            Color {
+                comps: vec![1.0, 0.0, 0.0],
+                alpha: 1.0
+            }
+        );
         assert_eq!(s.width, 0.4);
         assert!(n.transforms.is_empty());
     }
@@ -965,7 +1178,11 @@ mod tests {
             lit("Q", x, y),
         ]);
         let n = native_graphics(&p).unwrap();
-        let paint = n.ops.iter().find(|o| matches!(o, GfxOp::Paint { .. })).unwrap();
+        let paint = n
+            .ops
+            .iter()
+            .find(|o| matches!(o, GfxOp::Paint { .. }))
+            .unwrap();
         // the move of 10 bp to the right happens in the rotated space: it goes up instead
         let (sx, sy) = dl_point(paint, 0.0, 0.0);
         assert!((sx - x as f64).abs() < 1.0, "{sx}");
@@ -975,12 +1192,31 @@ mod tests {
     #[test]
     fn glyphs_in_a_scaled_scope_get_a_transform() {
         let (x, y) = ((100.0 * SP_PER_BP) as Sp, (100.0 * SP_PER_BP) as Sp);
-        let glyph = Item::Glyph { font: 1, char: 65, index: None, x, y, width: 1000, expansion: 0 };
-        let p = page(vec![lit("q 2 0 0 2 0 0 cm", x, y), glyph.clone(), lit("Q", x, y), glyph]);
+        let glyph = Item::Glyph {
+            font: 1,
+            char: 65,
+            index: None,
+            x,
+            y,
+            width: 1000,
+            expansion: 0,
+        };
+        let p = page(vec![
+            lit("q 2 0 0 2 0 0 cm", x, y),
+            glyph.clone(),
+            lit("Q", x, y),
+            glyph,
+        ]);
         let n = native_graphics(&p).unwrap();
         assert_eq!(n.transforms.len(), 1, "only the glyph inside the scope");
         let (r, m) = n.transforms[0];
-        assert_eq!(r, ItemRef { line: Some(0), item: 1 });
+        assert_eq!(
+            r,
+            ItemRef {
+                line: Some(0),
+                item: 1
+            }
+        );
         // scaled about the scope's origin, which is the glyph's position here: it stays put
         let (gx, gy) = apply(&m, x as f64, y as f64);
         assert!((gx - x as f64).abs() < 1e-3 && (gy - y as f64).abs() < 1e-3);
@@ -991,13 +1227,28 @@ mod tests {
     #[test]
     fn unknown_things_are_errors_never_partial() {
         let (x, y) = (1000, 1000);
-        for bad in ["/Sh sh", "/Fm0 Do", "BT /F1 10 Tf (a) Tj ET", "/GS0 gs", "/Pattern cs /P0 scn", "q"] {
+        for bad in [
+            "/Sh sh",
+            "/Fm0 Do",
+            "BT /F1 10 Tf (a) Tj ET",
+            "/GS0 gs",
+            "/Pattern cs /P0 scn",
+            "q",
+        ] {
             let p = page(vec![lit(bad, x, y)]);
             assert!(native_graphics(&p).is_err(), "{bad}");
         }
-        let p = page(vec![Item::Literal { mode: 0, data: "q".into(), at: None }]);
+        let p = page(vec![Item::Literal {
+            mode: 0,
+            data: "q".into(),
+            at: None,
+        }]);
         assert!(native_graphics(&p).is_err());
-        let p = page(vec![Item::Literal { mode: -1, data: "x".into(), at: Some((0, 0)) }]);
+        let p = page(vec![Item::Literal {
+            mode: -1,
+            data: "x".into(),
+            at: Some((0, 0)),
+        }]);
         assert!(native_graphics(&p).is_err());
     }
 
@@ -1018,17 +1269,63 @@ mod tests {
     fn opacity_clip_dash_and_color_stack() {
         let (x, y) = (1000, 1000);
         let p = page(vec![
-            Item::Color { stack: 0, cmd: Some(1), data: "0 0 1 rg 0 0 1 RG".into(), after: None },
-            lit("q /pgf@ca0.5 gs [3 1] 0 d 0 0 10 10 re W n 0 0 5 5 re B Q", x, y),
-            Item::Color { stack: 0, cmd: Some(2), data: String::new(), after: None },
+            Item::Color {
+                stack: 0,
+                cmd: Some(1),
+                data: "0 0 1 rg 0 0 1 RG".into(),
+                after: None,
+            },
+            lit(
+                "q /pgf@ca0.5 gs [3 1] 0 d 0 0 10 10 re W n 0 0 5 5 re B Q",
+                x,
+                y,
+            ),
+            Item::Color {
+                stack: 0,
+                cmd: Some(2),
+                data: String::new(),
+                after: None,
+            },
         ]);
         let n = native_graphics(&p).unwrap();
         assert!(matches!(n.ops[0], GfxOp::Save { .. }));
-        assert!(matches!(n.ops[1], GfxOp::Clip { even_odd: false, .. }));
-        let GfxOp::Paint { fill: Some(f), stroke: Some(s), .. } = &n.ops[2] else { panic!("{:?}", n.ops[2]) };
-        assert_eq!(*f, Color { comps: vec![0.0, 0.0, 1.0], alpha: 0.5 });
-        assert_eq!(s.color, Color { comps: vec![0.0, 0.0, 1.0], alpha: 1.0 });
-        assert_eq!(Color { comps: vec![0.0, 0.0, 0.4, 0.0], alpha: 1.0 }.rgb(), [1.0, 1.0, 0.6]);
+        assert!(matches!(
+            n.ops[1],
+            GfxOp::Clip {
+                even_odd: false,
+                ..
+            }
+        ));
+        let GfxOp::Paint {
+            fill: Some(f),
+            stroke: Some(s),
+            ..
+        } = &n.ops[2]
+        else {
+            panic!("{:?}", n.ops[2])
+        };
+        assert_eq!(
+            *f,
+            Color {
+                comps: vec![0.0, 0.0, 1.0],
+                alpha: 0.5
+            }
+        );
+        assert_eq!(
+            s.color,
+            Color {
+                comps: vec![0.0, 0.0, 1.0],
+                alpha: 1.0
+            }
+        );
+        assert_eq!(
+            Color {
+                comps: vec![0.0, 0.0, 0.4, 0.0],
+                alpha: 1.0
+            }
+            .rgb(),
+            [1.0, 1.0, 0.6]
+        );
         assert_eq!(s.dash, vec![3.0, 1.0]);
         assert!(matches!(n.ops[3], GfxOp::Restore { .. }));
     }

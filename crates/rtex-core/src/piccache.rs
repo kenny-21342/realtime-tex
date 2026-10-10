@@ -195,7 +195,10 @@ impl PicCache {
             .filter(|p| p.cacheable && !self.index.bad.contains_key(&p.key))
             .filter_map(|p| {
                 let e = self.index.entries.get(&p.hash.to_string())?;
-                (e.env == p.env).then(|| e.native.clone()).flatten().map(|f| (p.key.clone(), f))
+                (e.env == p.env)
+                    .then(|| e.native.clone())
+                    .flatten()
+                    .map(|f| (p.key.clone(), f))
             })
             .collect()
     }
@@ -453,6 +456,23 @@ const UNCACHEABLE_WORDS: &[&str] = &[
     "newsavebox",
     "usebox",
     "setbox",
+    // catcode changes and Lua: a skipped body is scanned with the catcodes in force at the
+    // picture, so a body that reads part of itself under other catcodes (`%` inside
+    // `luacode*`, `\verb|}|`) is not skipped the way the drawing reads it; Lua may also
+    // print anything
+    "catcode",
+    "makeatletter",
+    "makeatother",
+    "ExplSyntaxOn",
+    "obeylines",
+    "obeyspaces",
+    "scantokens",
+    "lstinline",
+    "mintinline",
+    "Verb",
+    "directlua",
+    "luaexec",
+    "luadirect",
 ];
 
 /// Control-word prefixes (`\citep`, `\includegraphics*`, `\pgfplotstableread` …).
@@ -574,10 +594,63 @@ fn word_before_arg(text: &str, word: &str) -> bool {
     false
 }
 
+/// Does `text` open an environment that reads its body under other catcodes (the list is the
+/// segmenter's: `document::is_verbatim_env`)?
+fn has_verbatim_env(text: &str) -> bool {
+    let mut from = 0;
+    while let Some(k) = text[from..].find("\\begin{") {
+        let start = from + k + "\\begin{".len();
+        let name = text[start..].split('}').next().unwrap_or("");
+        if crate::document::is_verbatim_env(name) {
+            return true;
+        }
+        from = start;
+    }
+    false
+}
+
+/// Would the skip of a cached picture's body (rtex-pic.tex: `\rtex@gobbleto`, which takes
+/// everything up to each `\end` as a macro argument) stop at the picture's own `\end{env}`?
+/// It cannot when a `}` closes a group the body never opened (an argument error) or when the
+/// `\end{env}` sits inside braces (the skip runs past it to the end of the file). `text` is
+/// the comment-stripped source from the `\begin{env}` line to the `\end{env}` line.
+fn skip_stops_at_end(text: &str, env: &str) -> bool {
+    let begin = format!("\\begin{{{env}}}");
+    let end = format!("\\end{{{env}}}");
+    let Some(b) = text.find(&begin) else {
+        return false;
+    };
+    let body = &text[b + begin.len()..];
+    let bytes = body.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if depth == 0 && body[i..].starts_with(&end) {
+                    return true;
+                }
+                i += 1;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Does a picture with this (comment-stripped) text depend on more than its source and the
 /// definitions before it?
 pub fn uncacheable(text: &str) -> bool {
     UNCACHEABLE_WORDS.iter().any(|w| has_cs(text, w))
+        || has_verbatim_env(text)
         || has_the_counter(text)
         || UNCACHEABLE_PREFIXES.iter().any(|w| has_cs_prefix(text, w))
         || UNCACHEABLE_TEXT.iter().any(|t| text.contains(t))
@@ -638,10 +711,10 @@ pub fn scan_pictures(
         if name != main {
             return 0;
         }
-        texts[name]
-            .lines()
-            .position(|l| strip_comment(l).contains("\\begin{document}"))
-            .map(|k| k + 1)
+        // the line after the \begin{document} TeX reads (not one in a comment or verbatim)
+        let text = &texts[name];
+        crate::document::find_command(text, "\\begin{document}")
+            .map(|off| text[..off].matches('\n').count() + 1)
             .unwrap_or(0)
     };
     // `remember picture` anywhere (comments aside; the preamble too: `\tikzset{every
@@ -709,7 +782,8 @@ pub fn scan_pictures(
                         && trimmed.starts_with(&begin_marker)
                         && text_all.matches(&begin_marker).count() == 1
                         && !line.contains("\\end{")
-                        && !uncacheable(&text_all);
+                        && !uncacheable(&text_all)
+                        && skip_stops_at_end(&text_all, env);
                     let mut h = self.prelude.clone();
                     hash_bytes(&mut h, &text_all);
                     self.bodies.push(text_all.clone());
@@ -813,7 +887,12 @@ fn uses_name(text: &str, name: &str) -> bool {
             continue;
         }
         let before = text[..at].trim_end();
-        if before.ends_with('(') || before.ends_with("-|") || before.ends_with("|-") || before.ends_with("of") || before.ends_with("of=") {
+        if before.ends_with('(')
+            || before.ends_with("-|")
+            || before.ends_with("|-")
+            || before.ends_with("of")
+            || before.ends_with("of=")
+        {
             return true;
         }
     }
@@ -858,20 +937,27 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
     let mut glyphs = 0;
     let mut fonts = dl.fonts.clone();
     let mut spots: Vec<rtex_dl::PictureSpot> = Vec::new();
-    let mut next_id = fonts.keys().filter_map(|k| k.parse::<i64>().ok()).max().unwrap_or(0) + 1;
+    let mut next_id = fonts
+        .keys()
+        .filter_map(|k| k.parse::<i64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
     let mut splice = |items: &mut Vec<Item>| {
         let mut out = Vec::with_capacity(items.len());
         for it in items.drain(..) {
             let frag = match &it {
-                Item::Unsupported { kind, detail } if kind == "cached_picture" => detail.as_str().and_then(|d| {
-                    let mut f = d.splitn(6, ' ');
-                    let _idx = f.next()?;
-                    let x: i64 = f.next()?.parse().ok()?;
-                    let top: i64 = f.next()?.parse().ok()?;
-                    let (_w, _h) = (f.next()?, f.next()?);
-                    let frag = fragments.get(f.next()?)?;
-                    Some((frag, x, top + frag.h))
-                }),
+                Item::Unsupported { kind, detail } if kind == "cached_picture" => {
+                    detail.as_str().and_then(|d| {
+                        let mut f = d.splitn(6, ' ');
+                        let _idx = f.next()?;
+                        let x: i64 = f.next()?.parse().ok()?;
+                        let top: i64 = f.next()?.parse().ok()?;
+                        let (_w, _h) = (f.next()?, f.next()?);
+                        let frag = fragments.get(f.next()?)?;
+                        Some((frag, x, top + frag.h))
+                    })
+                }
                 _ => None,
             };
             let Some((frag, ox, oy)) = frag else {
@@ -881,8 +967,18 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
             // where the picture is (a host copying a picture into a live unit needs it)
             if let Item::Unsupported { detail, .. } = &it {
                 let f: Vec<&str> = detail.as_str().unwrap_or("").splitn(6, ' ').collect();
-                if let (Some(w), Some(h), Some(key)) = (f.get(3).and_then(|v| v.parse().ok()), f.get(4).and_then(|v| v.parse().ok()), f.get(5)) {
-                    spots.push(rtex_dl::PictureSpot { key: key.to_string(), x: ox, top: oy - frag.h, width: w, height: h });
+                if let (Some(w), Some(h), Some(key)) = (
+                    f.get(3).and_then(|v| v.parse().ok()),
+                    f.get(4).and_then(|v| v.parse().ok()),
+                    f.get(5),
+                ) {
+                    spots.push(rtex_dl::PictureSpot {
+                        key: key.to_string(),
+                        x: ox,
+                        top: oy - frag.h,
+                        width: w,
+                        height: h,
+                    });
                 }
             }
             // the fragment's font ids are the recording pass's: map them onto this page's
@@ -904,26 +1000,71 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
             }
             for i in &frag.items {
                 let moved = match i.clone() {
-                    Item::Glyph { font, char, index, x, y, width, expansion } => {
+                    Item::Glyph {
+                        font,
+                        char,
+                        index,
+                        x,
+                        y,
+                        width,
+                        expansion,
+                    } => {
                         glyphs += 1;
-                        Item::Glyph { font: *ids.get(&font).unwrap_or(&font), char, index, x: x + ox, y: y + oy, width, expansion }
+                        Item::Glyph {
+                            font: *ids.get(&font).unwrap_or(&font),
+                            char,
+                            index,
+                            x: x + ox,
+                            y: y + oy,
+                            width,
+                            expansion,
+                        }
                     }
-                    Item::Rule { x, y_top, width, height } => Item::Rule { x: x + ox, y_top: y_top + oy, width, height },
+                    Item::Rule {
+                        x,
+                        y_top,
+                        width,
+                        height,
+                    } => Item::Rule {
+                        x: x + ox,
+                        y_top: y_top + oy,
+                        width,
+                        height,
+                    },
                     Item::Literal { mode, data, at } => {
                         *added_flags.entry("literal".into()).or_default() += 1;
-                        Item::Literal { mode, data, at: at.map(|(x, y)| (x + ox, y + oy)) }
+                        Item::Literal {
+                            mode,
+                            data,
+                            at: at.map(|(x, y)| (x + ox, y + oy)),
+                        }
                     }
-                    Item::Matrix { op, x, y, data } => Item::Matrix { op, x: x + ox, y: y + oy, data },
+                    Item::Matrix { op, x, y, data } => Item::Matrix {
+                        op,
+                        x: x + ox,
+                        y: y + oy,
+                        data,
+                    },
                     Item::Math { on, x } => Item::Math { on, x: x + ox },
                     Item::Unsupported { kind, detail } if kind == "shading" => {
                         *added_flags.entry("shading".into()).or_default() += 1;
                         let d = detail.as_str().unwrap_or("");
                         let mut f = d.splitn(4, ' ');
-                        let moved = match (f.next(), f.next().and_then(|v| v.parse::<i64>().ok()), f.next().and_then(|v| v.parse::<i64>().ok()), f.next()) {
-                            (Some(idx), Some(x), Some(top), Some(rest)) => format!("{idx} {} {} {rest}", x + ox, top + oy),
+                        let moved = match (
+                            f.next(),
+                            f.next().and_then(|v| v.parse::<i64>().ok()),
+                            f.next().and_then(|v| v.parse::<i64>().ok()),
+                            f.next(),
+                        ) {
+                            (Some(idx), Some(x), Some(top), Some(rest)) => {
+                                format!("{idx} {} {} {rest}", x + ox, top + oy)
+                            }
                             _ => d.to_string(),
                         };
-                        Item::Unsupported { kind, detail: serde_json::Value::String(moved) }
+                        Item::Unsupported {
+                            kind,
+                            detail: serde_json::Value::String(moved),
+                        }
                     }
                     other => other,
                 };
@@ -1019,6 +1160,16 @@ mod tests {
     }
 
     #[test]
+    fn the_body_starts_at_the_begin_document_tex_reads() {
+        // a commented \begin{document} in the preamble does not make the preamble's picture
+        // (inside a macro definition) a body picture
+        let main = "\\documentclass{article}\n% \\begin{document} goes below\n\\newcommand\\pic{%\n\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}}\n\\begin{document}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end{document}\n";
+        let pics = scan_pictures(&texts_of(main), "main.tex", 0);
+        let keys: Vec<&str> = pics.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, vec!["main.tex:6"]);
+    }
+
+    #[test]
     fn counters_links_and_double_inputs_are_not_cached() {
         // \the<counter> prints a number the picture's text does not show
         assert!(uncacheable("\\node {Section \\thesection};"));
@@ -1086,7 +1237,12 @@ mod tests {
         let doc = "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\begin{axis}[\n    name=upper,\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\begin{axis}[\n    at={(upper.below south west)},\n]\n\\end{axis}\n\\end{tikzpicture}\n\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}\n\\end{document}\n";
         assert_eq!(cacheable(doc), vec![false, false, true]);
         // a node, used with an anchor, `-|` and positioning's `of`
-        for using in ["\\draw (p.east) -- ++(1,0);", "\\draw (0,0) -| p;", "\\node[right=of p] {x};", "\\draw (p) -- (1,0);"] {
+        for using in [
+            "\\draw (p.east) -- ++(1,0);",
+            "\\draw (0,0) -| p;",
+            "\\node[right=of p] {x};",
+            "\\draw (p) -- (1,0);",
+        ] {
             let doc = format!("\\documentclass{{article}}\n\\begin{{document}}\n\\begin{{tikzpicture}}\n\\node[draw] (p) {{P}};\n\\end{{tikzpicture}}\n\\begin{{tikzpicture}}\n{using}\n\\end{{tikzpicture}}\n\\end{{document}}\n");
             assert_eq!(cacheable(&doc), vec![false, false], "{using}");
         }
@@ -1100,13 +1256,30 @@ mod tests {
     #[test]
     fn substitute_puts_a_cached_picture_back_and_says_where() {
         use rtex_dl::{DisplayList, FontDesc, Item, Line};
-        let font = FontDesc { id: 7, filename: Some("lmroman10-regular.otf".into()), size: Some(655360.0), ..Default::default() };
+        let font = FontDesc {
+            id: 7,
+            filename: Some("lmroman10-regular.otf".into()),
+            size: Some(655360.0),
+            ..Default::default()
+        };
         let mut frag_fonts = BTreeMap::new();
         frag_fonts.insert("7".to_string(), font.clone());
         let frag = Fragment {
             items: vec![
-                Item::Literal { mode: 0, data: "0 0 m 10 0 l S".into(), at: Some((0, 0)) },
-                Item::Glyph { font: 7, char: 65, index: Some(36), x: 100, y: -50, width: 400, expansion: 0 },
+                Item::Literal {
+                    mode: 0,
+                    data: "0 0 m 10 0 l S".into(),
+                    at: Some((0, 0)),
+                },
+                Item::Glyph {
+                    font: 7,
+                    char: 65,
+                    index: Some(36),
+                    x: 100,
+                    y: -50,
+                    width: 400,
+                    expansion: 0,
+                },
             ],
             fonts: frag_fonts,
             h: 3000,
@@ -1132,15 +1305,42 @@ mod tests {
         assert_eq!(substitute(&mut dl, &fragments), 1);
         let items = &dl.lines[0].items;
         // baseline = top + h: 2000 + 3000
-        assert_eq!(items[0], Item::Literal { mode: 0, data: "0 0 m 10 0 l S".into(), at: Some((1000, 5000)) });
-        assert!(matches!(items[1], Item::Glyph { font: 3, x: 1100, y: 4950, .. }));
+        assert_eq!(
+            items[0],
+            Item::Literal {
+                mode: 0,
+                data: "0 0 m 10 0 l S".into(),
+                at: Some((1000, 5000))
+            }
+        );
+        assert!(matches!(
+            items[1],
+            Item::Glyph {
+                font: 3,
+                x: 1100,
+                y: 4950,
+                ..
+            }
+        ));
         let flags = dl.flags_map();
         assert!(!flags.contains_key("pic_cache"));
         assert_eq!(flags.get("literal").and_then(|v| v.as_i64()), Some(1));
-        assert_eq!(dl.pictures, vec![rtex_dl::PictureSpot { key: "main.tex:12".into(), x: 1000, top: 2000, width: 4000, height: 3500 }]);
+        assert_eq!(
+            dl.pictures,
+            vec![rtex_dl::PictureSpot {
+                key: "main.tex:12".into(),
+                x: 1000,
+                top: 2000,
+                width: 4000,
+                height: 3500
+            }]
+        );
         // an unknown key stays a cached region
         let mut other = dl.clone();
-        other.lines[0].items = vec![Item::Unsupported { kind: "cached_picture".into(), detail: serde_json::Value::String("5 1 2 3 4 other.tex:1".into()) }];
+        other.lines[0].items = vec![Item::Unsupported {
+            kind: "cached_picture".into(),
+            detail: serde_json::Value::String("5 1 2 3 4 other.tex:1".into()),
+        }];
         assert_eq!(substitute(&mut other, &fragments), 0);
     }
 
@@ -1162,6 +1362,27 @@ mod tests {
         assert!(uncacheable("\\pgfmathsetmacro\\w{3} \\xdef\\figwidth{\\w}"));
         assert!(uncacheable("\\global\\advance\\c by 1"));
         assert!(uncacheable("\\includegraphics*[width=1cm]{f}"));
+        // bodies read under other catcodes, Lua
+        assert!(uncacheable(
+            "\\begin{luacode*}\n tex.print(\"{hsb}{\")\n\\end{luacode*}"
+        ));
+        assert!(uncacheable("\\begin{Verbatim}x\\end{Verbatim}"));
+        assert!(uncacheable("\\node {\\directlua{tex.print(1)}};"));
+        assert!(uncacheable("{\\catcode`\\|=13 x}"));
+        assert!(!uncacheable("\\node[draw] {a comment-free node};"));
+    }
+
+    #[test]
+    fn the_body_skip_must_stop_at_the_pictures_end() {
+        let ok = "\\begin{tikzpicture}\n\\draw (0,0) -- (1,1);\n\\end{tikzpicture}";
+        assert!(skip_stops_at_end(ok, "tikzpicture"));
+        // a `{` left open by a stripped `%` (luacode* read under normal catcodes)
+        let open = "\\begin{tikzpicture}\n\\fill[c] {hsb}{\n\\end{tikzpicture}";
+        assert!(!skip_stops_at_end(open, "tikzpicture"));
+        let extra = "\\begin{tikzpicture}\n}\\draw;\n\\end{tikzpicture}";
+        assert!(!skip_stops_at_end(extra, "tikzpicture"));
+        let nested = "\\begin{tikzpicture}\n\\node {\\end{tikzpicture}};";
+        assert!(!skip_stops_at_end(nested, "tikzpicture"));
         // a picture after text on its line, or with text before its \begin, is not keyed by
         // the line its \begin is on
         let texts = texts_of(
@@ -1217,9 +1438,19 @@ mod tests {
         // does not matter
         let err = |f: &str, l: i64| vec![(f.to_string(), l)];
         let mut other = PicCache::open(&dir.join("cache-errors"));
-        assert_eq!(other.absorb(&pics, &rec, &[], &err("./main.tex", 9), &pdf).unwrap(), 0);
+        assert_eq!(
+            other
+                .absorb(&pics, &rec, &[], &err("./main.tex", 9), &pdf)
+                .unwrap(),
+            0
+        );
         assert_eq!(other.entries(), 0);
-        assert_eq!(other.absorb(&pics, &rec, &[], &err("./other.tex", 6), &pdf).unwrap(), 1);
+        assert_eq!(
+            other
+                .absorb(&pics, &rec, &[], &err("./other.tex", 6), &pdf)
+                .unwrap(),
+            1
+        );
         // not a real PDF: the whole file is copied and page numbers stay
         assert_eq!(cache.absorb(&pics, &rec, &[], &[], &pdf).unwrap(), 1);
         assert_eq!(cache.entries(), 1);
@@ -1270,7 +1501,9 @@ mod tests {
         }];
         for _ in 0..(KEEP_PASSES + 1) {
             assert_eq!(cache.write_manifest(&changed, &manifest).unwrap(), 0);
-            cache.absorb(&changed, &BTreeMap::new(), &[], &[], &pdf).unwrap();
+            cache
+                .absorb(&changed, &BTreeMap::new(), &[], &[], &pdf)
+                .unwrap();
         }
         assert_eq!(cache.entries(), 0);
         assert!(std::fs::read_dir(dir.join("cache"))

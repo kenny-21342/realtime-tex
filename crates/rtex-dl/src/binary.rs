@@ -1,4 +1,4 @@
-//! Binary display-list encoding, revision 1 (docs/DISPLAY_LIST.md): decoder and encoder.
+//! Binary display-list encoding, revision 1 (docs/display-list.md): decoder and encoder.
 
 use crate::{DisplayList, FontDesc, ImageInfo, Item, Line, Sp};
 #[cfg(test)]
@@ -370,7 +370,10 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                         let data = p.str().map_err(malformed)?;
                         // the position is a later addition: absent in older lists
                         let at = if p.remaining() >= 8 {
-                            Some((p.i32().map_err(malformed)? as Sp, p.i32().map_err(malformed)? as Sp))
+                            Some((
+                                p.i32().map_err(malformed)? as Sp,
+                                p.i32().map_err(malformed)? as Sp,
+                            ))
                         } else {
                             None
                         };
@@ -497,7 +500,12 @@ fn write_items(out: &mut Writer, items: &[Item]) {
                 p.i32(*height);
                 out.rec(0x21, &p.0);
             }
-            Item::Color { stack, cmd, data, after } => {
+            Item::Color {
+                stack,
+                cmd,
+                data,
+                after,
+            } => {
                 let mut p = Writer(Vec::new());
                 p.u8(cmd.map(|c| c as u8).unwrap_or(255));
                 p.u8(0);
@@ -779,10 +787,31 @@ mod tests {
                         height: 800,
                     },
                     // graphicx scaling: every record of the group survives the round trip
-                    Item::Matrix { op: "save".into(), x: 1500, y: 2000, data: String::new() },
-                    Item::Matrix { op: "set".into(), x: 1500, y: 2000, data: ".5 0 0 .5".into() },
-                    Item::Image { index: 3, x: 1500, y_top: 1000, width: 800, height: 800 },
-                    Item::Matrix { op: "restore".into(), x: 1500, y: 2000, data: String::new() },
+                    Item::Matrix {
+                        op: "save".into(),
+                        x: 1500,
+                        y: 2000,
+                        data: String::new(),
+                    },
+                    Item::Matrix {
+                        op: "set".into(),
+                        x: 1500,
+                        y: 2000,
+                        data: ".5 0 0 .5".into(),
+                    },
+                    Item::Image {
+                        index: 3,
+                        x: 1500,
+                        y_top: 1000,
+                        width: 800,
+                        height: 800,
+                    },
+                    Item::Matrix {
+                        op: "restore".into(),
+                        x: 1500,
+                        y: 2000,
+                        data: String::new(),
+                    },
                     Item::Literal {
                         mode: 0,
                         data: "q Q".into(),
@@ -806,9 +835,18 @@ mod tests {
                 after: None,
             }],
             flags: serde_json::json!({"literal": 1}),
-            pictures: vec![crate::PictureSpot { key: "main.tex:12".into(), x: 100, top: 200, width: 3000, height: 1500 }],
+            pictures: vec![crate::PictureSpot {
+                key: "main.tex:12".into(),
+                x: 100,
+                top: 200,
+                width: 3000,
+                height: 1500,
+            }],
             rotate: 90,
-            color_base: BTreeMap::from([("0".to_string(), vec!["0 g 0 G".to_string(), "0 0 1 rg 0 0 1 RG".to_string()])]),
+            color_base: BTreeMap::from([(
+                "0".to_string(),
+                vec!["0 g 0 G".to_string(), "0 0 1 rg 0 0 1 RG".to_string()],
+            )]),
             glyphs: 3,
             width: 5000,
             height: 700,

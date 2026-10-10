@@ -6,12 +6,16 @@ use std::time::Instant;
 fn main() {
     let mut rows = Vec::new();
     for path in std::env::args().skip(1) {
-        let dl: DisplayList = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dl: DisplayList =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         if !rtex_dl::gfx::only_literals(&dl) {
             continue;
         }
         let bin = dl.to_binary();
-        if let (Ok(_), Err(e)) = (rtex_dl::gfx::native_graphics(&dl), rtex_dl::gfx::native_graphics(&DisplayList::from_binary(&bin).unwrap())) {
+        if let (Ok(_), Err(e)) = (
+            rtex_dl::gfx::native_graphics(&dl),
+            rtex_dl::gfx::native_graphics(&DisplayList::from_binary(&bin).unwrap()),
+        ) {
             println!("BINARY ROUND TRIP LOSES NATIVE DRAWING: {path}: {e}");
         }
         let mut times = Vec::new();

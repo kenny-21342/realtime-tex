@@ -43,7 +43,18 @@ impl Clone for CaptureResult {
 /// (images, .bib, .cls …) so relative inputs resolve.
 pub fn write_snapshot(project: &Path, files: &BTreeMap<String, String>, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    copy_tree(project, dir, 0)?;
+    // the PDFs built from the document's own sources (main.pdf, a subfile compiled alone):
+    // outputs, not inputs. A PDF next to a .tex the document does not read (a standalone
+    // figure's source) is an input and is copied.
+    let built: std::collections::HashSet<PathBuf> = files
+        .keys()
+        .map(|rel| {
+            project
+                .join(rel.trim_start_matches("./"))
+                .with_extension("pdf")
+        })
+        .collect();
+    copy_tree(project, dir, 0, &built)?;
     for (rel, text) in files {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
@@ -54,13 +65,18 @@ pub fn write_snapshot(project: &Path, files: &BTreeMap<String, String>, dir: &Pa
     Ok(())
 }
 
-fn copy_tree(src: &Path, dst: &Path, depth: usize) -> Result<()> {
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    depth: usize,
+    built: &std::collections::HashSet<PathBuf>,
+) -> Result<()> {
     if depth > 8 {
         return Ok(());
     }
     // the snapshot's own tree, in canonical form (a host may keep its build directory inside
     // the project under any name, given relative or absolute)
-    let dst_canon = dst.canonicalize().unwrap_or_else(|_| dst.to_path_buf());
+    let dst_canon = crate::paths::canonical(dst).unwrap_or_else(|_| dst.to_path_buf());
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -71,14 +87,14 @@ fn copy_tree(src: &Path, dst: &Path, depth: usize) -> Result<()> {
         let path = entry.path();
         // never descend into the build tree the snapshot itself lives in (a host may keep it
         // inside the project under any name), and skip FIFOs, sockets and devices
-        let path_canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let path_canon = crate::paths::canonical(&path).unwrap_or_else(|_| path.clone());
         if dst_canon.starts_with(&path_canon) {
             continue;
         }
         if path.is_dir() {
             let sub = dst.join(&name);
             std::fs::create_dir_all(&sub)?;
-            copy_tree(&path, &sub, depth + 1)?;
+            copy_tree(&path, &sub, depth + 1, built)?;
         } else if !path.is_file() {
             continue;
         } else {
@@ -86,6 +102,9 @@ fn copy_tree(src: &Path, dst: &Path, depth: usize) -> Result<()> {
             // never copied. PDFs are inputs (\includegraphics, \includepdf) and are copied; an
             // old output PDF of the document is harmless, LaTeX never reads one implicitly.
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext == "pdf" && built.contains(&path) {
+                continue;
+            }
             if matches!(
                 ext,
                 "aux"
@@ -137,11 +156,78 @@ pub fn mirror_dirs(src: &Path, out: &Path, depth: usize) -> Result<()> {
     Ok(())
 }
 
+/// `bytes` with the pass directory's path taken out, plain and hex-encoded (bookmark writes
+/// `srcfile={<hex of the .ind path>}` into the `.aux`): passes alternate between directories,
+/// and the same document must give the same signature in either.
+fn without_dir(bytes: &[u8], dir_forms: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    for form in dir_forms {
+        if form.is_empty() {
+            continue;
+        }
+        let mut next = Vec::with_capacity(out.len());
+        let mut i = 0;
+        while i < out.len() {
+            if out[i..].starts_with(form) {
+                next.extend_from_slice(b"<dir>");
+                i += form.len();
+            } else {
+                next.push(out[i]);
+                i += 1;
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+fn dir_forms(out_dir: &Path) -> Vec<Vec<u8>> {
+    let mut dirs = vec![out_dir.to_path_buf()];
+    if let Ok(c) = crate::paths::canonical(out_dir) {
+        dirs.push(c);
+    }
+    // as given and as TeX writes it back (forward slashes on Windows)
+    let mut paths: Vec<String> = Vec::new();
+    for d in &dirs {
+        paths.push(d.to_string_lossy().into_owned());
+        paths.push(crate::paths::tex(d));
+    }
+    let mut forms = Vec::new();
+    for p in paths {
+        let hex: String = p.bytes().map(|b| format!("{b:02X}")).collect();
+        forms.push(hex.to_ascii_lowercase().into_bytes());
+        forms.push(hex.into_bytes());
+        forms.push(p.into_bytes());
+    }
+    // longest first, so a path is replaced before a shorter form inside it; equal forms
+    // (an already canonical directory) adjacent so `dedup` drops them
+    forms.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    forms.dedup();
+    forms
+}
+
 fn aux_signature(out_dir: &Path, jobname: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     use std::hash::{Hash, Hasher};
-    for ext in ["aux", "toc", "lof", "lot", "out", "bcf", "bbl", "idx", "ind"] {
+    let forms = dir_forms(out_dir);
+    // every index (imakeidx's `name=` indexes too), as makeindex left it
+    let mut inds: Vec<PathBuf> = std::fs::read_dir(out_dir)
+        .map(|d| {
+            d.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "ind"))
+                .collect()
+        })
+        .unwrap_or_default();
+    inds.sort();
+    for p in &inds {
+        if let Ok(b) = std::fs::read(p) {
+            p.file_name().hash(&mut h);
+            without_dir(&b, &forms).hash(&mut h);
+        }
+    }
+    for ext in ["aux", "toc", "lof", "lot", "out", "bcf", "bbl", "idx"] {
         if let Ok(b) = std::fs::read(out_dir.join(format!("{jobname}.{ext}"))) {
+            let b = without_dir(&b, &forms);
             ext.hash(&mut h);
             b.hash(&mut h);
             if ext == "aux" {
@@ -153,7 +239,7 @@ fn aux_signature(out_dir: &Path, jobname: &str) -> u64 {
                     };
                     if let Ok(pb) = std::fs::read(out_dir.join(name)) {
                         name.hash(&mut h);
-                        pb.hash(&mut h);
+                        without_dir(&pb, &forms).hash(&mut h);
                     }
                 }
             }
@@ -211,21 +297,25 @@ pub fn run_pass_with(
         crate::capture::run_capture_with(tl, snapshot_dir, main, out_dir, instrumented, unit_envs)
     };
     run_pass_with_runner(
-        tl,
-        snapshot_dir,
-        main,
-        out_dir,
-        max_passes,
-        bib,
+        PassPlan {
+            tl,
+            snapshot_dir,
+            main,
+            aux_dir: out_dir,
+            max_passes,
+            bib,
+        },
         &mut runner,
         &mut |_, _| {},
     )
 }
 
 /// Copy the aux family a pass leaves for the next one (`.aux .toc .lof .lot .out .bbl .bcf
-/// .idx .ind .glo .nav .snm`, and the partial `.aux` files of `\include`d chapters in
+/// .ind .gls .nav .snm`, and the partial `.aux` files of `\include`d chapters in
 /// subdirectories) from one pass directory into another. Pass outputs (PDF, log, capture
-/// JSON) and the picture cache are not copied.
+/// JSON) and the picture cache are not copied, nor are the files TeX only writes, which a
+/// standby engine may already hold open from its preamble (`.idx` from `\makeindex`, `.glo`
+/// from `\makeglossaries`): a copy would land in a file being written.
 pub fn copy_aux_family(from: &Path, to: &Path) -> Result<()> {
     fn go(root: &Path, dir: &Path, to: &Path) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
@@ -251,9 +341,7 @@ pub fn copy_aux_family(from: &Path, to: &Path) -> Result<()> {
                             | "bbl"
                             | "bcf"
                             | "blg"
-                            | "idx"
                             | "ind"
-                            | "glo"
                             | "gls"
                             | "nav"
                             | "snm"
@@ -280,19 +368,34 @@ pub fn copy_aux_family(from: &Path, to: &Path) -> Result<()> {
     go(from, from, to)
 }
 
+/// Where and how a sequence of passes runs.
+#[derive(Clone, Copy)]
+pub struct PassPlan<'a> {
+    pub tl: &'a TexLive,
+    pub snapshot_dir: &'a Path,
+    pub main: &'a str,
+    /// The aux family the first pass starts from (each pass may run in its own directory).
+    pub aux_dir: &'a Path,
+    pub max_passes: u32,
+    pub bib: BibTool,
+}
+
 /// `run_pass_with` with the single pass supplied by `runner` (a fresh lualatex, or a standby
 /// `WarmEngine` that already holds the preamble). Each pass may run in its own directory
 /// (`CaptureResult::out_dir`); `aux_dir` holds the aux family the first pass starts from.
 pub fn run_pass_with_runner(
-    tl: &TexLive,
-    snapshot_dir: &Path,
-    main: &str,
-    aux_dir: &Path,
-    max_passes: u32,
-    bib: BibTool,
+    plan: PassPlan,
     runner: &mut dyn FnMut(u32) -> Result<CaptureResult>,
     on_pass: &mut dyn FnMut(&CaptureResult, u32),
 ) -> Result<PassOutcome> {
+    let PassPlan {
+        tl,
+        snapshot_dir,
+        main,
+        aux_dir,
+        max_passes,
+        bib,
+    } = plan;
     std::fs::create_dir_all(aux_dir)?;
     let jobname = Path::new(main)
         .file_stem()
@@ -301,8 +404,7 @@ pub fn run_pass_with_runner(
         .to_string();
     let mut sig_before = aux_signature(aux_dir, &jobname);
     let mut bib_ran = false;
-    // the .idx makeindex last read: run again only when the entries or their pages changed
-    let mut indexed: Option<Vec<u8>> = None;
+    let mut indexed = BTreeMap::new();
     let mut last: Option<CaptureResult> = None;
     let mut passes = 0;
     let mut stable = false;
@@ -331,48 +433,24 @@ pub fn run_pass_with_runner(
             let mut cmd = Command::new(tool);
             cmd.current_dir(out_dir).arg(&jobname);
             if let Some(d) = &tl.bin_dir {
-                cmd.env(
-                    "PATH",
-                    format!(
-                        "{}:{}",
-                        d.display(),
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                );
+                crate::paths::prepend_bin_dir(&mut cmd, d);
             }
             // bibtex needs BIBINPUTS to find .bib files in the snapshot
-            cmd.env("BIBINPUTS", format!("{}:", snapshot_dir.display()));
+            cmd.env(
+                "BIBINPUTS",
+                format!(
+                    "{}{}",
+                    crate::paths::tex(snapshot_dir),
+                    crate::paths::SEARCH_SEP
+                ),
+            );
             let out = cmd.output().with_context(|| format!("running {tool}"))?;
             if !out.status.success() {
                 log::warn!("{tool} failed: {}", String::from_utf8_lossy(&out.stderr));
             }
             bib_ran = true;
         }
-        // an index (\makeindex, \index, \printindex): makeindex turns the pass's .idx into the
-        // .ind the next pass prints. A changed .ind changes the signature: another pass.
-        let idx = out_dir.join(format!("{jobname}.idx"));
-        if let Ok(entries) = std::fs::read(&idx) {
-            if !entries.is_empty() && indexed.as_deref() != Some(entries.as_slice()) {
-                let mut cmd = Command::new("makeindex");
-                cmd.current_dir(out_dir).arg("-q").arg(format!("{jobname}.idx"));
-                if let Some(d) = &tl.bin_dir {
-                    cmd.env(
-                        "PATH",
-                        format!("{}:{}", d.display(), std::env::var("PATH").unwrap_or_default()),
-                    );
-                }
-                // a style file (-s) in the project is found through INDEXSTYLE
-                cmd.env("INDEXSTYLE", format!("{}:", snapshot_dir.display()));
-                match cmd.output() {
-                    Ok(out) if !out.status.success() => {
-                        log::warn!("makeindex failed: {}", String::from_utf8_lossy(&out.stderr))
-                    }
-                    Err(e) => log::warn!("makeindex: {e}"),
-                    _ => {}
-                }
-                indexed = Some(entries);
-            }
-        }
+        run_makeindex(tl, snapshot_dir, out_dir, &jobname, &mut indexed);
         let sig_after = aux_signature(out_dir, &jobname);
         // a bibliography run that changed nothing (same .bbl) needs no extra pass: the .bbl is
         // part of the signature
@@ -394,6 +472,105 @@ pub fn run_pass_with_runner(
         bib_ran,
         aux_stable: stable,
     })
+}
+
+/// Index programs a document may ask for (imakeidx `program=`); anything else runs makeindex.
+const INDEX_PROGRAMS: &[&str] = &[
+    "makeindex",
+    "texindy",
+    "xindy",
+    "truexindy",
+    "upmendex",
+    "mendex",
+];
+
+/// The command for `idx` (a file name in the pass directory): the one the capture recorded
+/// from imakeidx (`<job>.rtex-idxcmd`: program, the document's options, the file), else
+/// `makeindex -q <idx>`.
+fn index_command(recorded: &str, idx: &str) -> (String, Vec<String>) {
+    for line in recorded.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let (Some(prog), Some(file)) = (words.first(), words.last()) else {
+            continue;
+        };
+        if *file == idx && words.len() >= 2 && INDEX_PROGRAMS.contains(prog) {
+            let mut args: Vec<String> = words[1..].iter().map(|w| w.to_string()).collect();
+            if *prog == "makeindex" && !args.iter().any(|a| a == "-q") {
+                args.insert(0, "-q".into());
+            }
+            return (prog.to_string(), args);
+        }
+    }
+    ("makeindex".into(), vec!["-q".into(), idx.into()])
+}
+
+/// Run the index program on every `.idx` a pass wrote (`\makeindex`, imakeidx's named indexes)
+/// whose entries differ from the ones last indexed in `indexed` (name → hash of the `.idx`), or
+/// whose `.ind` is missing, with the program and options imakeidx was given (`index_command`).
+/// The `.ind` files are part of the aux signature, so a changed index brings another pass. The
+/// index is built here rather than by the document (imakeidx's own call needs shell escape and
+/// cannot find an `.idx` in the output directory).
+fn run_makeindex(
+    tl: &TexLive,
+    snapshot_dir: &Path,
+    out_dir: &Path,
+    jobname: &str,
+    indexed: &mut BTreeMap<String, u64>,
+) {
+    use std::hash::{Hash, Hasher};
+    let Ok(dir) = std::fs::read_dir(out_dir) else {
+        return;
+    };
+    let recorded =
+        std::fs::read_to_string(out_dir.join(format!("{jobname}.rtex-idxcmd"))).unwrap_or_default();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "idx") {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        let hash = h.finish();
+        if indexed.get(&name) == Some(&hash) && path.with_extension("ind").exists() {
+            continue;
+        }
+        let (program, args) = index_command(&recorded, &name);
+        let mut cmd = Command::new(&program);
+        cmd.current_dir(out_dir).args(&args);
+        if let Some(d) = &tl.bin_dir {
+            crate::paths::prepend_bin_dir(&mut cmd, d);
+        }
+        // index styles (.ist) the project ships
+        cmd.env(
+            "INDEXSTYLE",
+            format!(
+                "{}{}",
+                crate::paths::tex(snapshot_dir),
+                crate::paths::SEARCH_SEP
+            ),
+        );
+        match cmd.output() {
+            Ok(out) if !out.status.success() => {
+                log::warn!(
+                    "{program} {name} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            }
+            Err(e) => log::warn!("running {program}: {e}"),
+            _ => {}
+        }
+        indexed.insert(name, hash);
+    }
 }
 
 pub fn snapshot_dir(build: &Path) -> PathBuf {
@@ -522,7 +699,7 @@ mod aux_tests {
 // ---------------------------------------------------------------------------------------------
 // Standby background engine: a lualatex that has loaded the preamble and waits for the body.
 // Engine start, format and preamble (packages, fonts) are ~75 % of a pass over a short
-// document (docs/BENCHMARKS.md), so a pass that only typesets the body is 3–4× faster.
+// document (docs/benchmarks.md), so a pass that only typesets the body is 3–4× faster.
 // ---------------------------------------------------------------------------------------------
 
 /// Snapshot layout for a standby pass: the project copied as for `write_snapshot`, the preamble
@@ -565,28 +742,37 @@ pub struct WarmEngine {
     pub spawned: std::time::Instant,
 }
 
+/// What a standby engine runs: the project and its sources, where the body snapshot goes and
+/// where the pass writes.
+#[derive(Clone, Copy)]
+pub struct StandbySpec<'a> {
+    pub tl: &'a TexLive,
+    pub project: &'a Path,
+    pub files: &'a BTreeMap<String, String>,
+    pub main: &'a str,
+    pub src_dir: &'a Path,
+    pub out_dir: &'a Path,
+    pub instrumented: bool,
+    pub unit_envs: &'a str,
+}
+
 impl WarmEngine {
     /// Start a standby: writes the body snapshot into `src_dir` and runs lualatex up to the end
     /// of the preamble, where it blocks on stdin (tex/rtex-bg.lua).
-    pub fn spawn(
-        tl: &TexLive,
-        project: &Path,
-        files: &BTreeMap<String, String>,
-        main: &str,
-        src_dir: &Path,
-        out_dir: &Path,
-        instrumented: bool,
-        unit_envs: &str,
-    ) -> Result<WarmEngine> {
-        let preamble_hash = write_body_snapshot(project, files, main, src_dir)?;
-        let (mut cmd, jobname, out_dir) = capture_command(
+    pub fn spawn(spec: StandbySpec) -> Result<WarmEngine> {
+        let StandbySpec {
             tl,
-            src_dir,
+            project,
+            files,
             main,
-            &out_dir.to_path_buf(),
+            src_dir,
+            out_dir,
             instrumented,
             unit_envs,
-        )?;
+        } = spec;
+        let preamble_hash = write_body_snapshot(project, files, main, src_dir)?;
+        let (mut cmd, jobname, out_dir) =
+            capture_command(tl, src_dir, main, out_dir, instrumented, unit_envs)?;
         let pkg = if instrumented {
             "\\RequirePackage{rtex-capture}"
         } else {
@@ -719,6 +905,89 @@ mod tests {
         assert!(!dir.join("snap/main.aux").exists());
         // a second snapshot (files already present) is fine too
         write_snapshot(&project, &files, &dir.join("snap")).unwrap();
+    }
+
+    #[test]
+    fn index_commands_follow_imakeidx() {
+        let rec = "makeindex -s mystyle.ist main.idx\ntexindy -L english -C utf8 names.idx\n";
+        assert_eq!(
+            index_command(rec, "main.idx"),
+            (
+                "makeindex".to_string(),
+                vec!["-q", "-s", "mystyle.ist", "main.idx"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(index_command(rec, "names.idx").0, "texindy");
+        assert_eq!(
+            index_command(rec, "names.idx").1.last().unwrap(),
+            "names.idx"
+        );
+        // no record (makeidx, or an index imakeidx never printed): plain makeindex
+        assert_eq!(
+            index_command(rec, "other.idx"),
+            (
+                "makeindex".to_string(),
+                vec!["-q".to_string(), "other.idx".to_string()]
+            )
+        );
+        // a program outside the list is not run
+        assert_eq!(index_command("rm -rf x.idx", "x.idx").0, "makeindex");
+    }
+
+    #[test]
+    fn signature_ignores_the_pass_directory() {
+        let dir = std::env::temp_dir().join(format!("rtex-sig-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, b) = (dir.join("pass-0"), dir.join("pass-1"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            let p = crate::paths::canonical(d).unwrap().join("main.ind");
+            let hex: String = p
+                .to_string_lossy()
+                .bytes()
+                .map(|x| format!("{x:02X}"))
+                .collect();
+            std::fs::write(
+                d.join("main.aux"),
+                format!(
+                    "\\BKM@entry{{srcfile={{{hex}}}}}\n\\@input{{{}}}\n",
+                    p.display()
+                ),
+            )
+            .unwrap();
+            std::fs::write(d.join("main.ind"), "\\begin{theindex}\\end{theindex}").unwrap();
+        }
+        assert_eq!(aux_signature(&a, "main"), aux_signature(&b, "main"));
+        std::fs::write(
+            b.join("main.ind"),
+            "\\begin{theindex}\\item x\\end{theindex}",
+        )
+        .unwrap();
+        assert_ne!(aux_signature(&a, "main"), aux_signature(&b, "main"));
+    }
+
+    #[test]
+    fn snapshot_keeps_input_pdfs_and_drops_built_ones() {
+        let dir = std::env::temp_dir().join(format!("rtex-snap-pdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("images")).unwrap();
+        std::fs::write(project.join("main.tex"), "x").unwrap();
+        std::fs::write(project.join("main.pdf"), "built").unwrap();
+        std::fs::write(project.join("figure.pdf"), "input").unwrap();
+        std::fs::write(project.join("images/plot.pdf"), "input").unwrap();
+        // a standalone figure: its source sits next to it but the document only reads the PDF
+        std::fs::write(project.join("images/fig.tex"), "standalone").unwrap();
+        std::fs::write(project.join("images/fig.pdf"), "input").unwrap();
+        let files = BTreeMap::from([("main.tex".to_string(), "x".to_string())]);
+        write_snapshot(&project, &files, &dir.join("snap")).unwrap();
+        assert!(dir.join("snap/images/fig.pdf").is_file());
+        assert!(!dir.join("snap/main.pdf").exists());
+        assert!(dir.join("snap/figure.pdf").is_file());
+        assert!(dir.join("snap/images/plot.pdf").is_file());
     }
 
     #[test]

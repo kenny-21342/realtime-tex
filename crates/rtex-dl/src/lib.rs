@@ -1,7 +1,7 @@
 //! Display-list model for rtex.
 //!
 //! The JSON form produced by `tex/rtex-dl.lua` is the provisional interchange format until the
-//! binary encoding is revision 1 (docs/DISPLAY_LIST.md). Coordinates are in scaled points (sp); y grows down.
+//! binary encoding is revision 1 (docs/display-list.md). Coordinates are in scaled points (sp); y grows down.
 
 pub mod binary;
 pub mod gfx;
@@ -149,10 +149,28 @@ impl Serialize for Item {
                 width,
                 height,
             } => json!(["r", x, y_top, width, height]),
-            Item::Color { stack, cmd, data, after: None } => json!(["c", stack, cmd, data]),
-            Item::Color { stack, cmd, data, after: Some(a) } => json!(["c", stack, cmd, data, a]),
-            Item::Literal { mode, data, at: None } => json!(["l", mode, data]),
-            Item::Literal { mode, data, at: Some((x, y)) } => json!(["l", mode, data, x, y]),
+            Item::Color {
+                stack,
+                cmd,
+                data,
+                after: None,
+            } => json!(["c", stack, cmd, data]),
+            Item::Color {
+                stack,
+                cmd,
+                data,
+                after: Some(a),
+            } => json!(["c", stack, cmd, data, a]),
+            Item::Literal {
+                mode,
+                data,
+                at: None,
+            } => json!(["l", mode, data]),
+            Item::Literal {
+                mode,
+                data,
+                at: Some((x, y)),
+            } => json!(["l", mode, data, x, y]),
             Item::Unsupported { kind, detail } => json!(["u", kind, detail]),
             Item::Math { on, x } => json!(["m", if *on { "on" } else { "off" }, x]),
             Item::Image {
@@ -380,7 +398,11 @@ pub struct DisplayList {
     /// are not the color package's initial black: LuaTeX carries its color stacks across pages,
     /// so a page that starts inside a color group pops entries pushed on an earlier one. Capture
     /// pages only; the native drawing starts from it.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "map_or_empty_array")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "map_or_empty_array"
+    )]
     pub color_base: BTreeMap<String, Vec<String>>,
     /// Pictures this page draws from the picture cache's stored drawings (their `cached_picture`
     /// items were replaced by the drawing): where each is, by its cache key. A host that copies
