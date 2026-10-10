@@ -82,11 +82,13 @@ fn copy_tree(src: &Path, dst: &Path, depth: usize) -> Result<()> {
         } else if !path.is_file() {
             continue;
         } else {
+            // build outputs a pass could read in place of its own (a stale .aux, .toc, .bbl):
+            // never copied. PDFs are inputs (\includegraphics, \includepdf) and are copied; an
+            // old output PDF of the document is harmless, LaTeX never reads one implicitly.
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if matches!(
                 ext,
-                "pdf"
-                    | "aux"
+                "aux"
                     | "log"
                     | "synctex.gz"
                     | "fls"
@@ -659,6 +661,8 @@ mod tests {
         std::fs::write(project.join("main.tex"), "x").unwrap();
         std::fs::write(project.join("a/b/file.txt"), "nested").unwrap();
         std::fs::write(project.join("a/top.bib"), "bib").unwrap();
+        std::fs::write(project.join("a/figure.pdf"), "%PDF-1.5").unwrap();
+        std::fs::write(project.join("main.aux"), "stale").unwrap();
         let mut files = BTreeMap::new();
         files.insert("main.tex".to_string(), "edited".to_string());
         write_snapshot(&project, &files, &dir.join("snap")).unwrap();
@@ -674,6 +678,12 @@ mod tests {
             std::fs::read_to_string(dir.join("snap/main.tex")).unwrap(),
             "edited"
         );
+        // PDF figures are inputs; build outputs such as a stale .aux are not
+        assert_eq!(
+            std::fs::read_to_string(dir.join("snap/a/figure.pdf")).unwrap(),
+            "%PDF-1.5"
+        );
+        assert!(!dir.join("snap/main.aux").exists());
         // a second snapshot (files already present) is fine too
         write_snapshot(&project, &files, &dir.join("snap")).unwrap();
     }
