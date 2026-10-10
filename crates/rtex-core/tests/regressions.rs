@@ -289,22 +289,27 @@ fn repeated_images_keep_their_files() {
     let mut cfg = SessionConfig::new(&project, "main.tex");
     cfg.build_dir = root.join("build");
     let s = Session::open(cfg).unwrap();
+    // the pages as the run leaves them: a provisional layout (a first pass over 2 s, when the
+    // machine is busy) may deliver them, and the converged one then changes none
     let deadline = Instant::now() + Duration::from_secs(120);
-    let mut files = vec![];
-    while files.is_empty() {
+    let mut pages = std::collections::BTreeMap::new();
+    let mut converged = false;
+    while !converged {
         assert!(Instant::now() < deadline, "no converged layout");
         for e in s.poll(Duration::from_millis(100)) {
             if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
-                if matches!(convergence, Convergence::Converged) {
-                    for p in pages_changed {
-                        let items = p.dl.other.iter().chain(p.dl.lines.iter().flat_map(|l| l.items.iter()));
-                        for it in items {
-                            if let rtex_dl::Item::Image { index, .. } = it {
-                                files.push(p.dl.images.get(&index.to_string()).map(|i| i.file.clone()));
-                            }
-                        }
-                    }
+                for p in pages_changed {
+                    pages.insert(p.page, p.dl);
                 }
+                converged |= matches!(convergence, Convergence::Converged);
+            }
+        }
+    }
+    let mut files = vec![];
+    for dl in pages.values() {
+        for it in dl.other.iter().chain(dl.lines.iter().flat_map(|l| l.items.iter())) {
+            if let rtex_dl::Item::Image { index, .. } = it {
+                files.push(dl.images.get(&index.to_string()).map(|i| i.file.clone()));
             }
         }
     }
