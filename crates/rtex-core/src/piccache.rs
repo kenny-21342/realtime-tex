@@ -60,6 +60,9 @@ pub struct RecordedPic {
     /// (An empty Lua table arrives as `[]`.)
     #[serde(default, deserialize_with = "rtex_dl::map_or_empty_array")]
     pub fonts: BTreeMap<String, rtex_dl::FontDesc>,
+    /// The tiling patterns its literals fill with (as declared, on the recording page).
+    #[serde(default, deserialize_with = "rtex_dl::map_or_empty_array")]
+    pub patterns: BTreeMap<String, rtex_dl::Pattern>,
 }
 
 /// What a cached picture draws, kept with its PDF region: the items of its display list
@@ -72,6 +75,38 @@ pub struct Fragment {
     pub fonts: BTreeMap<String, rtex_dl::FontDesc>,
     /// The picture's height above its baseline (sp).
     pub h: i64,
+    /// The tiling patterns its literals name, their matrices relative to the picture's origin
+    /// (PDF space, bp): the cached PDF region keeps its tiles where the recording page had
+    /// them, so they move with the picture.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub patterns: BTreeMap<String, rtex_dl::Pattern>,
+}
+
+/// The `/pgfpatN` names in a literal's operators.
+fn pattern_names(data: &str) -> impl Iterator<Item = &str> {
+    data.match_indices("/pgfpat").filter_map(move |(i, _)| {
+        let rest = &data[i + 1..];
+        let end = rest[6..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map_or(rest.len(), |k| k + 6);
+        (end > 6).then(|| &rest[..end])
+    })
+}
+
+/// `data` with every `/old` name token that is a key of `names` renamed.
+fn rename_patterns(data: &str, names: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(data.len());
+    let mut last = 0;
+    for name in pattern_names(data) {
+        let start = name.as_ptr() as usize - data.as_ptr() as usize;
+        if let Some(new) = names.get(name) {
+            out.push_str(&data[last..start]);
+            out.push_str(new);
+            last = start + name.len();
+        }
+    }
+    out.push_str(&data[last..]);
+    out
 }
 
 impl Fragment {
@@ -79,15 +114,32 @@ impl Fragment {
     /// math markers and recorded shadings.
     fn from_recorded(r: &RecordedPic) -> Option<Fragment> {
         let items = r.items.as_ref()?;
+        let mut patterns = BTreeMap::new();
+        let (ox, oy) = (
+            r.x as f64 / rtex_dl::SP_PER_BP,
+            (r.page_height - r.y) as f64 / rtex_dl::SP_PER_BP,
+        );
         let ok = items.iter().all(|i| match i {
             rtex_dl::Item::Unsupported { kind, .. } => kind == "shading",
             rtex_dl::Item::Image { .. } => false,
+            // every pattern it fills with is known
+            rtex_dl::Item::Literal { data, .. } => pattern_names(data).all(|n| {
+                let Some(p) = r.patterns.get(n) else {
+                    return false;
+                };
+                let mut p = p.clone();
+                p.matrix[4] -= ox;
+                p.matrix[5] -= oy;
+                patterns.insert(n.to_string(), p);
+                true
+            }),
             _ => true,
         });
         ok.then(|| Fragment {
             items: items.clone(),
             fonts: r.fonts.clone(),
             h: r.h,
+            patterns,
         })
     }
 }
@@ -937,6 +989,7 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
     let mut glyphs = 0;
     let mut fonts = dl.fonts.clone();
     let mut spots: Vec<rtex_dl::PictureSpot> = Vec::new();
+    let mut patterns: BTreeMap<String, rtex_dl::Pattern> = BTreeMap::new();
     let mut next_id = fonts
         .keys()
         .filter_map(|k| k.parse::<i64>().ok())
@@ -979,6 +1032,23 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
                         width: w,
                         height: h,
                     });
+                }
+            }
+            // its patterns, under names of their own on this page, at the picture's place
+            let mut names: BTreeMap<String, String> = BTreeMap::new();
+            if !frag.patterns.is_empty() {
+                let page_h = dl.page_height.unwrap_or(0) as f64;
+                let (px, py) = (
+                    ox as f64 / rtex_dl::SP_PER_BP,
+                    (page_h - oy as f64) / rtex_dl::SP_PER_BP,
+                );
+                for (n, p) in &frag.patterns {
+                    let new = format!("{n}c{replaced}");
+                    let mut p = p.clone();
+                    p.matrix[4] += px;
+                    p.matrix[5] += py;
+                    patterns.insert(new.clone(), p);
+                    names.insert(n.clone(), new);
                 }
             }
             // the fragment's font ids are the recording pass's: map them onto this page's
@@ -1035,7 +1105,11 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
                         *added_flags.entry("literal".into()).or_default() += 1;
                         Item::Literal {
                             mode,
-                            data,
+                            data: if names.is_empty() {
+                                data
+                            } else {
+                                rename_patterns(&data, &names)
+                            },
                             at: at.map(|(x, y)| (x + ox, y + oy)),
                         }
                     }
@@ -1082,6 +1156,7 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
         return 0;
     }
     dl.fonts = fonts;
+    dl.patterns.extend(patterns);
     dl.glyphs += glyphs;
     dl.pictures.extend(spots);
     let mut flags = dl.flags_map();
@@ -1254,6 +1329,95 @@ mod tests {
     }
 
     #[test]
+    fn pattern_names_are_found_and_renamed_as_whole_tokens() {
+        let d = "/pgfprgb cs 1 0 0 /pgfpat1 scn /pgfpat12 scn /pgfpatx";
+        assert_eq!(
+            pattern_names(d).collect::<Vec<_>>(),
+            ["pgfpat1", "pgfpat12"]
+        );
+        let names = BTreeMap::from([("pgfpat1".to_string(), "pgfpat1c0".to_string())]);
+        assert_eq!(
+            rename_patterns(d, &names),
+            "/pgfprgb cs 1 0 0 /pgfpat1c0 scn /pgfpat12 scn /pgfpatx"
+        );
+    }
+
+    #[test]
+    fn cached_pictures_keep_their_patterns_where_their_tiles_were() {
+        use rtex_dl::{DisplayList, Item, Line, Pattern, SP_PER_BP};
+        let k = SP_PER_BP;
+        let pat = Pattern {
+            paint_type: 2,
+            bbox: [0.0, 0.0, 3.0, 3.0],
+            xstep: 3.0,
+            ystep: 3.0,
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            content: "0 0 m 3 3 l S".into(),
+        };
+        let lit = |name: &str| Item::Literal {
+            mode: 0,
+            data: format!("/pgfprgb cs 0 0 1 /{name} scn 0 0 5 5 re f"),
+            at: Some((0, 0)),
+        };
+        // recorded at (100 bp, baseline 300 bp from the top) of a 800 bp page
+        let rec = |patterns: BTreeMap<String, Pattern>| RecordedPic {
+            page: 1,
+            x: (100.0 * k) as i64,
+            y: (300.0 * k) as i64,
+            w: 1000,
+            h: 2000,
+            d: 0,
+            page_height: (800.0 * k) as i64,
+            items: Some(vec![lit("pgfpat3")]),
+            patterns,
+            ..Default::default()
+        };
+        // a picture whose pattern was not recorded has no drawing to give back
+        assert!(Fragment::from_recorded(&rec(BTreeMap::new())).is_none());
+        let frag =
+            Fragment::from_recorded(&rec(BTreeMap::from([("pgfpat3".to_string(), pat)]))).unwrap();
+        let rel = &frag.patterns["pgfpat3"];
+        assert!((rel.matrix[4] + 100.0).abs() < 1e-3 && (rel.matrix[5] + 500.0).abs() < 1e-3);
+        // put back 10 bp lower on a page that has its own pgfpat3
+        let mut dl = DisplayList {
+            kind: "page".into(),
+            page_height: Some((800.0 * k) as i64),
+            lines: vec![Line {
+                items: vec![
+                    lit("pgfpat3"),
+                    Item::Unsupported {
+                        kind: "cached_picture".into(),
+                        detail: serde_json::Value::String(format!(
+                            "5 {} {} 1000 2000 main.tex:3",
+                            (100.0 * k) as i64,
+                            (310.0 * k) as i64 - 2000
+                        )),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        dl.patterns.insert("pgfpat3".into(), Pattern::default());
+        let fragments = BTreeMap::from([("main.tex:3".to_string(), frag)]);
+        assert_eq!(substitute(&mut dl, &fragments), 1);
+        assert_eq!(dl.lines[0].items[0], lit("pgfpat3"));
+        assert_eq!(dl.lines[0].items[1], {
+            let Item::Literal { data, .. } = lit("pgfpat3c0") else {
+                unreachable!()
+            };
+            Item::Literal {
+                mode: 0,
+                data,
+                at: Some(((100.0 * k) as i64, (310.0 * k) as i64)),
+            }
+        });
+        let moved = &dl.patterns["pgfpat3c0"];
+        assert!((moved.matrix[4]).abs() < 1e-3 && (moved.matrix[5] + 10.0).abs() < 1e-3);
+        assert_eq!(dl.patterns["pgfpat3"], Pattern::default());
+    }
+
+    #[test]
     fn substitute_puts_a_cached_picture_back_and_says_where() {
         use rtex_dl::{DisplayList, FontDesc, Item, Line};
         let font = FontDesc {
@@ -1283,6 +1447,7 @@ mod tests {
             ],
             fonts: frag_fonts,
             h: 3000,
+            patterns: BTreeMap::new(),
         };
         let mut fragments = BTreeMap::new();
         fragments.insert("main.tex:12".to_string(), frag);

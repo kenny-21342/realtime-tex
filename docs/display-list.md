@@ -131,6 +131,12 @@ Records, until END: u8 tag, u32 payload_length, payload
   0x2A ROTATE      i32 degrees                        the page's /Rotate; absent when 0
   0x2B COLOR_BASE  str stack, u16 n, n × str          a colour stack's entries when the page
                                                       starts, bottom first
+  0x2C PATTERN     str name, u8 paint_type, 4 × f64 bbox, f64 xstep, f64 ystep, 6 × f64 matrix,
+                   u32 n, n bytes content
+                   a tiling pattern the page's literals fill with (pgf's patterns library,
+                   `/pgfpatN scn`), as pgf declares it: paint type 1 coloured, 2 uncoloured;
+                   bbox, steps and content in pattern space; the matrix maps pattern space to
+                   the page's default space (bp, origin bottom-left)
   0xFF END
 ```
 
@@ -143,7 +149,8 @@ A page whose flags are only `literal` and `shading` can be drawn without its PDF
 `rtex_dl::gfx::native_graphics(&dl)` replays the page's literals, colour stack operations,
 MATRIX records and shading forms the way LuaTeX writes them into the PDF and returns a
 `NativePage`, or the first thing it does not understand (`Unsupported`: text or XObjects in
-literals, tiling patterns, soft masks, literal modes other than 0/1, `\special`, `box_resource`).
+literals, stroking with a pattern, soft masks, literal modes other than 0/1, `\special`,
+`box_resource`).
 It never returns a partial drawing. `LayoutUpdate.pages_changed[].native` carries it for every
 degraded page it resolves (absent otherwise); the page stays `exact: false`, so a host that does
 not draw natively keeps using the PDF.
@@ -166,6 +173,15 @@ not draw natively keeps using the PDF.
   with its PDF region, and a page list puts them back in place of the `cached_picture` item, so a
   layout is drawn natively whether its pictures were typeset or cached. The page lists each such
   picture in `pictures` (PICTURE records: key and rectangle).
+- Tiling patterns (pgf's `patterns` and `patterns.meta` libraries): a `Paint` whose fill is a
+  pattern names it (`pattern`), its `fill` giving the tint of an uncoloured pattern and the
+  opacity. `patterns` maps each name to its cell: `ops` (their `ctm` maps to pattern space),
+  `bbox`, `xstep`, `ystep`, `matrix` (pattern space to the list's frame) and `colored`. Fill the
+  path with the cell drawn at every `(i·xstep, j·ystep)`, clipped to `bbox`; an uncoloured cell
+  is painted entirely in the tint. Tiles are anchored to the page (pattern space is the page's
+  default space), not to the shape. The page list carries the declarations it needs
+  (`patterns`, PATTERN records), and so do cached pictures, moved with the picture, as their
+  PDF region keeps its tiles.
 - `transforms` lists glyphs, rules and images that a transformed pgf scope (rotated or scaled
   node text, axis labels) moves away from their list position: draw them with that map (list
   coordinates to list coordinates) instead of their MATRIX records.

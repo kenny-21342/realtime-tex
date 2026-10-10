@@ -274,6 +274,29 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                 }
                 dl.color_base.insert(stack, entries);
             }
+            0x2C => {
+                let name = p.str().map_err(malformed)?;
+                let paint_type = p.u8().map_err(malformed)?;
+                let mut f = [0.0; 12];
+                for v in f.iter_mut() {
+                    *v = p.f64().map_err(malformed)?;
+                }
+                let n = p.u32().map_err(malformed)? as usize;
+                let content = std::str::from_utf8(p.bytes(n).map_err(malformed)?)
+                    .map_err(|_| BinError::Utf8)?
+                    .to_string();
+                dl.patterns.insert(
+                    name,
+                    crate::Pattern {
+                        paint_type,
+                        bbox: [f[0], f[1], f[2], f[3]],
+                        xstep: f[4],
+                        ystep: f[5],
+                        matrix: [f[6], f[7], f[8], f[9], f[10], f[11]],
+                        content,
+                    },
+                );
+            }
             0x29 => {
                 let key = p.str().map_err(malformed)?;
                 dl.pictures.push(crate::PictureSpot {
@@ -645,6 +668,22 @@ pub fn encode(dl: &DisplayList) -> Vec<u8> {
         }
         body.rec(0x2B, &p.0);
     }
+    for (name, pat) in &dl.patterns {
+        let mut p = Writer(Vec::new());
+        p.str(name);
+        p.u8(pat.paint_type);
+        for v in pat
+            .bbox
+            .iter()
+            .chain([pat.xstep, pat.ystep].iter())
+            .chain(pat.matrix.iter())
+        {
+            p.f64(*v);
+        }
+        p.u32(pat.content.len() as u32);
+        p.0.extend_from_slice(pat.content.as_bytes());
+        body.rec(0x2C, &p.0);
+    }
     for pic in &dl.pictures {
         let mut p = Writer(Vec::new());
         p.str(&pic.key);
@@ -846,6 +885,17 @@ mod tests {
             color_base: BTreeMap::from([(
                 "0".to_string(),
                 vec!["0 g 0 G".to_string(), "0 0 1 rg 0 0 1 RG".to_string()],
+            )]),
+            patterns: BTreeMap::from([(
+                "pgfpat1".to_string(),
+                crate::Pattern {
+                    paint_type: 2,
+                    bbox: [-0.5, -0.5, 3.5, 3.5],
+                    xstep: 3.0,
+                    ystep: 3.0,
+                    matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    content: "q 0 0 m 3 3 l S Q".into(),
+                },
             )]),
             glyphs: 3,
             width: 5000,

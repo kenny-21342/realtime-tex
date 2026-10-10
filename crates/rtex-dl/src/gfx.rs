@@ -20,9 +20,12 @@
 //!
 //! Understood operators: path construction (`m l c v y h re`), painting (`S s f F f* B B* b b*
 //! n`), clipping (`W W*`), state (`q Q cm w J j M d`), device colors (`g G rg RG k K`, `cs CS sc
-//! SC scn SCN` in DeviceGray/RGB/CMYK), pgf's opacity states (`/pgf@ca<v> gs`, `/pgf@CA<v> gs`)
-//! and pdf_colorstack operations. Anything else (text in literals, XObjects, shadings, patterns,
-//! other graphics states, literal modes other than origin/page, \special) is an error.
+//! SC scn SCN` in DeviceGray/RGB/CMYK), pgf's opacity states (`/pgf@ca<v> gs`, `/pgf@CA<v> gs`),
+//! pdf_colorstack operations, and fills with pgf's tiling patterns (`/Pattern cs /pgfpatN scn`,
+//! `/pgfprgb cs r g b /pgfpatN scn`) declared in the display list's `patterns`: each pattern's
+//! cell is interpreted once into [`NativePage::patterns`]. Anything else (text in literals,
+//! XObjects, stroking with a pattern, other graphics states, literal modes other than
+//! origin/page, \special) is an error.
 
 use crate::{DisplayList, Item, Line, Sp, SP_PER_BP};
 use serde::Serialize;
@@ -166,7 +169,8 @@ pub enum GfxOp {
         stops: Vec<(f64, Color)>,
         alpha: f64,
     },
-    /// Fill and/or stroke a path (fill first).
+    /// Fill and/or stroke a path (fill first). `pattern`: the fill is a tiling pattern (a cell
+    /// of [`NativePage::patterns`]); `fill` is then its tint (uncoloured patterns) and opacity.
     Paint {
         at: ItemRef,
         ctm: Matrix,
@@ -174,7 +178,23 @@ pub enum GfxOp {
         fill: Option<Color>,
         even_odd: bool,
         stroke: Option<Stroke>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
     },
+}
+
+/// A tiling pattern's cell as drawing operations: `ops` (their `ctm` maps to pattern space) are
+/// drawn clipped to `bbox` at every `(i xstep, j ystep)` offset, and `matrix` maps pattern space
+/// to page coordinates (sp, y down). An uncoloured cell (`colored: false`) is painted in the tint
+/// of the fill that uses it, whatever colors its ops have.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PatternCell {
+    pub colored: bool,
+    pub bbox: [f64; 4],
+    pub xstep: f64,
+    pub ystep: f64,
+    pub matrix: Matrix,
+    pub ops: Vec<GfxOp>,
 }
 
 /// A page's literals as drawing operations.
@@ -185,6 +205,9 @@ pub struct NativePage {
     /// display-list position: draw them with this map (display-list coordinates to display-list
     /// coordinates) instead of their MATRIX records.
     pub transforms: Vec<(ItemRef, Matrix)>,
+    /// The tiling patterns `Paint` ops fill with, by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub patterns: BTreeMap<String, PatternCell>,
 }
 
 /// Why a page cannot be drawn natively.
@@ -227,6 +250,10 @@ struct GState {
     /// Color spaces set by `cs`/`CS`: components expected by `sc`/`scn`.
     fill_space: usize,
     stroke_space: usize,
+    /// The fill color space is a pattern space (`/Pattern`, or pgf's `/pgfprgb`: uncoloured
+    /// patterns with an RGB tint): `scn` takes the tint and a pattern name.
+    fill_pattern_space: bool,
+    fill_pattern: Option<String>,
 }
 
 impl Default for GState {
@@ -243,6 +270,8 @@ impl Default for GState {
             dash_phase: 0.0,
             fill_space: 1,
             stroke_space: 1,
+            fill_pattern_space: false,
+            fill_pattern: None,
         }
     }
 }
@@ -336,6 +365,12 @@ struct Interp {
     colors: ColorStacks,
     /// q/Q depth of the current row: a row may not restore what it did not save.
     depth: usize,
+    /// Maps PDF space to the output: the display list's frame for a page, the identity for a
+    /// pattern cell.
+    out: Matrix,
+    /// Declared patterns (the page's) and the cells made of those used so far.
+    declared: BTreeMap<String, crate::Pattern>,
+    cells: BTreeMap<String, PatternCell>,
 }
 
 /// From PDF space (bp, y up, origin bottom-left) to display-list space (sp, y down).
@@ -375,7 +410,66 @@ impl Interp {
     }
 
     fn dl_ctm(&self) -> Matrix {
-        concat(&self.gs.ctm, &pdf_to_dl(self.page_h))
+        concat(&self.gs.ctm, &self.out)
+    }
+
+    fn new(page_h: f64, out: Matrix) -> Interp {
+        Interp {
+            page_h,
+            gs: GState::default(),
+            stack: Vec::new(),
+            pos: (0.0, 0.0),
+            path: Vec::new(),
+            clip: None,
+            ops: Vec::new(),
+            transforms: Vec::new(),
+            colors: ColorStacks {
+                stacks: BTreeMap::new(),
+            },
+            depth: 0,
+            out,
+            declared: BTreeMap::new(),
+            cells: BTreeMap::new(),
+        }
+    }
+
+    /// The cell of a declared pattern, interpreted once (its operators in pattern space).
+    fn use_pattern(&mut self, name: &str) -> Result<(), String> {
+        if self.cells.contains_key(name) {
+            return Ok(());
+        }
+        let p = self
+            .declared
+            .get(name)
+            .ok_or_else(|| format!("pattern /{name} not declared"))?;
+        let colored = match p.paint_type {
+            1 => true,
+            2 => false,
+            t => return Err(format!("pattern paint type {t}")),
+        };
+        if p.xstep == 0.0 || p.ystep == 0.0 {
+            return Err(format!("pattern /{name} with a zero step"));
+        }
+        let mut cell = Interp::new(self.page_h, IDENTITY);
+        let at = ItemRef {
+            line: None,
+            item: 0,
+        };
+        cell.run(&p.content, at, false)
+            .map_err(|e| format!("pattern /{name}: {e}"))?;
+        if !cell.path.is_empty() || cell.clip.is_some() || cell.depth != 0 {
+            return Err(format!("pattern /{name}: unbalanced cell"));
+        }
+        let pc = PatternCell {
+            colored,
+            bbox: p.bbox,
+            xstep: p.xstep,
+            ystep: p.ystep,
+            matrix: concat(&p.matrix, &self.out),
+            ops: cell.ops,
+        };
+        self.cells.insert(name.to_string(), pc);
+        Ok(())
     }
 
     fn set_color(fill: bool, gs: &mut GState, comps: &[f64]) -> Result<(), String> {
@@ -384,6 +478,10 @@ impl Interp {
         }
         let slot = if fill { &mut gs.fill } else { &mut gs.stroke };
         slot.comps = comps.to_vec();
+        if fill {
+            gs.fill_pattern_space = false;
+            gs.fill_pattern = None;
+        }
         Ok(())
     }
 
@@ -495,8 +593,17 @@ impl Interp {
                     let even_odd = op.ends_with('*');
                     let path = std::mem::take(&mut self.path);
                     let ctm = self.dl_ctm();
+                    let pattern = if fill && !path.is_empty() {
+                        self.gs.fill_pattern.clone()
+                    } else {
+                        None
+                    };
+                    if let Some(p) = &pattern {
+                        self.use_pattern(p)?;
+                    }
                     if (fill || stroke) && !path.is_empty() {
                         self.ops.push(GfxOp::Paint {
+                            pattern,
                             at,
                             ctm,
                             path: path.clone(),
@@ -603,6 +710,18 @@ impl Interp {
                         self.gs.stroke_space = n;
                     }
                 }
+                "cs" if matches!(args.as_slice(), [Tok::Name(s)] if s == "Pattern" || s == "pgfprgb") =>
+                {
+                    // pgf's patterns: /Pattern (coloured), /pgfprgb = [/Pattern /DeviceRGB]
+                    let rgb = matches!(args.as_slice(), [Tok::Name(s)] if s == "pgfprgb");
+                    Self::set_color(
+                        true,
+                        &mut self.gs,
+                        if rgb { &[0.0, 0.0, 0.0] } else { &[0.0] },
+                    )?;
+                    self.gs.fill_space = if rgb { 3 } else { 0 };
+                    self.gs.fill_pattern_space = true;
+                }
                 "cs" | "CS" => {
                     let n = match args.as_slice() {
                         [Tok::Name(s)] if s == "DeviceGray" => 1,
@@ -624,8 +743,22 @@ impl Interp {
                         self.gs.stroke_space = n;
                     }
                 }
+                "scn" if self.gs.fill_pattern_space => {
+                    let n = self.gs.fill_space;
+                    let name = match args.last() {
+                        Some(Tok::Name(p)) if nums.len() == n && args.len() == n + 1 => p.clone(),
+                        _ => return Err(format!("operator {op} with operands {args:?}")),
+                    };
+                    if n > 0 {
+                        self.gs.fill.comps = nums.clone();
+                    }
+                    self.gs.fill_pattern = Some(name);
+                }
                 "sc" | "SC" | "scn" | "SCN" => {
                     let fill = op.starts_with('s');
+                    if fill && self.gs.fill_pattern_space {
+                        return Err(format!("{op} in a pattern color space"));
+                    }
                     let n = if fill {
                         self.gs.fill_space
                     } else {
@@ -978,24 +1111,13 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
         what: "no page height".into(),
     })? as f64
         / SP_PER_BP;
-    let mut it = Interp {
-        page_h,
-        gs: GState::default(),
-        stack: Vec::new(),
-        pos: (0.0, 0.0),
-        path: Vec::new(),
-        clip: None,
-        ops: Vec::new(),
-        transforms: Vec::new(),
-        colors: ColorStacks {
-            stacks: dl
-                .color_base
-                .iter()
-                .filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.clone())))
-                .collect(),
-        },
-        depth: 0,
-    };
+    let mut it = Interp::new(page_h, pdf_to_dl(page_h));
+    it.colors.stacks = dl
+        .color_base
+        .iter()
+        .filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.clone())))
+        .collect();
+    it.declared = dl.patterns.clone();
     // `other` comes first in the page's content, then the rows in order
     let rows: Vec<(Option<usize>, &[Item])> = std::iter::once((None, dl.other.as_slice()))
         .chain(
@@ -1088,6 +1210,7 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
     Ok(NativePage {
         ops: it.ops,
         transforms: it.transforms,
+        patterns: it.cells,
     })
 }
 
@@ -1232,7 +1355,9 @@ mod tests {
             "/Fm0 Do",
             "BT /F1 10 Tf (a) Tj ET",
             "/GS0 gs",
-            "/Pattern cs /P0 scn",
+            "/Pattern cs /P0 scn 0 0 1 1 re f",
+            "/pgfprgb cs 1 0 0 scn",
+            "/Pattern CS /P0 SCN",
             "q",
         ] {
             let p = page(vec![lit(bad, x, y)]);
@@ -1328,5 +1453,72 @@ mod tests {
         );
         assert_eq!(s.dash, vec![3.0, 1.0]);
         assert!(matches!(n.ops[3], GfxOp::Restore { .. }));
+    }
+
+    fn pattern(paint_type: u8, content: &str) -> crate::Pattern {
+        crate::Pattern {
+            paint_type,
+            bbox: [-1.0, -1.0, 4.0, 4.0],
+            xstep: 3.0,
+            ystep: 3.0,
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn uncoloured_pattern_fill_names_its_cell_and_tint() {
+        let mut p = page(vec![lit(
+            "/pgfprgb cs 1 0 0 /pgfpat1 scn 0 0 10 10 re f 0 g 0 0 1 1 re f",
+            1000,
+            1000,
+        )]);
+        p.patterns
+            .insert("pgfpat1".into(), pattern(2, "0 0 m 3 3 l S"));
+        let n = native_graphics(&p).unwrap();
+        let paints: Vec<_> = n
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                GfxOp::Paint { fill, pattern, .. } => Some((fill.clone(), pattern.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paints.len(), 2);
+        assert_eq!(paints[0].0.as_ref().unwrap().comps, vec![1.0, 0.0, 0.0]);
+        assert_eq!(paints[0].1.as_deref(), Some("pgfpat1"));
+        // a device color ends the pattern
+        assert_eq!(paints[1].1, None);
+        let cell = &n.patterns["pgfpat1"];
+        assert!(!cell.colored);
+        assert_eq!(cell.ops.len(), 1);
+        // pattern space is the page's default space: its origin is the page's bottom-left
+        let (_, y0) = apply(&cell.matrix, 0.0, 0.0);
+        assert!((y0 - p.page_height.unwrap() as f64).abs() < 1e-6);
+        let GfxOp::Paint { ctm, stroke, .. } = &cell.ops[0] else {
+            panic!()
+        };
+        assert!(is_identity(ctm) && stroke.is_some());
+    }
+
+    #[test]
+    fn coloured_patterns_and_bad_cells() {
+        let mut p = page(vec![lit(
+            "/Pattern cs /pgfpat2 scn 0 0 5 5 re f",
+            1000,
+            1000,
+        )]);
+        p.patterns
+            .insert("pgfpat2".into(), pattern(1, "1 0 0 rg 0 0 1 1 re f"));
+        let n = native_graphics(&p).unwrap();
+        assert!(n.patterns["pgfpat2"].colored);
+        for bad in [
+            "BT ET",
+            "q 0 0 m",
+            "/pgfprgb cs 0 0 0 /pgfpat2 scn 0 0 1 1 re f",
+        ] {
+            p.patterns.insert("pgfpat2".into(), pattern(1, bad));
+            assert!(native_graphics(&p).is_err(), "{bad}");
+        }
     }
 }

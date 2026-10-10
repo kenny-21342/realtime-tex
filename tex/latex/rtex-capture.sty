@@ -84,6 +84,26 @@
   \fi\fi}
 \AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfshadings}
 \AddToHook{begindocument/before}{\rtex@hookpgfshadings}
+% pgf's tiling patterns (the patterns library): record each pattern pgfsys-luatex.def writes, as
+% it writes it (rtex_capture.pattern). The bbox and steps are in \pgf@xa..\pgf@yc, the matrix's
+% translation is computed as the driver computes it, and the cell is the protocolled code.
+\def\rtex@patterninfo#1#2#3#4#5#6#7#8#9{{%
+  \pgfutil@tempdima=#6\relax \pgfutil@tempdimb=#7\relax
+  \pgf@sys@bp@correct\pgfutil@tempdima \pgf@sys@bp@correct\pgfutil@tempdimb
+  \directlua{rtex_capture.pattern("\luaescapestring{#1}", \ifnum#9=0 2\else 1\fi,
+    "\pgf@sys@tonumber\pgf@xa\space\pgf@sys@tonumber\pgf@ya\space\pgf@sys@tonumber\pgf@xb\space\pgf@sys@tonumber\pgf@yb",
+    "\pgf@sys@tonumber\pgf@xc\space\pgf@sys@tonumber\pgf@yc",
+    "\luaescapestring{#2 #3 #4 #5} \pgf@sys@tonumber\pgfutil@tempdima\space\pgf@sys@tonumber\pgfutil@tempdimb",
+    "\luaescapestring{#8}")}}}
+\def\rtex@hookpgfpatterns{%
+  \ifdefined\rtex@pgf@declarepattern\else\ifdefined\pgfsys@@declarepattern
+    \let\rtex@pgf@declarepattern\pgfsys@@declarepattern
+    \def\pgfsys@@declarepattern##1##2##3##4##5##6##7##8##9{%
+      \rtex@pgf@declarepattern{##1}{##2}{##3}{##4}{##5}{##6}{##7}{##8}{##9}%
+      \rtex@patterninfo{##1}{##2}{##3}{##4}{##5}{##6}{##7}{##8}{##9}}%
+  \fi\fi}
+\AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfpatterns}
+\AddToHook{begindocument/before}{\rtex@hookpgfpatterns}
 % imakeidx: record the index commands instead of running them (rtex-capture.lua, index_command)
 \AddToHook{package/imakeidx/after}{%
   \def\imki@exec#1{\directlua{rtex_capture.index_command("\luaescapestring{#1}")}}%

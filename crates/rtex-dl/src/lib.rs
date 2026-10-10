@@ -409,6 +409,29 @@ pub struct DisplayList {
     /// a cached picture into a live unit takes its pixels from here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pictures: Vec<PictureSpot>,
+    /// The tiling patterns this page's literals paint with (pgf's `patterns` library: `/pgfpatN
+    /// scn`), by resource name; capture pages only. Native drawing needs their cells.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "map_or_empty_array"
+    )]
+    pub patterns: BTreeMap<String, Pattern>,
+}
+
+/// A PDF tiling pattern (PatternType 1) as pgf declares it: the cell's content stream and its
+/// geometry, in pattern space (bp). `matrix` maps pattern space to the page's default space
+/// (bottom-left origin), so tiles are anchored to the page, not to the shape they fill.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Pattern {
+    /// 1: the cell carries its own colours; 2: uncoloured, painted in the tint `scn` gives.
+    pub paint_type: u8,
+    pub bbox: [f64; 4],
+    pub xstep: f64,
+    pub ystep: f64,
+    pub matrix: [f64; 6],
+    /// The cell's PDF operators.
+    pub content: String,
 }
 
 /// A picture on a page (sp, the list's frame) and its picture-cache key (`file:line`).

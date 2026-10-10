@@ -608,13 +608,19 @@ function C.shipout(b)
     -- lines or pages is not recorded (never cached)
     if k and not pc.multi and not C.pics[k.key] and not C.pic_bad[k.key] then
       C.pics[k.key] = { env = k.env, page = C.page, x = pc.x, y = pc.y, w = pc.w, h = pc.h, d = pc.d,
-                        page_height = page.page_height, state = k.state, items = pc.items, fonts = pc.fonts }
+                        page_height = page.page_height, state = k.state, items = pc.items, fonts = pc.fonts,
+                        patterns = C.patterns_of({ pc.items }) }
     elseif k and (pc.multi or C.pics[k.key]) then
       C.pics[k.key] = nil
       C.pic_bad[k.key] = true
     end
   end
   page.pics = nil
+  do
+    local lists = { page.other }
+    for _, line in ipairs(page.lines) do lists[#lists + 1] = line.items end
+    page.patterns = C.patterns_of(lists)
+  end
   if next(C.images) then page.images_info = C.images end
   C.pages[#C.pages + 1] = page
   for _, line in ipairs(page.lines) do
@@ -693,6 +699,38 @@ dl.shadings = C.shadings
 function C.shading(idx, kind, space, domain, coords, func, extend)
   C.shadings[idx] = json.encode({ kind = kind, space = space, domain = domain, coords = coords, ["function"] = func, extend = extend })
 end
+-- pgf's tiling patterns (rtex-capture.sty): resource name -> the pattern as pgf declares it
+-- (rtex_dl::Pattern). A pattern is declared once, where it is first used; pages and recorded
+-- pictures carry the ones their literals name.
+C.patterns = {}
+local function nums(s)
+  local t = {}
+  for v in tostring(s):gmatch("%S+") do t[#t + 1] = tonumber(v) or 0 end
+  return t
+end
+function C.pattern(name, paint_type, bbox, steps, matrix, content)
+  local st = nums(steps)
+  C.patterns["pgfpat" .. name] = { paint_type = paint_type, bbox = nums(bbox), xstep = st[1] or 0,
+                                   ystep = st[2] or 0, matrix = nums(matrix), content = content }
+end
+-- The declared patterns the literals of `items` (display-list items) name, or nil.
+local function patterns_of(lists, into)
+  if not next(C.patterns) then return into end
+  for _, items in ipairs(lists) do
+    for _, it in ipairs(items or {}) do
+      if it[1] == "l" and type(it[3]) == "string" then
+        for n in it[3]:gmatch("/(pgfpat%d+)") do
+          if C.patterns[n] then
+            into = into or {}
+            into[n] = C.patterns[n]
+          end
+        end
+      end
+    end
+  end
+  return into
+end
+C.patterns_of = patterns_of
 function C.literal(data)
   local n = node.new("whatsit", literal_subtype)
   n.mode = 0
