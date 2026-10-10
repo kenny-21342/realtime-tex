@@ -223,13 +223,16 @@ impl PicCache {
     /// After a pass: remember every current picture the pass drew (its page of `pass_pdf`,
     /// extracted into the cache), forget the pictures the pass reported as mismatched
     /// (`stale_keys`: a cached body that did not end where the source scan said), evict what
-    /// no picture wanted for a while, drop PDFs nothing references. Returns the number of new
-    /// entries.
+    /// no picture wanted for a while, drop PDFs nothing references. A picture with an error
+    /// between its `\begin` and `\end` lines (`errors`: the pass's `(file, line)` error
+    /// locations) is not cached: taken from the cache it would no longer be compiled, and the
+    /// error would vanish from the next pass. Returns the number of new entries.
     pub fn absorb(
         &mut self,
         pics: &[PictureRef],
         recorded: &BTreeMap<String, RecordedPic>,
         stale_keys: &[String],
+        errors: &[(String, i64)],
         pass_pdf: &Path,
     ) -> Result<usize> {
         let serial = self.index.serial;
@@ -243,9 +246,21 @@ impl PicCache {
             self.index.bad.insert(k.clone(), serial + KEEP_PASSES);
         }
         let mut new: Vec<(&PictureRef, &RecordedPic)> = Vec::new();
+        let has_error = |p: &PictureRef| {
+            let Some((file, line)) = p.key.rsplit_once(':') else {
+                return false;
+            };
+            let Ok(begin) = line.parse::<i64>() else {
+                return false;
+            };
+            errors.iter().any(|(f, l)| {
+                f.trim_start_matches("./") == file.trim_start_matches("./")
+                    && (begin..=p.end_line as i64).contains(l)
+            })
+        };
         for p in pics
             .iter()
-            .filter(|p| p.cacheable && !self.index.bad.contains_key(&p.key))
+            .filter(|p| p.cacheable && !self.index.bad.contains_key(&p.key) && !has_error(p))
         {
             let Some(r) = recorded.get(&p.key) else {
                 continue;
@@ -625,7 +640,7 @@ pub fn scan_pictures(
         }
         texts[name]
             .lines()
-            .position(|l| l.contains("\\begin{document}"))
+            .position(|l| strip_comment(l).contains("\\begin{document}"))
             .map(|k| k + 1)
             .unwrap_or(0)
     };
@@ -1198,8 +1213,15 @@ mod tests {
                 ..Default::default()
             },
         );
+        // a picture with an error in its lines (the \end line here) is not cached; one elsewhere
+        // does not matter
+        let err = |f: &str, l: i64| vec![(f.to_string(), l)];
+        let mut other = PicCache::open(&dir.join("cache-errors"));
+        assert_eq!(other.absorb(&pics, &rec, &[], &err("./main.tex", 9), &pdf).unwrap(), 0);
+        assert_eq!(other.entries(), 0);
+        assert_eq!(other.absorb(&pics, &rec, &[], &err("./other.tex", 6), &pdf).unwrap(), 1);
         // not a real PDF: the whole file is copied and page numbers stay
-        assert_eq!(cache.absorb(&pics, &rec, &[], &pdf).unwrap(), 1);
+        assert_eq!(cache.absorb(&pics, &rec, &[], &[], &pdf).unwrap(), 1);
         assert_eq!(cache.entries(), 1);
         assert_eq!(cache.write_manifest(&pics, &manifest).unwrap(), 1);
         let m: serde_json::Value =
@@ -1217,7 +1239,7 @@ mod tests {
         let mut rec2 = rec.clone();
         rec2.get_mut("main.tex:5").unwrap().state = "other font/0 g 0 G".into();
         rec2.get_mut("main.tex:5").unwrap().h = 400;
-        assert_eq!(cache.absorb(&pics, &rec2, &[], &pdf).unwrap(), 1);
+        assert_eq!(cache.absorb(&pics, &rec2, &[], &[], &pdf).unwrap(), 1);
         assert_eq!(cache.entries(), 1);
         cache.write_manifest(&pics, &manifest).unwrap();
         let m: serde_json::Value =
@@ -1227,19 +1249,19 @@ mod tests {
         // a pass that reports the picture as mismatched forgets it
         assert_eq!(
             cache
-                .absorb(&pics, &BTreeMap::new(), &["main.tex:5".into()], &pdf)
+                .absorb(&pics, &BTreeMap::new(), &["main.tex:5".into()], &[], &pdf)
                 .unwrap(),
             0
         );
         assert_eq!(cache.entries(), 0);
         // and draws it (no entry) for KEEP_PASSES passes before caching it again
-        assert_eq!(cache.absorb(&pics, &rec, &[], &pdf).unwrap(), 0);
+        assert_eq!(cache.absorb(&pics, &rec, &[], &[], &pdf).unwrap(), 0);
         for _ in 0..KEEP_PASSES {
             assert_eq!(cache.write_manifest(&pics, &manifest).unwrap(), 0);
-            assert_eq!(cache.absorb(&pics, &rec, &[], &pdf).unwrap(), 0);
+            assert_eq!(cache.absorb(&pics, &rec, &[], &[], &pdf).unwrap(), 0);
         }
         cache.write_manifest(&pics, &manifest).unwrap();
-        assert_eq!(cache.absorb(&pics, &rec, &[], &pdf).unwrap(), 1);
+        assert_eq!(cache.absorb(&pics, &rec, &[], &[], &pdf).unwrap(), 1);
         assert_eq!(cache.write_manifest(&pics, &manifest).unwrap(), 1);
         // a changed picture: no hit; after KEEP_PASSES unwanted passes the entry and its PDF go
         let changed = vec![PictureRef {
@@ -1248,7 +1270,7 @@ mod tests {
         }];
         for _ in 0..(KEEP_PASSES + 1) {
             assert_eq!(cache.write_manifest(&changed, &manifest).unwrap(), 0);
-            cache.absorb(&changed, &BTreeMap::new(), &[], &pdf).unwrap();
+            cache.absorb(&changed, &BTreeMap::new(), &[], &[], &pdf).unwrap();
         }
         assert_eq!(cache.entries(), 0);
         assert!(std::fs::read_dir(dir.join("cache"))

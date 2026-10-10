@@ -962,7 +962,9 @@ pub fn setup_prefix(text: &str) -> (usize, bool) {
             return (stmt, any);
         }
         i = j;
-        // arguments
+        // arguments; a control sequence after a braced argument is not one (`\def\x{\x}\x`
+        // defines \x and then uses it)
+        let mut braced = false;
         loop {
             while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
                 i += 1;
@@ -999,6 +1001,7 @@ pub fn setup_prefix(text: &str) -> (usize, bool) {
                         return (stmt, any);
                     };
                     i = c + 1;
+                    braced = true;
                 }
                 b'#' => {
                     i += 1;
@@ -1006,6 +1009,7 @@ pub fn setup_prefix(text: &str) -> (usize, bool) {
                         i += 1;
                     }
                 }
+                b'\\' if braced => break,
                 b'\\' => {
                     // a control-sequence argument (\def\foo, \setlength\parindent); a setup
                     // command starts the next statement instead
@@ -2841,6 +2845,9 @@ mod tests {
         )
         .is_some());
         assert!(setup_statements("\\newcommand{\\kw}{x} Text after it").is_none());
+        // a definition followed by a use of what it defines (an endless loop here)
+        assert!(setup_statements("\\def\\x{\\x}\\x").is_none());
+        assert!(setup_statements("\\newcommand{\\a}{1}\\newcommand{\\b}[1]{#1}\\def\\c#1{#1}").is_some());
         assert!(setup_statements("Text \\newcommand{\\kw}{x}").is_none());
         assert!(setup_statements("\\setcounter{page}{3}").is_none());
         assert!(setup_statements("\\newcommand{\\kw}{x").is_none());

@@ -622,10 +622,21 @@ impl WarmEngine {
     /// Typeset the body: refresh the snapshot texts (same preamble), release the engine and
     /// collect the pass like a fresh run.
     pub fn run(
+        self,
+        project: &Path,
+        files: &BTreeMap<String, String>,
+        main: &str,
+    ) -> Result<CaptureResult> {
+        self.run_until(project, files, main, &crate::capture::never_stop)
+    }
+
+    /// `run` that `stop` may end early (`capture::StopCheck`).
+    pub fn run_until(
         mut self,
         project: &Path,
         files: &BTreeMap<String, String>,
         main: &str,
+        stop: crate::capture::StopCheck,
     ) -> Result<CaptureResult> {
         let t0 = std::time::Instant::now();
         let h = write_body_snapshot(project, files, main, &self.src_dir)?;
@@ -642,13 +653,8 @@ impl WarmEngine {
             stdin.flush().ok();
             drop(stdin);
         }
-        // drain stdout before waiting (a full pipe would block the engine), then reap
-        let mut stdout = Vec::new();
-        if let Some(mut so) = self.child.stdout.take() {
-            use std::io::Read;
-            let _ = so.read_to_end(&mut stdout);
-        }
-        let status = self.child.wait().context("waiting for standby pass")?;
+        // stdout is drained while waiting (a full pipe would block the engine)
+        let (status, stdout) = crate::capture::wait_child(&mut self.child, t0, stop)?;
         collect_capture(
             &self.out_dir,
             &self.jobname,

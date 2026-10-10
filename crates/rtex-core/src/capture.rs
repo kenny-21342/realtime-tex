@@ -326,6 +326,19 @@ pub fn run_capture_with(
     instrumented: bool,
     unit_envs: &str,
 ) -> Result<CaptureResult> {
+    run_capture_until(tl, src_dir, main, out_dir, instrumented, unit_envs, &never_stop)
+}
+
+/// `run_capture_with` that `stop` may end early (see [`StopCheck`]).
+pub fn run_capture_until(
+    tl: &TexLive,
+    src_dir: &Path,
+    main: &str,
+    out_dir: &Path,
+    instrumented: bool,
+    unit_envs: &str,
+    stop: StopCheck,
+) -> Result<CaptureResult> {
     let (mut cmd, jobname, out_dir) =
         capture_command(tl, src_dir, main, out_dir, instrumented, unit_envs)?;
     cmd.arg(if instrumented {
@@ -333,17 +346,77 @@ pub fn run_capture_with(
     } else {
         format!("\\input{{{main}}}")
     });
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     let t0 = Instant::now();
-    let out = cmd.output().context("spawning lualatex")?;
+    let mut child = cmd.spawn().context("spawning lualatex")?;
+    let (status, stdout) = wait_child(&mut child, t0, stop)?;
     collect_capture(
         &out_dir,
         &jobname,
         instrumented,
-        out.status.success(),
-        out.status.code(),
-        &out.stdout,
+        status.success(),
+        status.code(),
+        &stdout,
         t0.elapsed(),
     )
+}
+
+/// Whether a running pass is stopped: called every 100 ms with the time since the pass
+/// started; `Some(reason)` kills the engine and the pass fails with `reason`. A document that
+/// loops forever (`\def\x{\x}\x`) never ends its pass otherwise.
+pub type StopCheck<'a> = &'a dyn Fn(std::time::Duration) -> Option<String>;
+
+/// The error of a pass a [`StopCheck`] ended, with its reason.
+#[derive(Debug)]
+pub struct Stopped(pub String);
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// A [`StopCheck`] that lets every pass run to its end (offline tools, tests).
+pub fn never_stop(_: std::time::Duration) -> Option<String> {
+    None
+}
+
+/// Wait for a pass's engine, reading its stdout, and kill it when `stop` says so. The output is
+/// read on a thread: its end (the engine exiting) ends the wait at once.
+pub fn wait_child(
+    child: &mut std::process::Child,
+    t0: Instant,
+    stop: StopCheck,
+) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut so) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut so, &mut v);
+            let _ = tx.send(v);
+        });
+    } else {
+        let _ = tx.send(Vec::new());
+    }
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(out) => return Ok((child.wait().context("waiting for lualatex")?, out)),
+            // the reader is gone without its output: the engine's stdout closed
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok((child.wait().context("waiting for lualatex")?, Vec::new()))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Some(reason) = stop(t0.elapsed()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Stopped(reason).into());
+        }
+    }
 }
 
 /// The lualatex command for a pass over `src_dir`, without its final `\input` argument.

@@ -483,3 +483,165 @@ fn the_index_is_built() {
     assert!(chars.contains("alpha") && chars.contains("beta"), "index page text: {chars}");
     s.close();
 }
+
+/// The error diagnostics in force when the first layout arrives, and that layout's status.
+fn first_layout_errors(s: &Session, secs: u64) -> (CompileStatus, Vec<rtex_core::session::Diagnostic>) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut errors = vec![];
+    while Instant::now() < deadline {
+        for e in s.poll(Duration::from_millis(100)) {
+            match e {
+                Event::Diagnostics { items, .. } => {
+                    errors = items.into_iter().filter(|d| d.severity == "error").collect()
+                }
+                Event::LayoutUpdate { compile, .. } => return (compile, errors),
+                _ => {}
+            }
+        }
+    }
+    panic!("no layout within {secs} s");
+}
+
+/// A comment that mentions `\begin{document}` above the real one (the stress test's `broken`
+/// cases describe their mistake in a header comment) was taken for the start of the body: the
+/// preamble ended at the comment, the class and packages were compiled as body text, and every
+/// error was reported on the wrong line ("Can be used only in preamble" at the comment).
+#[test]
+fn a_commented_begin_document_is_not_the_body() {
+    let doc = "% Mistake: a typo after \\begin{document}\n\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\nSome text.\n\\begin{theorm}\nA claim.\n\\end{theorm}\n\\end{document}\n";
+    let Some(s) = open("commented-begin", doc) else {
+        return;
+    };
+    let (_, errors) = first_layout_errors(&s, 120);
+    let first = errors.first().expect("the undefined environment is an error");
+    assert!(first.message.contains("Environment theorm undefined"), "{errors:?}");
+    assert_eq!(first.line, Some(6), "{errors:?}");
+    assert!(first.file.as_deref().is_some_and(|f| f.ends_with("main.tex")), "{errors:?}");
+    assert!(!errors.iter().any(|d| d.message.contains("preamble")), "{errors:?}");
+    s.close();
+}
+
+/// A fatal error (TeX gives up before the end of the document) used to arrive as one diagnostic
+/// holding the whole terminal output, with no file or line. It is now read from the pass's log
+/// like any other error.
+#[test]
+fn a_fatal_error_has_a_location() {
+    // \left without \right: TeX inserts \right. on every token until it gives up at 100 errors
+    let doc = "\\documentclass{article}\n\\begin{document}\nFine.\n\nBrackets $\\left( a + b$ unbalanced.\n\nMore.\n\\end{document}\n";
+    let Some(s) = open("fatal-location", doc) else {
+        return;
+    };
+    let (compile, errors) = first_layout_errors(&s, 120);
+    assert_eq!(compile, CompileStatus::Failed, "{errors:?}");
+    let first = errors.first().expect("an error");
+    assert!(first.message.contains("Missing \\right"), "{errors:?}");
+    assert_eq!(first.line, Some(5), "{errors:?}");
+    assert!(first.file.as_deref().is_some_and(|f| f.ends_with("main.tex")), "{errors:?}");
+    assert!(errors.iter().all(|d| d.message.len() < 1000), "{errors:?}");
+    s.close();
+}
+
+/// A picture whose compile reports an error (a TikZ path without its semicolon) was cached
+/// after the first pass; the next pass took it from the cache, never compiled it, and the
+/// document came out clean (stress test, `broken/engine-tikz-semicolon`). Pictures with an
+/// error in their lines are not cached.
+#[test]
+fn a_picture_with_an_error_is_not_cached() {
+    let doc = "\\documentclass{article}\n\\usepackage{tikz}\n\\begin{document}\nText.\n\n\\begin{tikzpicture}\n  \\draw (0,0) -- (1,1)\n\\end{tikzpicture}\n\\end{document}\n";
+    let Some(s) = open("picture-error", doc) else {
+        return;
+    };
+    let (compile, convergence, errors, _) = final_layout(&s, 120, Duration::from_millis(500));
+    assert!(matches!(compile, CompileStatus::CompiledWithErrors { .. }), "{compile:?} {convergence:?}");
+    assert!(errors.iter().any(|e| e.contains("semicolon")), "{errors:?}");
+    // a second run (an edit elsewhere) still compiles the picture
+    let at = doc.find("Text.").unwrap();
+    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "More ".into() }).unwrap();
+    s.request_layout();
+    let (compile, _, errors, _) = final_layout(&s, 120, Duration::from_millis(500));
+    assert!(matches!(compile, CompileStatus::CompiledWithErrors { .. }), "{compile:?}");
+    assert!(errors.iter().any(|e| e.contains("semicolon")), "{errors:?}");
+    s.close();
+}
+
+/// LaTeX reads past a package's `\usepackage` line for its optional date: an option clash on
+/// the last package is raised at the `\begin{document}` line. The standby reads the preamble
+/// from its own file and the error came without a location.
+#[test]
+fn an_error_at_the_end_of_the_preamble_is_on_begin_document() {
+    let doc = "\\documentclass{article}\n\\usepackage[final]{graphicx}\n\\usepackage[draft]{graphicx}\n\\begin{document}\nText.\n\\end{document}\n";
+    let Some(s) = open("option-clash", doc) else {
+        return;
+    };
+    let (_, errors) = first_layout_errors(&s, 120);
+    let first = errors.first().expect("the option clash is an error");
+    assert!(first.message.contains("Option clash"), "{errors:?}");
+    assert_eq!((first.file.as_deref(), first.line), (Some("main.tex"), Some(4)), "{errors:?}");
+    s.close();
+}
+
+/// A document that loops forever (`\def\x{\x}\x`) held the background path: its pass never
+/// ended, no layout came, and later edits waited behind it. A pass now stops after
+/// `pass_timeout` and the run fails.
+#[test]
+fn an_endless_loop_stops_the_pass() {
+    if TexLive::discover().is_err() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-regr-{}-endless", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let doc = "\\documentclass{article}\n\\begin{document}\nText.\n\n\\def\\x{\\x}\\x\n\\end{document}\n";
+    std::fs::write(project.join("main.tex"), doc).unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.debounce = Duration::from_millis(50);
+    cfg.pass_timeout = Duration::from_secs(5);
+    let s = Session::open(cfg).unwrap();
+    let t0 = Instant::now();
+    let (compile, convergence, errors, _) = final_layout(&s, 60, Duration::from_millis(200));
+    assert_eq!(compile, CompileStatus::Failed, "{convergence:?} {errors:?}");
+    assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
+    assert!(errors.iter().any(|e| e.contains("did not finish")), "{errors:?}");
+    // the live server never loads the loop (it is no setup statement) and closing is prompt
+    s.close();
+    assert!(t0.elapsed() < Duration::from_secs(40), "closed after {:?}", t0.elapsed());
+}
+
+/// Once a pass has finished, a pass that runs twice as long as the slowest one while the
+/// sources change under it is stopped: removing an endless loop gets a layout without waiting
+/// for `pass_timeout`.
+#[test]
+fn removing_an_endless_loop_recovers_quickly() {
+    let doc = "\\documentclass{article}\n\\begin{document}\nText.\n\nMore text.\n\\end{document}\n";
+    let Some(s) = open("endless-fixed", doc) else {
+        return;
+    };
+    let (compile, ..) = final_layout(&s, 120, Duration::from_millis(200));
+    assert_eq!(compile, CompileStatus::Ok);
+    let at = doc.find("More text.").unwrap();
+    let lp = "\\def\\x{\\x}\\x ";
+    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: lp.into() }).unwrap();
+    s.request_layout();
+    // the looping pass starts; then the loop is removed again
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        s.poll(Duration::from_millis(100));
+    }
+    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at + lp.len(), text: String::new() }).unwrap();
+    s.request_layout();
+    let t0 = Instant::now();
+    let deadline = t0 + Duration::from_secs(60);
+    let mut ok = false;
+    while Instant::now() < deadline && !ok {
+        for e in s.poll(Duration::from_millis(100)) {
+            if let Event::LayoutUpdate { compile: CompileStatus::Ok, versions, .. } = e {
+                ok = versions.source_revision >= s.versions().source_revision;
+            }
+        }
+    }
+    assert!(ok, "no clean layout of the fixed document within 60 s");
+    assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
+    s.close();
+}

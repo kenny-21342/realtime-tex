@@ -33,6 +33,11 @@ pub struct SessionConfig {
     pub fast_on_stale_context: bool,
     pub bib_tool: BibTool,
     pub compile_timeout: Duration,
+    /// A background lualatex run still going after this long is stopped and the run fails
+    /// (default 120 s): a document that loops forever (`\def\x{\x}\x`) would hold the
+    /// background path. A run is stopped sooner once the sources have changed since it started
+    /// and it has taken twice as long as the slowest run that finished (a loop being fixed).
+    pub pass_timeout: Duration,
     /// Units whose last fast compile took longer than this are routed to the background path
     /// until the next layout (the host keeps its real-time guarantee).
     pub fast_budget: Duration,
@@ -119,6 +124,7 @@ impl SessionConfig {
             fast_on_stale_context: true,
             bib_tool: BibTool::Auto,
             compile_timeout: Duration::from_secs(5),
+            pass_timeout: Duration::from_secs(120),
             fast_budget: Duration::from_millis(5),
             unit_envs: Vec::new(),
             warm_background: true,
@@ -316,6 +322,8 @@ struct Shared {
     files: Mutex<BTreeMap<String, FileBuf>>,
     ids: Mutex<IdAllocator>,
     source_revision: AtomicU64,
+    /// The longest a background lualatex run that finished took (ms; `pass_timeout`).
+    slowest_pass_ms: AtomicU64,
     preamble_revision: AtomicU64,
     /// Per file: last revision at which a background-only span or the preamble changed.
     bg_change: Mutex<HashMap<String, Vec<(Revision, i64)>>>, // (revision, first line of the changed span)
@@ -419,7 +427,7 @@ impl Session {
         }
         // the main file and, transitively, every file it \input/\includes
         let texts = crate::document::load_project_files(&cfg.project_root, &cfg.main_file)
-            .with_context(|| format!("reading {}", cfg.main_file))?;
+            .context("loading the project")?;
         let mut ids = IdAllocator(0);
         let mut files = BTreeMap::new();
         let preamble = effective_preamble(&texts, &cfg.main_file);
@@ -447,6 +455,7 @@ impl Session {
             files: Mutex::new(files),
             ids: Mutex::new(ids),
             source_revision: AtomicU64::new(1),
+            slowest_pass_ms: AtomicU64::new(0),
             preamble_revision: AtomicU64::new(1),
             bg_change: Mutex::new(HashMap::new()),
             layout: Mutex::new(LayoutStore::default()),
@@ -1607,6 +1616,7 @@ fn engine_thread(s: Arc<Shared>) {
                 wanted_gen,
                 aux.as_deref(),
                 s.cfg.debug_dir.is_some(),
+                Some(&s.shutdown),
             ) {
                 Ok(mut srv) => {
                     srv.timeout = s.cfg.compile_timeout.max(Duration::from_secs(30)); // first compile loads fonts
@@ -2408,6 +2418,30 @@ fn pass_dir(s: &Shared, n: usize) -> PathBuf {
     s.cfg.build_dir.join("bg").join(format!("pass-{n}"))
 }
 
+/// The errors of a pass that stopped before writing its capture: the newest `<job>.log` in the
+/// pass directories written since `since` that reports an error (a standby opens its own log in
+/// the other directory as soon as it starts). File names as in `deliver_layout`.
+fn failed_pass_diagnostics(s: &Shared, since: std::time::SystemTime) -> Vec<Diagnostic> {
+    let jobname = jobname_of(&s.cfg.main_file);
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = [pass_dir(s, 0), pass_dir(s, 1), s.cfg.build_dir.join("bg")]
+        .iter()
+        .filter_map(|d| {
+            let p = d.join(format!("{jobname}.log"));
+            let m = std::fs::metadata(&p).ok()?.modified().ok()?;
+            (m >= since).then_some((m, p))
+        })
+        .collect();
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, log) in logs {
+        let mut items = parse_log(&log);
+        if items.iter().any(|d| d.severity == "error") {
+            locate_standby_diagnostics(s, &mut items);
+            return items;
+        }
+    }
+    Vec::new()
+}
+
 /// The directory of the last finished pass (seeded from disk on the first call: the newer
 /// of the two pass directories, or the pre-pass-directory layout `build/bg` itself).
 fn last_pass_dir(s: &Shared) -> Option<PathBuf> {
@@ -2562,17 +2596,34 @@ fn run_background_pass_inner(s: &Shared) {
     let snap_dir = snapshot_dir(&s.cfg.build_dir);
     // a pass that cannot run is still a layout result: hosts see compile = Failed instead of a
     // pass that never ends
-    let failed = |msg: String| {
+    let started = std::time::SystemTime::now();
+    let stop = |ran: Duration| -> Option<String> {
+        if ran >= s.cfg.pass_timeout {
+            return Some(format!(
+                "LaTeX did not finish within {} s (an endless loop?); stopped",
+                s.cfg.pass_timeout.as_secs()
+            ));
+        }
+        let slowest = Duration::from_millis(s.slowest_pass_ms.load(Ordering::SeqCst));
+        (!slowest.is_zero()
+            && ran > (slowest * 2).max(Duration::from_secs(5))
+            && s.source_revision.load(Ordering::SeqCst) != rev)
+            .then(|| {
+                format!(
+                    "LaTeX did not finish within {} s, twice its longest run so far; stopped for the edited sources",
+                    ran.as_secs()
+                )
+            })
+    };
+    let ran_to_end = |cap: &crate::capture::CaptureResult| {
+        s.slowest_pass_ms
+            .fetch_max(cap.wall.as_millis() as u64, Ordering::SeqCst);
+    };
+    let failed_with = |msg: String, items: Vec<Diagnostic>| {
         s.events
             .send(Event::Diagnostics {
                 source: "background".into(),
-                items: vec![Diagnostic {
-                    severity: "error".into(),
-                    file: None,
-                    line: None,
-                    message: msg.clone(),
-                    context: None,
-                }],
+                items,
             })
             .ok();
         *s.convergence.lock() = Some(Convergence::PassLimitReached {
@@ -2599,6 +2650,16 @@ fn run_background_pass_inner(s: &Shared) {
                 wall_ms: t0.elapsed().as_millis() as u64,
             })
             .ok();
+    };
+    let failed = |msg: String| {
+        let item = Diagnostic {
+            severity: "error".into(),
+            file: None,
+            line: None,
+            message: msg.clone(),
+            context: None,
+        };
+        failed_with(msg, vec![item])
     };
     if let Err(e) = write_snapshot(&s.cfg.project_root, &texts, &snap_dir) {
         failed(format!("snapshot: {e}"));
@@ -2640,10 +2701,16 @@ fn run_background_pass_inner(s: &Shared) {
         if pics.is_empty() || cap.fatal() {
             return;
         }
+        let errors: Vec<(String, i64)> = parse_log(&cap.log)
+            .into_iter()
+            .filter(|d| d.severity == "error")
+            .filter_map(|d| Some((d.file?, d.line?)))
+            .collect();
         if let Err(e) = pic_cache.lock().unwrap().absorb(
             &pics,
             &cap.json.recorded_pics(),
             &cap.json.pic_mismatch,
+            &errors,
             &cap.pdf,
         ) {
             log::warn!("picture cache: {e:#}");
@@ -2756,7 +2823,8 @@ fn run_background_pass_inner(s: &Shared) {
                 *s.standby.lock() = Some(next);
             }
             let t_run = Instant::now();
-            let mut cap = w.run(&s.cfg.project_root, &texts, &s.cfg.main_file)?;
+            let mut cap = w.run_until(&s.cfg.project_root, &texts, &s.cfg.main_file, &stop)?;
+            ran_to_end(&cap);
             log::debug!(
                 "background pass: {} standby, waited/spawned {} ms, engine run {} ms",
                 if warm { "warm" } else { "cold" },
@@ -2782,14 +2850,16 @@ fn run_background_pass_inner(s: &Shared) {
         let dir = pass_dir(s, 0);
         let mut runner = |_pass: u32| -> Result<crate::capture::CaptureResult> {
             prepare_dir(&dir);
-            let mut cap = crate::capture::run_capture_with(
+            let mut cap = crate::capture::run_capture_until(
                 &s.tl,
                 &snap_dir,
                 &s.cfg.main_file,
                 &dir,
                 true,
                 &unit_envs,
+                &stop,
             )?;
+            ran_to_end(&cap);
             cap.pic_fragments = pic_fragments.lock().unwrap().clone();
             finished(&cap);
             Ok(cap)
@@ -2808,7 +2878,35 @@ fn run_background_pass_inner(s: &Shared) {
     let outcome = match result {
         Ok(o) => o,
         Err(e) => {
-            failed(format!("background pass: {e:#}"));
+            // LaTeX stopped before the end of the document (no capture): its log still says
+            // where; the error list is the log's, as for any pass
+            let mut items = failed_pass_diagnostics(s, started);
+            if let Some(stopped) = e.downcast_ref::<crate::capture::Stopped>() {
+                // stopped by pass_timeout: that is the reason, whatever the log says so far
+                items.insert(
+                    0,
+                    Diagnostic {
+                        severity: "error".into(),
+                        file: None,
+                        line: None,
+                        message: stopped.0.clone(),
+                        context: None,
+                    },
+                );
+                failed_with(stopped.0.clone(), items);
+                return;
+            }
+            match items.iter().find(|d| d.severity == "error") {
+                Some(first) => {
+                    let at = match (&first.file, first.line) {
+                        (Some(f), Some(l)) => format!(" ({f}:{l})"),
+                        _ => String::new(),
+                    };
+                    let msg = format!("fatal error, LaTeX stopped: {}{at}", first.message);
+                    failed_with(msg, items);
+                }
+                None => failed(format!("background pass: {e:#}")),
+            }
             return;
         }
     };
@@ -2901,16 +2999,7 @@ fn deliver_layout_inner(
     provisional: bool,
 ) {
     let mut diagnostics = parse_log(&cap.log);
-    for d in &mut diagnostics {
-        // the standby reads the preamble from rtex-preamble.tex (same line numbers)
-        if d.file
-            .as_deref()
-            .map(|f| f.ends_with("rtex-preamble.tex"))
-            .unwrap_or(false)
-        {
-            d.file = Some(s.cfg.main_file.clone());
-        }
-    }
+    locate_standby_diagnostics(s, &mut diagnostics);
     let errors = diagnostics.iter().filter(|d| d.severity == "error").count();
     // a fatal error leaves no PDF (at most a partial one) even when pages were shipped: the
     // pass is a failure, the previous layout stays
@@ -3317,9 +3406,17 @@ pub fn parse_log(log: &Path) -> Vec<Diagnostic> {
                 context: None,
             });
         } else if l.starts_with("! ") {
+            // an error raised while TeX reads the standby's command line right after the
+            // preamble file (LaTeX looking past a \usepackage for its optional date): plain
+            // LaTeX reads on in the main file and reports it there, at \begin{document}
+            let after_preamble = lines[i + 1..]
+                .iter()
+                .take(30)
+                .take_while(|n| !n.starts_with("! ") && !re_fle.is_match(n))
+                .any(|n| n.starts_with("<*> ") && n.trim_end().ends_with("\\input{rtex-preamble.tex}"));
             out.push(Diagnostic {
                 severity: "error".into(),
-                file: None,
+                file: after_preamble.then(|| "rtex-preamble.tex".to_string()),
                 line: None,
                 message: l[2..].to_string(),
                 context: lines.get(i + 1).map(|s| s.to_string()),
@@ -3327,4 +3424,26 @@ pub fn parse_log(log: &Path) -> Vec<Diagnostic> {
         }
     }
     out
+}
+
+/// Diagnostics of a standby pass in the main file's terms: the standby reads the preamble from
+/// `rtex-preamble.tex` (same line numbers); an error after its end (no line) is where plain
+/// LaTeX reports it, the `\begin{document}` line.
+fn locate_standby_diagnostics(s: &Shared, items: &mut [Diagnostic]) {
+    let mut begin_line = None;
+    for d in items {
+        if !d.file.as_deref().is_some_and(|f| f.ends_with("rtex-preamble.tex")) {
+            continue;
+        }
+        d.file = Some(s.cfg.main_file.clone());
+        if d.line.is_none() {
+            let line = *begin_line.get_or_insert_with(|| {
+                s.files.lock().get(&s.cfg.main_file).and_then(|f| {
+                    let at = crate::document::find_uncommented(&f.text, "\\begin{document}")?;
+                    Some(f.text[..at].matches('\n').count() as i64 + 1)
+                })
+            });
+            d.line = line;
+        }
+    }
 }

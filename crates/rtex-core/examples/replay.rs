@@ -16,6 +16,10 @@
 //! step the files on disk are checked against the script's SHA-256s. With `--cases` (the suite's
 //! `cases.json`) each step also reports the expectation recorded for the reference engine.
 //!
+//! `check` opens a session on a copy of a project, waits (`--timeout` s, default 120) for the
+//! first run to end and reports its status, pages and error locations (what an editor's problem
+//! list shows): scripts/broken_errors.py runs it over the stress test's `broken` suite.
+//!
 //! `type` copies a project, then types ` WORD` one character at a time at the end of a word in
 //! N paragraphs spread over the project's files, CADENCE ms apart (continuous typing: background
 //! passes run while typing). With `--settle-each`, a clean pass is awaited after every word.
@@ -65,6 +69,7 @@ fn main() -> Result<()> {
     let report = match mode.as_str() {
         "ops" => replay_ops(&mut run, &PathBuf::from(get("ops")?), &PathBuf::from(get("root")?), &opt.get("main").cloned().unwrap_or("main.tex".into()), opt.get("cases").map(PathBuf::from), &out)?,
         "type" => type_words(&mut run, &PathBuf::from(get("project")?), &get("main")?, &opt, &out)?,
+        "check" => check(&PathBuf::from(get("project")?), &get("main")?, &opt, &out)?,
         _ => bail!("usage: replay ops|type ... (see the header of examples/replay.rs)"),
     };
     std::fs::write(out.join("report.json"), serde_json::to_string_pretty(&report)?)?;
@@ -567,4 +572,41 @@ fn type_words(run: &mut Run, src: &Path, main: &str, opt: &HashMap<String, Strin
     s.close();
     Ok(json!({"mode": "type", "project": src, "main": main, "word": word, "cadence_ms": cadence.as_millis() as u64,
               "settle_each": settle_each, "summary": run.summary(), "words": words, "final_settle": final_settle}))
+}
+
+fn check(src: &Path, main: &str, opt: &HashMap<String, String>, out: &Path) -> Result<Value> {
+    let timeout = Duration::from_secs(opt.get("timeout").map(|v| v.parse()).transpose()?.unwrap_or(120));
+    let project = out.join("project");
+    copy_dir(src, &project)?;
+    let t0 = Instant::now();
+    let mut cfg = SessionConfig::new(&project, main.to_string());
+    cfg.build_dir = out.join("build");
+    let s = match Session::open(cfg) {
+        Ok(s) => s,
+        // a project rtex cannot open (a source file that is not UTF-8) is a result too
+        Err(e) => {
+            let report = json!({"status": "open-failed", "errors": [{"file": null, "line": null, "message": format!("{e:#}")}],
+                                "wall_ms": t0.elapsed().as_millis() as u64});
+            println!("{report}");
+            return Ok(report);
+        }
+    };
+    let mut o = Observer::new();
+    let ended = o.pump(&s, timeout, |o| o.ended);
+    let errors: Vec<Value> = o
+        .diagnostics
+        .values()
+        .flatten()
+        .filter(|d| d.severity == "error")
+        .map(|d| json!({"file": d.file, "line": d.line, "message": d.message}))
+        .collect();
+    let report = json!({
+        "status": if ended { status_name(o.compile.as_ref()) } else { "timeout" },
+        "converged": o.converged, "pages": o.pages_total, "layouts": o.layouts,
+        "wall_ms": t0.elapsed().as_millis() as u64, "errors": errors,
+        "engine": s.versions().engine_generation,
+    });
+    println!("{report}");
+    s.close();
+    Ok(report)
 }

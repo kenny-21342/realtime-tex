@@ -24,6 +24,13 @@ buffers, repeating while the aux family changes or the log asks for a rerun, up 
 
 A missing bibliography tool makes the pass stop with `PassLimitReached` and a diagnostic.
 
+A pass that does not end is stopped (`SessionConfig.pass_timeout`, C ABI `pass_timeout_ms`,
+default 120 s; sooner, at twice the slowest finished pass, when the sources changed while it
+ran): the run ends `Failed` with `PassLimitReached` and a diagnostic saying LaTeX did not finish
+(`\def\x{\x}\x` loops forever). A pass that stops on a fatal error (a runaway argument, 100
+errors) reports the errors of its log with their `file:line`, the first one in the summary
+(`fatal error, LaTeX stopped: … (main.tex:13)`).
+
 `PdfExported.status` follows the same scale (`Ok` / `CompiledWithErrors` / `Failed`) and carries
 `converged` (aux stable and no errors); only `converged = true` claims equality with a clean
 LuaLaTeX build.

@@ -18,7 +18,7 @@ pub use session::{Convergence, Event, Session, SessionConfig, Versions};
 
 /// Extract the preamble (everything before `\begin{document}`) from a LaTeX main file.
 pub fn split_preamble(main_tex: &str) -> Option<(&str, &str)> {
-    let idx = main_tex.find("\\begin{document}")?;
+    let idx = document::find_uncommented(main_tex, "\\begin{document}")?;
     Some((&main_tex[..idx], &main_tex[idx..]))
 }
 

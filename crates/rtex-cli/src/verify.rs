@@ -683,7 +683,7 @@ fn pic_cache_check(
     std::fs::create_dir_all(&out)?;
     rtex_core::background::copy_aux_family(&cap.out_dir, &out)?;
     let mut cache = PicCache::open(&out.join("pic-cache"));
-    cache.absorb(&pics, &recorded, &[], &cap.pdf)?;
+    cache.absorb(&pics, &recorded, &[], &[], &cap.pdf)?;
     rep.hits = cache.write_manifest(&pics, &out.join("pic-manifest.json"))?;
     let cached =
         rtex_core::capture::run_capture_with(tl, project, &opts.main, &out, true, unit_envs)?;

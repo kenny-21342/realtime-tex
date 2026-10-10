@@ -384,8 +384,8 @@ fn compute_line_starts(text: &str) -> Vec<usize> {
 /// Boundaries of paragraph-ish units in `text`, as byte ranges with kinds (ids not assigned).
 fn segment(text: &str, extra_block_envs: &[String]) -> Vec<(Range<usize>, SpanKind)> {
     let mut out: Vec<(Range<usize>, SpanKind)> = Vec::new();
-    let begin_doc = text.find("\\begin{document}");
-    let end_doc = text.find("\\end{document}");
+    let begin_doc = find_uncommented(text, "\\begin{document}");
+    let end_doc = find_uncommented(text, "\\end{document}");
     let body_start = match begin_doc {
         Some(i) => {
             let e = i + "\\begin{document}".len();
@@ -571,6 +571,19 @@ pub fn has_control_word(line: &str, name: &str) -> bool {
 }
 
 /// Strip an unescaped `%` comment from a source line.
+/// Byte offset of the first `needle` in `text` outside `%` comments: a header comment that
+/// mentions `\begin{document}` is not where the document begins.
+pub fn find_uncommented(text: &str, needle: &str) -> Option<usize> {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if let Some(i) = strip_comment(line).find(needle) {
+            return Some(at + i);
+        }
+        at += line.len();
+    }
+    None
+}
+
 pub fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     let mut i = 0;
@@ -1176,6 +1189,19 @@ mod tests {
         assert!(has_control_word("a \\endinput b", "endinput"));
         assert!(!has_control_word("a \\endinputx b", "endinput"));
         assert!(!has_control_word("a \\\\endinput", "endinput"));
+    }
+
+    #[test]
+    fn commented_document_markers_are_not_boundaries() {
+        let doc = "% Mistake: \\usepackage after \\begin{document}, see \\end{document}\n\\documentclass{article}\n\\begin{document}\nText.\n\\end{document}\n";
+        let mut ids = IdAllocator(0);
+        let fb = FileBuf::new(doc, &mut ids, 1);
+        let pre = fb.spans.iter().find(|s| s.kind == SpanKind::Preamble).unwrap();
+        assert!(fb.text[pre.range.clone()].ends_with("\\begin{document}\n"));
+        assert!(fb.text[pre.range.clone()].contains("\\documentclass"));
+        let (p, _) = crate::split_preamble(doc).unwrap();
+        assert!(p.contains("\\documentclass{article}\n"));
+        assert_eq!(find_uncommented("a \\% b\n% b\nb", "b"), Some(5));
     }
 
     #[test]

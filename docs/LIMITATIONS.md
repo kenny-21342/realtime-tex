@@ -103,6 +103,14 @@ and images.
 
 **Platforms.** Linux/macOS (FIFO transport). Windows named pipes are not implemented.
 
+**Encodings.** Source files must be UTF-8: a project with a file that is not (Latin-1 bytes)
+does not open (`Session::open` fails naming the file).
+
+**Error locations.** Errors are reported at the `file:line` plain `lualatex -file-line-error`
+reports (checked on the stress test's `broken` suite, 57 of 58 located errors; the other case is
+the encoding one above). A picture with an error is never taken from the picture cache, so its
+error stays reported on every pass.
+
 **Performance depends on the font stack.** With fontspec's default luaotfload node mode (and
 more so with HarfBuzz), LuaTeX shapes every paragraph in Lua, which costs several times the
 line-breaking time itself (docs/BENCHMARKS.md, E13). The 1 ms class is reached with TFM fonts

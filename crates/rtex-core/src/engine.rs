@@ -156,12 +156,14 @@ impl FastServer {
         generation: u64,
         aux: Option<&Path>,
     ) -> Result<FastServer> {
-        Self::spawn_with(tl, cwd, work_dir, preamble, generation, aux, false)
+        Self::spawn_with(tl, cwd, work_dir, preamble, generation, aux, false, None)
     }
 
     /// `spawn` with the server's own trace on (`rtex-serve-g<generation>.trace` in `work_dir`:
     /// one line-flushed entry per request stage, so a hang shows the last stage reached even
-    /// when the TeX log's tail is lost with the killed process).
+    /// when the TeX log's tail is lost with the killed process). `cancel` set during startup
+    /// (the session closing) kills the server instead of waiting for its preamble.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with(
         tl: &TexLive,
         cwd: &Path,
@@ -170,6 +172,7 @@ impl FastServer {
         generation: u64,
         aux: Option<&Path>,
         trace: bool,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<FastServer> {
         std::fs::create_dir_all(work_dir)?;
         let work_dir = &work_dir.canonicalize()?;
@@ -233,7 +236,16 @@ impl FastServer {
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         // Opening the FIFO for reading blocks until the server opens it for writing. Poll the
         // child so a crash during the preamble does not hang us forever.
-        let resp = open_fifo_with_timeout(&fifo, &mut child, Duration::from_secs(120))?;
+        // A server that fails to start (a preamble that loops, a crash) is killed: a dropped
+        // Child keeps running.
+        let resp = match open_fifo_with_timeout(&fifo, &mut child, Duration::from_secs(120), cancel) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
         let mut s = FastServer {
             child,
             stdin,
@@ -557,7 +569,12 @@ impl Drop for FastServer {
     }
 }
 
-fn open_fifo_with_timeout(fifo: &Path, child: &mut Child, timeout: Duration) -> Result<File> {
+fn open_fifo_with_timeout(
+    fifo: &Path,
+    child: &mut Child,
+    timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<File> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::os::fd::AsFd;
     use std::os::unix::fs::OpenOptionsExt;
@@ -575,6 +592,9 @@ fn open_fifo_with_timeout(fifo: &Path, child: &mut Child, timeout: Duration) -> 
         }
         if t0.elapsed() > timeout {
             bail!("timed out waiting for the server to open the response FIFO");
+        }
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            bail!("server startup cancelled");
         }
         // Linux does not report POLLHUP for a FIFO that never had a writer, so poll blocks
         // until the first bytes ("ready" frame) arrive.
