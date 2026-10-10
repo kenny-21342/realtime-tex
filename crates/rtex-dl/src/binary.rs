@@ -262,6 +262,16 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                     },
                 );
             }
+            0x29 => {
+                let key = p.str().map_err(malformed)?;
+                dl.pictures.push(crate::PictureSpot {
+                    key,
+                    x: p.i32().map_err(malformed)? as Sp,
+                    top: p.i32().map_err(malformed)? as Sp,
+                    width: p.i32().map_err(malformed)? as Sp,
+                    height: p.i32().map_err(malformed)? as Sp,
+                });
+            }
             0x11 => {
                 let l = cur
                     .take()
@@ -590,6 +600,15 @@ pub fn encode(dl: &DisplayList) -> Vec<u8> {
         p.str(&im.file);
         body.rec(0x27, &p.0);
     }
+    for pic in &dl.pictures {
+        let mut p = Writer(Vec::new());
+        p.str(&pic.key);
+        p.i32(pic.x);
+        p.i32(pic.top);
+        p.i32(pic.width);
+        p.i32(pic.height);
+        body.rec(0x29, &p.0);
+    }
     write_items(&mut body, &dl.other);
     for l in &dl.lines {
         let mut p = Writer(Vec::new());
@@ -747,6 +766,7 @@ mod tests {
                 data: "0 g 0 G".into(),
             }],
             flags: serde_json::json!({"literal": 1}),
+            pictures: vec![crate::PictureSpot { key: "main.tex:12".into(), x: 100, top: 200, width: 3000, height: 1500 }],
             glyphs: 3,
             width: 5000,
             height: 700,

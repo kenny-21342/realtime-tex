@@ -140,6 +140,10 @@ fn cached_pictures_are_drawn_natively_like_typeset_ones() {
         }
     }
     assert!(drawn_from_cache > 0, "no page was drawn natively");
+    // the pictures put back are listed by key and place (hosts copy them into live units)
+    let spots: Vec<_> = pages.values().flat_map(|(dl, _)| dl.pictures.iter()).collect();
+    assert!(!spots.is_empty(), "no picture spot on the pages");
+    assert!(spots.iter().all(|p| p.key.starts_with("main.tex:") && p.width > 0 && p.height > 0), "{spots:?}");
     eprintln!("cached regions in the pass: {raw_cached}; pages drawn natively: {drawn_from_cache}");
     let _ = std::fs::remove_dir_all(&root);
 }

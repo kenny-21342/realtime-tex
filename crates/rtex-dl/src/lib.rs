@@ -14,7 +14,7 @@ pub type Sp = i64;
 pub const SP_PER_PT: f64 = 65536.0;
 pub const SP_PER_BP: f64 = 65536.0 * 72.27 / 72.0;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct FontDesc {
     pub id: i64,
     #[serde(default)]
@@ -365,6 +365,21 @@ pub struct DisplayList {
     pub page_height: Option<Sp>,
     #[serde(default)]
     pub origin: Option<(Sp, Sp)>,
+    /// Pictures this page draws from the picture cache's stored drawings (their `cached_picture`
+    /// items were replaced by the drawing): where each is, by its cache key. A host that copies
+    /// a cached picture into a live unit takes its pixels from here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pictures: Vec<PictureSpot>,
+}
+
+/// A picture on a page (sp, the list's frame) and its picture-cache key (`file:line`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PictureSpot {
+    pub key: String,
+    pub x: Sp,
+    pub top: Sp,
+    pub width: Sp,
+    pub height: Sp,
 }
 
 impl DisplayList {

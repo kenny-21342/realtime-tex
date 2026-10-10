@@ -87,6 +87,18 @@ fn edited_sentence_keeps_its_plot_from_the_cache() {
     }
     let (status, dl, timing) = seen.expect("a paragraph update");
     assert_ne!(status, "error");
+    // the live item names the picture's cache key, as the page's picture spots do
+    let detail = dl
+        .lines
+        .iter()
+        .flat_map(|l| l.items.iter())
+        .find_map(|i| match i {
+            Item::Unsupported { kind, detail } if kind == "cached_picture" => detail.as_str().map(str::to_string),
+            _ => None,
+        });
+    if let Some(d) = &detail {
+        assert!(d.split(' ').nth(5).is_some_and(|k| k.starts_with("main.tex:")), "{d}");
+    }
     assert!(
         has_cached_picture(&dl),
         "the plot should come from the cache; items: {:?}",
