@@ -1,6 +1,6 @@
 //! Minimal reproductions of failures found by the mutation test on real documents. Each test
 //! opens a session on a small inline document and checks the layout run ends the way
-//! docs/CONVERGENCE.md says. Skipped without lualatex.
+//! docs/how-it-works.md ("Convergence") says. Skipped without lualatex.
 
 use rtex_core::session::CompileStatus;
 use rtex_core::texlive::TexLive;
@@ -26,17 +26,31 @@ fn open(name: &str, main: &str) -> Option<Session> {
 /// Layout updates until one ends the run (anything but a provisional `Converging`), then any
 /// that arrive in the next `quiet` (a finished run must not be followed by another one nobody
 /// asked for).
-fn final_layout(s: &Session, secs: u64, quiet: Duration) -> (CompileStatus, Convergence, Vec<String>, usize) {
+fn final_layout(
+    s: &Session,
+    secs: u64,
+    quiet: Duration,
+) -> (CompileStatus, Convergence, Vec<String>, usize) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut errors = Vec::new();
     loop {
-        assert!(Instant::now() < deadline, "no layout ended the run within {secs} s");
+        assert!(
+            Instant::now() < deadline,
+            "no layout ended the run within {secs} s"
+        );
         for e in s.poll(Duration::from_millis(100)) {
             match e {
                 Event::Diagnostics { items, .. } => errors.extend(
-                    items.into_iter().filter(|d| d.severity == "error").map(|d| d.message),
+                    items
+                        .into_iter()
+                        .filter(|d| d.severity == "error")
+                        .map(|d| d.message),
                 ),
-                Event::LayoutUpdate { compile, convergence, .. } => {
+                Event::LayoutUpdate {
+                    compile,
+                    convergence,
+                    ..
+                } => {
                     let provisional = matches!(&convergence, Convergence::Converging { reasons, .. }
                         if reasons.iter().any(|r| r == "another pass is running"));
                     if !provisional {
@@ -69,7 +83,10 @@ fn a_persistent_error_ends_the_run() {
         return;
     };
     let (compile, convergence, errors, later) = final_layout(&s, 120, Duration::from_secs(3));
-    assert!(matches!(compile, CompileStatus::CompiledWithErrors { .. }), "{compile:?}");
+    assert!(
+        matches!(compile, CompileStatus::CompiledWithErrors { .. }),
+        "{compile:?}"
+    );
     assert!(!errors.is_empty());
     assert!(
         matches!(convergence, Convergence::PassLimitReached { .. }),
@@ -114,12 +131,32 @@ fn a_fatal_error_after_earlier_passes_is_a_failure() {
     let (compile, ..) = final_layout(&s, 120, Duration::from_millis(500));
     assert_eq!(compile, CompileStatus::Ok);
     let at = doc.find("Second page.").unwrap();
-    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "Again. ".into() }).unwrap();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "Again. ".into(),
+        },
+    )
+    .unwrap();
     s.request_layout();
     let (compile, ..) = final_layout(&s, 120, Duration::from_millis(500));
     assert_eq!(compile, CompileStatus::Ok);
-    let at = s.document_text("main.tex").unwrap().find("\\end{document}").unwrap();
-    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "\\undefinedmacro\n".repeat(101) }).unwrap();
+    let at = s
+        .document_text("main.tex")
+        .unwrap()
+        .find("\\end{document}")
+        .unwrap();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "\\undefinedmacro\n".repeat(101),
+        },
+    )
+    .unwrap();
     s.request_layout();
     let (compile, convergence, errors, _) = final_layout(&s, 120, Duration::from_secs(1));
     assert_eq!(compile, CompileStatus::Failed, "errors: {errors:?}");
@@ -147,7 +184,14 @@ fn hidden_global_state_demotes_the_unit() {
     assert_eq!(compile, CompileStatus::Ok);
     let at = doc.find("The items").unwrap();
     let r = s
-        .apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "Now ".into() })
+        .apply_edit(
+            "main.tex",
+            rtex_core::Edit {
+                start_byte: at,
+                end_byte: at,
+                text: "Now ".into(),
+            },
+        )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut served = vec![];
@@ -155,16 +199,27 @@ fn hidden_global_state_demotes_the_unit() {
     while Instant::now() < deadline && served.is_empty() && demoted.is_empty() {
         for e in s.poll(Duration::from_millis(100)) {
             match e {
-                Event::ParagraphUpdate { edit_id, status, dl, .. } if edit_id == r.edit_id && status == "ok" => {
-                    served.push(dl.lines.len())
-                }
-                Event::BackgroundScheduled { edit_id, reasons, .. } if edit_id == r.edit_id => demoted.extend(reasons),
+                Event::ParagraphUpdate {
+                    edit_id,
+                    status,
+                    dl,
+                    ..
+                } if edit_id == r.edit_id && status == "ok" => served.push(dl.lines.len()),
+                Event::BackgroundScheduled {
+                    edit_id, reasons, ..
+                } if edit_id == r.edit_id => demoted.extend(reasons),
                 _ => {}
             }
         }
     }
-    assert!(served.is_empty(), "served live although its compile changes hidden state: {served:?} rows");
-    assert!(demoted.iter().any(|r| r.contains("compiled again")), "{demoted:?}");
+    assert!(
+        served.is_empty(),
+        "served live although its compile changes hidden state: {served:?} rows"
+    );
+    assert!(
+        demoted.iter().any(|r| r.contains("compiled again")),
+        "{demoted:?}"
+    );
     s.close();
 }
 
@@ -187,7 +242,12 @@ fn landscape_pages_say_they_are_rotated() {
     while !done {
         assert!(Instant::now() < deadline, "no converged layout");
         for e in s.poll(Duration::from_millis(100)) {
-            if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
+            if let Event::LayoutUpdate {
+                pages_changed,
+                convergence,
+                ..
+            } = e
+            {
                 for p in pages_changed {
                     let flagged = p.dl.flags_map().contains_key("transformed_rows");
                     rotate.insert(p.page, (p.dl.rotate, flagged, p.exact));
@@ -198,7 +258,11 @@ fn landscape_pages_say_they_are_rotated() {
     }
     assert_eq!(
         rotate.into_iter().collect::<Vec<_>>(),
-        vec![(1, (0, false, true)), (2, (90, true, false)), (3, (0, false, true))]
+        vec![
+            (1, (0, false, true)),
+            (2, (90, true, false)),
+            (3, (0, false, true))
+        ]
     );
     s.close();
 }
@@ -214,20 +278,47 @@ fn runin_heading_is_served_with_its_text() {
         return;
     };
     let mut o = rtex_core::replay::Observer::new();
-    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    assert!(
+        o.pump(&s, Duration::from_secs(120), |o| o.ended),
+        "no first layout"
+    );
     let at = doc.find("starts on").unwrap();
     let r = s
-        .apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "quickly ".into() })
+        .apply_edit(
+            "main.tex",
+            rtex_core::Edit {
+                start_byte: at,
+                end_byte: at,
+                text: "quickly ".into(),
+            },
+        )
         .unwrap();
     assert_eq!(r.routed, "fast", "{:?}", r.reasons);
     let eid = r.edit_id;
-    assert!(o.pump(&s, Duration::from_secs(20), |o| o.updates.keys().any(|(e, _)| *e == eid)), "no fast result");
-    assert!(o.settle(&s, r.source_revision, Duration::from_secs(120)), "no settled layout");
-    let served: Vec<_> = o.updates.iter().filter(|((e, _), _)| *e == eid).map(|(_, v)| v.clone()).collect();
+    assert!(
+        o.pump(&s, Duration::from_secs(20), |o| o
+            .updates
+            .keys()
+            .any(|(e, _)| *e == eid)),
+        "no fast result"
+    );
+    assert!(
+        o.settle(&s, r.source_revision, Duration::from_secs(120)),
+        "no settled layout"
+    );
+    let served: Vec<_> = o
+        .updates
+        .iter()
+        .filter(|((e, _), _)| *e == eid)
+        .map(|(_, v)| v.clone())
+        .collect();
     for sv in &served {
         let j = o.judge(sv);
         assert!(
-            matches!(j.verdict, rtex_core::replay::Verdict::Match | rtex_core::replay::Verdict::DeclinedStatus),
+            matches!(
+                j.verdict,
+                rtex_core::replay::Verdict::Match | rtex_core::replay::Verdict::DeclinedStatus
+            ),
             "{:?}: {:?}",
             j.verdict,
             j.details
@@ -237,11 +328,11 @@ fn runin_heading_is_served_with_its_text() {
 }
 
 /// Material LaTeX adds after `shipout/before` (the shipout/background and /foreground hooks:
-/// eso-pic, pdfpages' inserted pages, watermarks) is not in the captured page, which used to be
-/// reported exact without it (stress-test document, an `\includepdf` page drawn empty). Such a
-/// page is flagged `shipout_extras`: Degraded, drawn from its PDF.
+/// eso-pic, pdfpages' inserted pages, watermarks) was missing from the captured page, which was
+/// reported exact without it (stress-test document, an `\includepdf` page drawn empty). Pages
+/// are now read from the box LuaTeX ships (pre_shipout_filter): the material is in the list.
 #[test]
-fn shipout_background_material_degrades_the_page() {
+fn shipout_background_material_is_in_the_page() {
     let Some(s) = open(
         "esopic",
         "\\documentclass{article}\n\\usepackage{eso-pic}\n\\begin{document}\n\\AddToShipoutPictureBG*{\\put(50,50){\\rule{2cm}{2cm}}}\nFirst page, with a background square.\n\\newpage\nSecond page, plain.\n\\end{document}\n",
@@ -254,15 +345,31 @@ fn shipout_background_material_degrades_the_page() {
     while !done {
         assert!(Instant::now() < deadline, "no converged layout");
         for e in s.poll(Duration::from_millis(100)) {
-            if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
+            if let Event::LayoutUpdate {
+                pages_changed,
+                convergence,
+                ..
+            } = e
+            {
                 for p in pages_changed {
-                    pages.insert(p.page, (p.dl.flags_map().contains_key("shipout_extras"), p.exact));
+                    // the background square: a 2 cm rule
+                    let two_cm = (2.0 * 72.27 / 2.54 * 65536.0) as i64;
+                    let squares =
+                        p.dl.other
+                            .iter()
+                            .chain(p.dl.lines.iter().flat_map(|l| l.items.iter()))
+                            .filter(|it| {
+                                matches!(it, rtex_dl::Item::Rule { width, height, .. }
+                            if (width - two_cm).abs() < 1000 && (height - two_cm).abs() < 1000)
+                            })
+                            .count();
+                    pages.insert(p.page, squares);
                 }
                 done |= matches!(convergence, Convergence::Converged);
             }
         }
     }
-    assert_eq!(pages.into_iter().collect::<Vec<_>>(), vec![(1, (true, false)), (2, (false, true))]);
+    assert_eq!(pages.into_iter().collect::<Vec<_>>(), vec![(1, 1), (2, 0)]);
     s.close();
 }
 
@@ -297,7 +404,12 @@ fn repeated_images_keep_their_files() {
     while !converged {
         assert!(Instant::now() < deadline, "no converged layout");
         for e in s.poll(Duration::from_millis(100)) {
-            if let Event::LayoutUpdate { pages_changed, convergence, .. } = e {
+            if let Event::LayoutUpdate {
+                pages_changed,
+                convergence,
+                ..
+            } = e
+            {
                 for p in pages_changed {
                     pages.insert(p.page, p.dl);
                 }
@@ -307,7 +419,11 @@ fn repeated_images_keep_their_files() {
     }
     let mut files = vec![];
     for dl in pages.values() {
-        for it in dl.other.iter().chain(dl.lines.iter().flat_map(|l| l.items.iter())) {
+        for it in dl
+            .other
+            .iter()
+            .chain(dl.lines.iter().flat_map(|l| l.items.iter()))
+        {
             if let rtex_dl::Item::Image { index, .. } = it {
                 files.push(dl.images.get(&index.to_string()).map(|i| i.file.clone()));
             }
@@ -320,10 +436,11 @@ fn repeated_images_keep_their_files() {
 
 /// A 1x1 PNG.
 const TINY_PNG: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
-    0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
-    0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18,
-    0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+    0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+    0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
 /// The live server keeps the images it saved: from the second compile of a paragraph on, its
@@ -346,36 +463,64 @@ fn live_results_name_reused_images() {
     cfg.build_dir = root.join("build");
     let s = Session::open(cfg).unwrap();
     let mut o = rtex_core::replay::Observer::new();
-    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    assert!(
+        o.pump(&s, Duration::from_secs(120), |o| o.ended),
+        "no first layout"
+    );
     let mut files = vec![];
     // a word, then the two images swapped: the second compile reuses both, b.png first
     for step in 0..2 {
         let text = s.document_text("main.tex").unwrap();
         let edit = if step == 0 {
             let at = text.find("images").unwrap();
-            rtex_core::Edit { start_byte: at, end_byte: at, text: "new ".into() }
+            rtex_core::Edit {
+                start_byte: at,
+                end_byte: at,
+                text: "new ".into(),
+            }
         } else {
             let (a, b) = (text.find("{a.png}").unwrap(), text.find("{b.png}").unwrap());
-            rtex_core::Edit { start_byte: a, end_byte: b + 7, text: "{b.png} and \\includegraphics[width=1cm]{a.png}".into() }
+            rtex_core::Edit {
+                start_byte: a,
+                end_byte: b + 7,
+                text: "{b.png} and \\includegraphics[width=1cm]{a.png}".into(),
+            }
         };
         let r = s.apply_edit("main.tex", edit).unwrap();
         assert_eq!(r.routed, "fast", "{:?}", r.reasons);
         let eid = r.edit_id;
-        assert!(o.pump(&s, Duration::from_secs(20), |o| o.updates.keys().any(|(e, _)| *e == eid)), "no fast result");
-        let sv = o.updates.iter().find(|((e, _), _)| *e == eid).map(|(_, v)| v.clone()).unwrap();
+        assert!(
+            o.pump(&s, Duration::from_secs(20), |o| o
+                .updates
+                .keys()
+                .any(|(e, _)| *e == eid)),
+            "no fast result"
+        );
+        let sv = o
+            .updates
+            .iter()
+            .find(|((e, _), _)| *e == eid)
+            .map(|(_, v)| v.clone())
+            .unwrap();
         files = sv
             .dl
             .lines
             .iter()
             .flat_map(|l| l.items.iter())
             .filter_map(|it| match it {
-                rtex_dl::Item::Image { index, .. } => Some(sv.dl.images.get(&index.to_string()).map(|i| i.file.clone())),
+                rtex_dl::Item::Image { index, .. } => {
+                    Some(sv.dl.images.get(&index.to_string()).map(|i| i.file.clone()))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
     }
     let f = |n: &str| Some(n.to_string());
-    assert_eq!(files, vec![f("b.png"), f("a.png")], "the second compile's images");
+    assert_eq!(
+        files,
+        vec![f("b.png"), f("a.png")],
+        "the second compile's images"
+    );
     s.close();
 }
 
@@ -403,17 +548,37 @@ fn a_preamble_with_inputs_uses_the_standby() {
     cfg.debounce = Duration::from_millis(50);
     let s = Session::open(cfg).unwrap();
     let mut o = rtex_core::replay::Observer::new();
-    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    assert!(
+        o.pump(&s, Duration::from_secs(120), |o| o.ended),
+        "no first layout"
+    );
     let before = s.background_passes();
-    let at = s.document_text("main.tex").unwrap().find("to edit").unwrap();
+    let at = s
+        .document_text("main.tex")
+        .unwrap()
+        .find("to edit")
+        .unwrap();
     let r = s
-        .apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "quickly ".into() })
+        .apply_edit(
+            "main.tex",
+            rtex_core::Edit {
+                start_byte: at,
+                end_byte: at,
+                text: "quickly ".into(),
+            },
+        )
         .unwrap();
     // give the standby time to load its preamble before the pass is asked for
     std::thread::sleep(Duration::from_secs(3));
-    assert!(o.settle(&s, r.source_revision, Duration::from_secs(120)), "no settled layout");
+    assert!(
+        o.settle(&s, r.source_revision, Duration::from_secs(120)),
+        "no settled layout"
+    );
     let after = s.background_passes();
-    assert!(after.0 > before.0, "no warm pass after the edit: before {before:?}, after {after:?}");
+    assert!(
+        after.0 > before.0,
+        "no warm pass after the edit: before {before:?}, after {after:?}"
+    );
     s.close();
 }
 
@@ -444,18 +609,41 @@ fn endinput_never_reaches_the_live_server() {
     cfg.build_dir = root.join("build");
     let s = Session::open(cfg).unwrap();
     let mut o = rtex_core::replay::Observer::new();
-    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no first layout");
+    assert!(
+        o.pump(&s, Duration::from_secs(120), |o| o.ended),
+        "no first layout"
+    );
     let gen = s.versions().engine_generation;
     let at = s.document_text("part.tex").unwrap().find("ends").unwrap();
     let r = s
-        .apply_edit("part.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "quickly ".into() })
+        .apply_edit(
+            "part.tex",
+            rtex_core::Edit {
+                start_byte: at,
+                end_byte: at,
+                text: "quickly ".into(),
+            },
+        )
         .unwrap();
-    assert_ne!(r.routed, "fast", "a span with \\endinput went to the live server");
+    assert_ne!(
+        r.routed, "fast",
+        "a span with \\endinput went to the live server"
+    );
     // the junk after \endinput is no unit either
     let junk = s.document_text("part.tex").unwrap().find("Never").unwrap();
-    assert!(s.spans("part.tex").iter().all(|sp| !sp.range.contains(&junk)));
-    assert!(o.settle(&s, r.source_revision, Duration::from_secs(120)), "no settled layout");
-    assert_eq!(s.versions().engine_generation, gen, "the live engine was restarted");
+    assert!(s
+        .spans("part.tex")
+        .iter()
+        .all(|sp| !sp.range.contains(&junk)));
+    assert!(
+        o.settle(&s, r.source_revision, Duration::from_secs(120)),
+        "no settled layout"
+    );
+    assert_eq!(
+        s.versions().engine_generation,
+        gen,
+        "the live engine was restarted"
+    );
     s.close();
 }
 
@@ -470,7 +658,10 @@ fn the_index_is_built() {
         return;
     };
     let mut o = rtex_core::replay::Observer::new();
-    assert!(o.pump(&s, Duration::from_secs(120), |o| o.ended), "no layout");
+    assert!(
+        o.pump(&s, Duration::from_secs(120), |o| o.ended),
+        "no layout"
+    );
     assert!(o.converged, "{}", o.dump(&s, "did not converge"));
     // the index starts a page of its own (article's theindex), with the entries on it
     assert_eq!(o.pages_total, 2, "{}", o.dump(&s, "no index page"));
@@ -485,19 +676,28 @@ fn the_index_is_built() {
             _ => None,
         })
         .collect();
-    assert!(chars.contains("alpha") && chars.contains("beta"), "index page text: {chars}");
+    assert!(
+        chars.contains("alpha") && chars.contains("beta"),
+        "index page text: {chars}"
+    );
     s.close();
 }
 
 /// The error diagnostics in force when the first layout arrives, and that layout's status.
-fn first_layout_errors(s: &Session, secs: u64) -> (CompileStatus, Vec<rtex_core::session::Diagnostic>) {
+fn first_layout_errors(
+    s: &Session,
+    secs: u64,
+) -> (CompileStatus, Vec<rtex_core::session::Diagnostic>) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut errors = vec![];
     while Instant::now() < deadline {
         for e in s.poll(Duration::from_millis(100)) {
             match e {
                 Event::Diagnostics { items, .. } => {
-                    errors = items.into_iter().filter(|d| d.severity == "error").collect()
+                    errors = items
+                        .into_iter()
+                        .filter(|d| d.severity == "error")
+                        .collect()
                 }
                 Event::LayoutUpdate { compile, .. } => return (compile, errors),
                 _ => {}
@@ -518,11 +718,25 @@ fn a_commented_begin_document_is_not_the_body() {
         return;
     };
     let (_, errors) = first_layout_errors(&s, 120);
-    let first = errors.first().expect("the undefined environment is an error");
-    assert!(first.message.contains("Environment theorm undefined"), "{errors:?}");
+    let first = errors
+        .first()
+        .expect("the undefined environment is an error");
+    assert!(
+        first.message.contains("Environment theorm undefined"),
+        "{errors:?}"
+    );
     assert_eq!(first.line, Some(6), "{errors:?}");
-    assert!(first.file.as_deref().is_some_and(|f| f.ends_with("main.tex")), "{errors:?}");
-    assert!(!errors.iter().any(|d| d.message.contains("preamble")), "{errors:?}");
+    assert!(
+        first
+            .file
+            .as_deref()
+            .is_some_and(|f| f.ends_with("main.tex")),
+        "{errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|d| d.message.contains("preamble")),
+        "{errors:?}"
+    );
     s.close();
 }
 
@@ -541,7 +755,13 @@ fn a_fatal_error_has_a_location() {
     let first = errors.first().expect("an error");
     assert!(first.message.contains("Missing \\right"), "{errors:?}");
     assert_eq!(first.line, Some(5), "{errors:?}");
-    assert!(first.file.as_deref().is_some_and(|f| f.ends_with("main.tex")), "{errors:?}");
+    assert!(
+        first
+            .file
+            .as_deref()
+            .is_some_and(|f| f.ends_with("main.tex")),
+        "{errors:?}"
+    );
     assert!(errors.iter().all(|d| d.message.len() < 1000), "{errors:?}");
     s.close();
 }
@@ -557,14 +777,28 @@ fn a_picture_with_an_error_is_not_cached() {
         return;
     };
     let (compile, convergence, errors, _) = final_layout(&s, 120, Duration::from_millis(500));
-    assert!(matches!(compile, CompileStatus::CompiledWithErrors { .. }), "{compile:?} {convergence:?}");
+    assert!(
+        matches!(compile, CompileStatus::CompiledWithErrors { .. }),
+        "{compile:?} {convergence:?}"
+    );
     assert!(errors.iter().any(|e| e.contains("semicolon")), "{errors:?}");
     // a second run (an edit elsewhere) still compiles the picture
     let at = doc.find("Text.").unwrap();
-    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: "More ".into() }).unwrap();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "More ".into(),
+        },
+    )
+    .unwrap();
     s.request_layout();
     let (compile, _, errors, _) = final_layout(&s, 120, Duration::from_millis(500));
-    assert!(matches!(compile, CompileStatus::CompiledWithErrors { .. }), "{compile:?}");
+    assert!(
+        matches!(compile, CompileStatus::CompiledWithErrors { .. }),
+        "{compile:?}"
+    );
     assert!(errors.iter().any(|e| e.contains("semicolon")), "{errors:?}");
     s.close();
 }
@@ -581,7 +815,11 @@ fn an_error_at_the_end_of_the_preamble_is_on_begin_document() {
     let (_, errors) = first_layout_errors(&s, 120);
     let first = errors.first().expect("the option clash is an error");
     assert!(first.message.contains("Option clash"), "{errors:?}");
-    assert_eq!((first.file.as_deref(), first.line), (Some("main.tex"), Some(4)), "{errors:?}");
+    assert_eq!(
+        (first.file.as_deref(), first.line),
+        (Some("main.tex"), Some(4)),
+        "{errors:?}"
+    );
     s.close();
 }
 
@@ -597,7 +835,8 @@ fn an_endless_loop_stops_the_pass() {
     let _ = std::fs::remove_dir_all(&root);
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let doc = "\\documentclass{article}\n\\begin{document}\nText.\n\n\\def\\x{\\x}\\x\n\\end{document}\n";
+    let doc =
+        "\\documentclass{article}\n\\begin{document}\nText.\n\n\\def\\x{\\x}\\x\n\\end{document}\n";
     std::fs::write(project.join("main.tex"), doc).unwrap();
     let mut cfg = SessionConfig::new(&project, "main.tex");
     cfg.build_dir = root.join("build");
@@ -608,10 +847,17 @@ fn an_endless_loop_stops_the_pass() {
     let (compile, convergence, errors, _) = final_layout(&s, 60, Duration::from_millis(200));
     assert_eq!(compile, CompileStatus::Failed, "{convergence:?} {errors:?}");
     assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
-    assert!(errors.iter().any(|e| e.contains("did not finish")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("did not finish")),
+        "{errors:?}"
+    );
     // the live server never loads the loop (it is no setup statement) and closing is prompt
     s.close();
-    assert!(t0.elapsed() < Duration::from_secs(40), "closed after {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(40),
+        "closed after {:?}",
+        t0.elapsed()
+    );
 }
 
 /// Once a pass has finished, a pass that runs twice as long as the slowest one while the
@@ -627,21 +873,42 @@ fn removing_an_endless_loop_recovers_quickly() {
     assert_eq!(compile, CompileStatus::Ok);
     let at = doc.find("More text.").unwrap();
     let lp = "\\def\\x{\\x}\\x ";
-    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at, text: lp.into() }).unwrap();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: lp.into(),
+        },
+    )
+    .unwrap();
     s.request_layout();
     // the looping pass starts; then the loop is removed again
     let until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < until {
         s.poll(Duration::from_millis(100));
     }
-    s.apply_edit("main.tex", rtex_core::Edit { start_byte: at, end_byte: at + lp.len(), text: String::new() }).unwrap();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at + lp.len(),
+            text: String::new(),
+        },
+    )
+    .unwrap();
     s.request_layout();
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_secs(60);
     let mut ok = false;
     while Instant::now() < deadline && !ok {
         for e in s.poll(Duration::from_millis(100)) {
-            if let Event::LayoutUpdate { compile: CompileStatus::Ok, versions, .. } = e {
+            if let Event::LayoutUpdate {
+                compile: CompileStatus::Ok,
+                versions,
+                ..
+            } = e
+            {
                 ok = versions.source_revision >= s.versions().source_revision;
             }
         }
@@ -672,24 +939,42 @@ fn a_reopened_session_starts_from_its_last_layout() {
         cfg.debounce = Duration::from_millis(50);
         Session::open(cfg).unwrap()
     };
-    // the first layout a session delivers: (provisional, pages, ms after open)
+    // the first layout a session delivers: (provisional, pages, time after open, its text)
     let first = |s: &Session| {
         let t0 = Instant::now();
         loop {
             assert!(t0.elapsed() < Duration::from_secs(120), "no layout");
             for e in s.poll(Duration::from_millis(50)) {
-                if let Event::LayoutUpdate { convergence, pages_total, .. } = e {
+                if let Event::LayoutUpdate {
+                    convergence,
+                    pages_total,
+                    pages_changed,
+                    ..
+                } = e
+                {
                     let provisional = matches!(&convergence, Convergence::Converging { reasons, .. }
                         if reasons.iter().any(|r| r == "another pass is running"));
-                    return (provisional, pages_total, t0.elapsed());
+                    let text: String = pages_changed
+                        .iter()
+                        .flat_map(|p| p.dl.lines.iter())
+                        .flat_map(|l| l.items.iter())
+                        .filter_map(|i| match i {
+                            rtex_dl::Item::Glyph { char, .. } => char::from_u32(*char as u32),
+                            _ => None,
+                        })
+                        .collect();
+                    return (provisional, pages_total, t0.elapsed(), text);
                 }
             }
         }
     };
     let s = open();
-    let (provisional, pages, _) = first(&s);
-    assert!(!provisional);
+    let (provisional, pages, ..) = first(&s);
     assert_eq!(pages, 2);
+    if provisional {
+        // a slow first pass (a cold machine) is shown while the next one runs: wait for the end
+        final_layout(&s, 120, Duration::from_millis(300));
+    }
     // the run's sources hash is written right after its layout
     let until = Instant::now() + Duration::from_millis(500);
     while Instant::now() < until {
@@ -698,18 +983,108 @@ fn a_reopened_session_starts_from_its_last_layout() {
     s.close();
     // same sources: the saved layout first, then the pass
     let s = open();
-    let (provisional, pages, at) = first(&s);
+    let (provisional, pages, at, _) = first(&s);
     assert!(provisional, "the reopened session waited for its pass");
     assert_eq!(pages, 2);
     assert!(at < Duration::from_secs(5), "{at:?}");
     let (compile, convergence, ..) = final_layout(&s, 60, Duration::from_millis(300));
     assert_eq!(compile, CompileStatus::Ok);
-    assert!(matches!(convergence, Convergence::Converged), "{convergence:?}");
+    assert!(
+        matches!(convergence, Convergence::Converged),
+        "{convergence:?}"
+    );
     s.close();
     // changed sources: no saved layout
-    std::fs::write(project.join("main.tex"), doc.replace("Second page.", "Second page, edited.")).unwrap();
+    std::fs::write(
+        project.join("main.tex"),
+        doc.replace("Second page.", "Second page, edited."),
+    )
+    .unwrap();
     let s = open();
-    let (provisional, ..) = first(&s);
-    assert!(!provisional, "a layout of other sources was shown");
+    // (a slow pass of the new sources may itself be shown provisionally: what matters is that
+    // the first layout is of these sources)
+    let (.., text) = first(&s);
+    assert!(
+        text.contains("edited"),
+        "a layout of other sources was shown: {text}"
+    );
+    s.close();
+}
+
+/// A file the document starts to `\input` before it exists used to be remembered as an empty
+/// buffer, and every later pass compiled that empty text from the snapshot: TeX never reported
+/// the file missing, and once created on disk it never showed up.
+#[test]
+fn an_input_created_after_it_is_named_is_read() {
+    let main = "\\documentclass{article}\n\\begin{document}\nFirst.\n\\end{document}\n";
+    let Some(s) = open("late-input", main) else {
+        return;
+    };
+    let project = std::env::temp_dir()
+        .join(format!("rtex-regr-{}-late-input", std::process::id()))
+        .join("project");
+    final_layout(&s, 120, Duration::from_millis(200));
+    let at = main.find("First.").unwrap() + "First.".len();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "\n\\input{later}\n".into(),
+        },
+    )
+    .unwrap();
+    let (_, _, errors, _) = final_layout(&s, 120, Duration::from_millis(200));
+    assert!(
+        errors.iter().any(|e| e.contains("later")),
+        "the missing file is not reported: {errors:?}"
+    );
+    std::fs::write(project.join("later.tex"), "Written later.\n").unwrap();
+    s.apply_edit(
+        "main.tex",
+        rtex_core::Edit {
+            start_byte: at,
+            end_byte: at,
+            text: " Again.".into(),
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut text = String::new();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no layout with the new file: {text}"
+        );
+        let mut done = false;
+        for e in s.poll(Duration::from_millis(100)) {
+            if let Event::LayoutUpdate {
+                pages_changed,
+                convergence,
+                ..
+            } = e
+            {
+                for p in pages_changed.iter().filter(|p| p.page == 1) {
+                    text =
+                        p.dl.lines
+                            .iter()
+                            .flat_map(|l| l.items.iter())
+                            .filter_map(|i| match i {
+                                rtex_dl::Item::Glyph { char, .. } => char::from_u32(*char as u32),
+                                _ => None,
+                            })
+                            .collect();
+                }
+                done |= !matches!(&convergence, Convergence::Converging { .. });
+            }
+        }
+        if done && text.contains("Again") {
+            break;
+        }
+    }
+    assert!(
+        text.contains("Writtenlater"),
+        "the file's text is not on the page: {text}"
+    );
     s.close();
 }

@@ -145,7 +145,7 @@ fn row_text(l: &Line) -> String {
 
 pub fn run(opts: VerifyOpts) -> Result<Report> {
     let tl = TexLive::discover()?;
-    let project = opts.project.canonicalize()?;
+    let project = rtex_core::paths::canonical(&opts.project)?;
     std::fs::create_dir_all(&opts.build)?;
     println!("== verify {} ({})", project.display(), opts.main);
     // bibliography support for mixed fixtures: run biber when a .bcf shows up after the first pass
@@ -497,7 +497,14 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
         let dl_images: Vec<(f64, f64, f64, f64, f64)> = {
             let mut out = Vec::new();
             walk_transforms(&dl, |it, [a, b, c, d, tx, ty]| {
-                if let Item::Image { x, y_top, width, height, .. } = it {
+                if let Item::Image {
+                    x,
+                    y_top,
+                    width,
+                    height,
+                    ..
+                } = it
+                {
                     let tr = |px: f64, py: f64| (a * px + c * py + tx, b * px + d * py + ty);
                     let (x0, y0) = (*x as f64, *y_top as f64);
                     let (x1, y1) = (x0 + *width as f64, y0 + *height as f64);
@@ -506,8 +513,14 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
                     let maxx = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
                     let miny = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
                     let maxy = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-                    let (x, y) = (minx / rtex_dl::SP_PER_BP, pdf_page.height - maxy / rtex_dl::SP_PER_BP);
-                    let (w, h) = ((maxx - minx) / rtex_dl::SP_PER_BP, (maxy - miny) / rtex_dl::SP_PER_BP);
+                    let (x, y) = (
+                        minx / rtex_dl::SP_PER_BP,
+                        pdf_page.height - maxy / rtex_dl::SP_PER_BP,
+                    );
+                    let (w, h) = (
+                        (maxx - minx) / rtex_dl::SP_PER_BP,
+                        (maxy - miny) / rtex_dl::SP_PER_BP,
+                    );
                     out.push((x, y, w, h, 0.01));
                 }
             });
@@ -574,7 +587,10 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
                     format!("host falls back to the PDF page; not native: {why}")
                 }
             };
-            println!("  page {page_no}: DEGRADED {} ({how}); glyphs matched {}/{} (pdf {})", dl.flags, rep.matched, rep.dl_glyphs, rep.pdf_glyphs);
+            println!(
+                "  page {page_no}: DEGRADED {} ({how}); glyphs matched {}/{} (pdf {})",
+                dl.flags, rep.matched, rep.dl_glyphs, rep.pdf_glyphs
+            );
         }
         if opts.raster {
             let ref_png = opts.build.join(format!("ref-p{page_no}.png"));
@@ -614,8 +630,16 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
             }
             // each display-list image without a PDF image at its rectangle, and the closest one
             for (x, y, w, h, tol) in &dl_images {
-                let d = |im: &&pdftext::PdfImage| (im.x - x).abs().max((im.y - y).abs()).max((im.w - w).abs()).max((im.h - h).abs());
-                let Some(near) = pdf_page.images.iter().min_by(|a, b| d(a).total_cmp(&d(b))) else { continue };
+                let d = |im: &&pdftext::PdfImage| {
+                    (im.x - x)
+                        .abs()
+                        .max((im.y - y).abs())
+                        .max((im.w - w).abs())
+                        .max((im.h - h).abs())
+                };
+                let Some(near) = pdf_page.images.iter().min_by(|a, b| d(a).total_cmp(&d(b))) else {
+                    continue;
+                };
                 if d(&near) >= *tol {
                     println!("    image unmatched: dl=({x:.4},{y:.4} {w:.4}x{h:.4}) nearest pdf=({:.4},{:.4} {:.4}x{:.4}) off {:.5} (tolerance {tol:.5})", near.x, near.y, near.w, near.h, d(&near));
                 }
@@ -797,13 +821,20 @@ fn walk_transforms<'a>(dl: &'a DisplayList, mut f: impl FnMut(&'a Item, [f64; 6]
     let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut stack: Vec<[f64; 6]> = Vec::new();
     let mut cur = identity;
-    for it in dl.other.iter().chain(dl.lines.iter().flat_map(|l| l.items.iter())) {
+    for it in dl
+        .other
+        .iter()
+        .chain(dl.lines.iter().flat_map(|l| l.items.iter()))
+    {
         if let Item::Matrix { op, x, y, data } = it {
             match op.as_str() {
                 "save" => stack.push(cur),
                 "restore" => cur = stack.pop().unwrap_or(identity),
                 _ => {
-                    let v: Vec<f64> = data.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                    let v: Vec<f64> = data
+                        .split_whitespace()
+                        .filter_map(|t| t.parse().ok())
+                        .collect();
                     if v.len() == 4 {
                         // y down: the matrix [a b c d] of the PDF becomes [a -b -c d]
                         let (a2, b2, c2, d2) = (v[0], -v[1], -v[2], v[3]);
@@ -837,7 +868,10 @@ fn with_transforms_applied(dl: &DisplayList) -> DisplayList {
         if let Item::Glyph { x, y, .. } = it {
             let (px, py) = (*x as f64, *y as f64);
             any |= [a, b, c, d, tx, ty] != [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-            moved.push(((a * px + c * py + tx).round() as i64, (b * px + d * py + ty).round() as i64));
+            moved.push((
+                (a * px + c * py + tx).round() as i64,
+                (b * px + d * py + ty).round() as i64,
+            ));
         }
     });
     let mut out = dl.clone();
@@ -845,7 +879,11 @@ fn with_transforms_applied(dl: &DisplayList) -> DisplayList {
         return out;
     }
     let mut k = 0;
-    for it in out.other.iter_mut().chain(out.lines.iter_mut().flat_map(|l| l.items.iter_mut())) {
+    for it in out
+        .other
+        .iter_mut()
+        .chain(out.lines.iter_mut().flat_map(|l| l.items.iter_mut()))
+    {
         if let Item::Glyph { x, y, .. } = it {
             (*x, *y) = moved[k];
             k += 1;

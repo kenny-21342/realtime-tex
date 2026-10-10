@@ -1,7 +1,7 @@
 //! Display-list model for rtex.
 //!
 //! The JSON form produced by `tex/rtex-dl.lua` is the provisional interchange format until the
-//! binary encoding is revision 1 (docs/DISPLAY_LIST.md). Coordinates are in scaled points (sp); y grows down.
+//! binary encoding is revision 1 (docs/display-list.md). Coordinates are in scaled points (sp); y grows down.
 
 pub mod binary;
 pub mod gfx;
@@ -149,10 +149,28 @@ impl Serialize for Item {
                 width,
                 height,
             } => json!(["r", x, y_top, width, height]),
-            Item::Color { stack, cmd, data, after: None } => json!(["c", stack, cmd, data]),
-            Item::Color { stack, cmd, data, after: Some(a) } => json!(["c", stack, cmd, data, a]),
-            Item::Literal { mode, data, at: None } => json!(["l", mode, data]),
-            Item::Literal { mode, data, at: Some((x, y)) } => json!(["l", mode, data, x, y]),
+            Item::Color {
+                stack,
+                cmd,
+                data,
+                after: None,
+            } => json!(["c", stack, cmd, data]),
+            Item::Color {
+                stack,
+                cmd,
+                data,
+                after: Some(a),
+            } => json!(["c", stack, cmd, data, a]),
+            Item::Literal {
+                mode,
+                data,
+                at: None,
+            } => json!(["l", mode, data]),
+            Item::Literal {
+                mode,
+                data,
+                at: Some((x, y)),
+            } => json!(["l", mode, data, x, y]),
             Item::Unsupported { kind, detail } => json!(["u", kind, detail]),
             Item::Math { on, x } => json!(["m", if *on { "on" } else { "off" }, x]),
             Item::Image {
@@ -380,13 +398,40 @@ pub struct DisplayList {
     /// are not the color package's initial black: LuaTeX carries its color stacks across pages,
     /// so a page that starts inside a color group pops entries pushed on an earlier one. Capture
     /// pages only; the native drawing starts from it.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "map_or_empty_array")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "map_or_empty_array"
+    )]
     pub color_base: BTreeMap<String, Vec<String>>,
     /// Pictures this page draws from the picture cache's stored drawings (their `cached_picture`
     /// items were replaced by the drawing): where each is, by its cache key. A host that copies
     /// a cached picture into a live unit takes its pixels from here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pictures: Vec<PictureSpot>,
+    /// The tiling patterns this page's literals paint with (pgf's `patterns` library: `/pgfpatN
+    /// scn`), by resource name; capture pages only. Native drawing needs their cells.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "map_or_empty_array"
+    )]
+    pub patterns: BTreeMap<String, Pattern>,
+}
+
+/// A PDF tiling pattern (PatternType 1) as pgf declares it: the cell's content stream and its
+/// geometry, in pattern space (bp). `matrix` maps pattern space to the page's default space
+/// (bottom-left origin), so tiles are anchored to the page, not to the shape they fill.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Pattern {
+    /// 1: the cell carries its own colours; 2: uncoloured, painted in the tint `scn` gives.
+    pub paint_type: u8,
+    pub bbox: [f64; 4],
+    pub xstep: f64,
+    pub ystep: f64,
+    pub matrix: [f64; 6],
+    /// The cell's PDF operators.
+    pub content: String,
 }
 
 /// A picture on a page (sp, the list's frame) and its picture-cache key (`file:line`).

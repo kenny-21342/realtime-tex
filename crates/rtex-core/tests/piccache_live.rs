@@ -93,11 +93,18 @@ fn edited_sentence_keeps_its_plot_from_the_cache() {
         .iter()
         .flat_map(|l| l.items.iter())
         .find_map(|i| match i {
-            Item::Unsupported { kind, detail } if kind == "cached_picture" => detail.as_str().map(str::to_string),
+            Item::Unsupported { kind, detail } if kind == "cached_picture" => {
+                detail.as_str().map(str::to_string)
+            }
             _ => None,
         });
     if let Some(d) = &detail {
-        assert!(d.split(' ').nth(5).is_some_and(|k| k.starts_with("main.tex:")), "{d}");
+        assert!(
+            d.split(' ')
+                .nth(5)
+                .is_some_and(|k| k.starts_with("main.tex:")),
+            "{d}"
+        );
     }
     assert!(
         has_cached_picture(&dl),
@@ -106,6 +113,13 @@ fn edited_sentence_keeps_its_plot_from_the_cache() {
     );
     // the compile costs the sentence, not the plot
     assert!(timing.tex_us < 100_000, "tex {} us", timing.tex_us);
+    // and no probe ran: the probe compiles the snapshot's text, which would draw the plot
+    // (seconds with macro tracing on, enough to trip the engine watchdog)
+    assert_eq!(
+        s.probes(),
+        0,
+        "a unit whose only unknown is a cached picture is not probed"
+    );
     s.close();
     let _ = std::fs::remove_dir_all(&root);
 }

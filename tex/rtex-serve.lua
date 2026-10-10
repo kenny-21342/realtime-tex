@@ -1,9 +1,9 @@
 -- rtex-serve.lua: persistent paragraph server running inside a live LuaLaTeX document.
--- Requests arrive on stdin:
+-- Requests arrive on stdin (Windows: on the named pipe $RTEX_REQ, opened in binary mode):
 --   C <req> <ctx> <len>\n<len bytes>   compile <len> bytes of paragraph source (no JSON)
 --   {...}\n                            any other op as a JSON object (context, ping, stats, ...)
--- Responses are frames on the FIFO named by $RTEX_RESP: u32-LE length, u8 kind, payload
--- (kind 0: JSON; kind 1: u32 json_len, JSON header, binary display list). See docs/PROTOCOL.md.
+-- Responses are frames on the FIFO (Windows: named pipe) named by $RTEX_RESP: u32-LE length, u8 kind, payload
+-- (kind 0: JSON; kind 1: u32 json_len, JSON header, binary display list). See docs/engine-protocol.md.
 local S = { contexts = {}, errors = {}, requests = 0 }
 local json = dofile(kpse.find_file("rtex-json.lua", "lua") or "rtex-json.lua")
 local dl = dofile(kpse.find_file("rtex-dl.lua", "lua") or "rtex-dl.lua")
@@ -33,6 +33,11 @@ local function send_error_result(req, ctx, message)
 end
 
 local function log(msg) texio.write_nl("log", "rtex-serve: " .. msg) end
+
+-- Test seam: with $RTEX_TEST_FINISH_ERROR set to a marker string, a compile whose source
+-- contains the marker fails inside finish (tests of the internal-error path).
+local test_error_marker = os.getenv("RTEX_TEST_FINISH_ERROR")
+if test_error_marker == "" then test_error_marker = nil end
 
 -- Debug trace ($RTEX_TRACE, set by the session's debug setting): one line per request stage,
 -- flushed at once, so the stage a hung request reached survives the process being killed
@@ -119,6 +124,17 @@ S.counter_names = {}
 S.counter_base = {}
 S.the_base = {}
 -- idle meanings of the macros the capture reports (looked up lazily)
+-- \iftrue / \iffalse for a \newif switch (no token.get_meaning for a primitive), else nil
+local IFTRUE, IFFALSE
+local function if_meaning(name)
+  local ok, t = pcall(create, name)
+  if not ok or not t or t.cmdname ~= "if_test" then return nil end
+  IFTRUE = IFTRUE or create("iftrue")
+  IFFALSE = IFFALSE or create("iffalse")
+  if t.mode == IFTRUE.mode then return "\\iftrue" elseif t.mode == IFFALSE.mode then return "\\iffalse" end
+  return nil
+end
+S.if_meaning = if_meaning
 S.macro_base = setmetatable({}, { __index = function(t, name)
   local m = nil
   if token.get_meaning then
@@ -127,7 +143,7 @@ S.macro_base = setmetatable({}, { __index = function(t, name)
   end
   if m == nil then
     local ok, b = pcall(token.get_macro, name)
-    m = ok and b and ("->" .. b) or false
+    m = ok and b and ("->" .. b) or if_meaning(name) or false
   end
   rawset(t, name, m)
   return m
@@ -192,6 +208,24 @@ local function install_context(id, ctx)
     local d = S.def_from_meaning(k, ctx.macros[k])
     if d then extra[#extra + 1] = d end
   end
+  -- \newif switches (glossaries' first-use \ifglo@<label>@flag): their value at the unit,
+  -- local to the compile; a compile that sets one globally (\gls) has it reset to the idle
+  -- value right after its group, so no compile sees another's first use
+  local snames, after = {}, {}
+  for k, v in pairs(ctx.macros or {}) do
+    if (v == "\\iftrue" or v == "\\iffalse") and k:match("^[%w@:%-_.]+$") then snames[#snames + 1] = k end
+  end
+  table.sort(snames)
+  for _, k in ipairs(snames) do
+    local base = S.macro_base[k]
+    if base == "\\iftrue" or base == "\\iffalse" then
+      if base ~= ctx.macros[k] then
+        extra[#extra + 1] = "\\expandafter\\let\\csname " .. k .. "\\endcsname" .. ctx.macros[k] .. " "
+      end
+      after[#after + 1] = "\\expandafter\\global\\expandafter\\let\\csname " .. k .. "\\endcsname" .. base .. " "
+    end
+  end
+  ctx.after_group = table.concat(after)
   extra[#extra + 1] = ctx.nobreak and "\\@nobreaktrue " or "\\@nobreakfalse "
   extra[#extra + 1] = ctx.afterindent and "\\@afterindenttrue " or "\\@afterindentfalse "
   extra[#extra + 1] = ctx.noskipsec and "\\@noskipsectrue " or "\\@noskipsecfalse "
@@ -227,10 +261,20 @@ local function float_content(source, name)
   return inner
 end
 
+-- An error in a Lua function TeX calls during a compile is reported by TeX and swallowed in
+-- batch mode: the compile goes on and, if the error was in S.finish, no result is ever sent,
+-- so the host waits out its watchdog and kills the engine. Every such entry point therefore
+-- runs protected; an error is traced (the trace survives the process) and recorded on the
+-- request, and S.finish answers with an internal-error result instead of staying silent.
+local function internal_error(cur, where, err)
+  local msg = where .. ": " .. tostring(err)
+  if trace_file then trace("internal error req " .. tostring(cur and cur.req) .. " in " .. msg) end
+  log("internal error in " .. msg)
+  if cur and not cur.internal then cur.internal = msg end
+end
+
 -- Called from TeX (\luafunction) inside the paragraph \vbox group, before any text.
-function S.apply()
-  local cur = S.current
-  if not cur then return end
+local function apply_body(cur)
   cur.t_apply = gettime()
   local ctx = cur.ctx
   local a = ctx.a_ints
@@ -241,6 +285,12 @@ function S.apply()
   for i = 1, #a do local g = a[i]; setglue(g[1], g[2], g[3], g[4], g[5], g[6]) end
   if ctx.parshape and #ctx.parshape > 0 then tex.parshape = ctx.parshape end
   cur.t_applied = gettime()
+end
+function S.apply()
+  local cur = S.current
+  if not cur then return end
+  local ok, err = xpcall(apply_body, debug.traceback, cur)
+  if not ok then internal_error(cur, "apply", err) end
 end
 
 -- The font selected at the server's outer level persists across requests; re-select only when
@@ -255,7 +305,7 @@ local last_nfss = nil
 --   finish() traverses the box, checks the state fingerprint and sends the result.
 -- The TeX side runs `\loop\rtexstep\ifnum\rtexcontinue>0 \repeat`.
 S.current = nil
-local head_tokens, tail_tokens  -- built in init once the \luafunction slots are known
+local head_tokens, tail_after_group  -- built in init once the \luafunction slots are known
 
 -- Leak check: the meanings of the control sequences a unit's source mentions, before and
 -- after its compile (every distinct \name in the source; a name built with \csname is not
@@ -293,7 +343,10 @@ end
 -- begin) and the font/color/width state matches, and places the cached region instead of
 -- drawing. The result reports how many pictures were seen and how many came from the cache.
 S.cache_images = {}
-function S.pic_arm(env) P.arm(S.picctl, env) end
+function S.pic_arm(env)
+  local ok, err = pcall(P.arm, S.picctl, env)
+  if not ok then internal_error(S.current, "pic_arm", err) end
+end
 function S.pic_begin(env)
   local cur = S.current
   local lookup = function(_, state)
@@ -310,9 +363,19 @@ function S.pic_begin(env)
     end
     return nil
   end
-  P.begin(S.picctl, env, lookup, nil)
+  local ok, err = xpcall(P.begin, debug.traceback, S.picctl, env, lookup, nil)
+  if not ok then
+    -- P.begin prints its continuation last: nothing was printed, so draw the picture
+    internal_error(cur, "pic_begin", err)
+    S.picctl.armed = nil
+    S.picctl.pending = nil
+    tex.sprint(S.cct, "\\csname rtex@orig@" .. env .. "\\endcsname")
+  end
 end
-function S.pic_write() P.write(S.picctl, S.cache_images) end
+function S.pic_write()
+  local ok, err = xpcall(P.write, debug.traceback, S.picctl, S.cache_images)
+  if not ok then internal_error(S.current, "pic_write", err) end
+end
 function S.pic_end() end
 
 function S.begin_compile(req_id, ctx_id, source, pics)
@@ -345,13 +408,14 @@ function S.begin_compile(req_id, ctx_id, source, pics)
                 t_read = S.t_read, t_decoded = S.t_decoded, names = cs_names(source),
                 lines = lines, pics_by_line = pics_by_line, pics_seen = 0, pics_used = 0 }
   S.current.meanings = meanings_of(S.current.names)
+  if test_error_marker and source:find(test_error_marker, 1, true) then S.current.test_error = true end
   S.images_used = false
   if trace_file then trace(format("begin req %s ctx %s bytes %d lines %d pics %s", tostring(req_id), tostring(ctx_id), #source, n, pics and #pics or 0)) end
   -- our own tokens use @ as a letter (kernel switches, float emulation); the source keeps the
   -- document's catcodes
   tex.print(S.cct, ftoks .. head_tokens .. ctx.head_extra)
   tex.print(lines)
-  tex.print(S.cct, ctx.tail_extra .. tail_tokens)
+  tex.print(S.cct, ctx.tail_extra .. "\\par\\egroup\\endgroup" .. ctx.after_group .. tail_after_group)
   S.current.t_printed = gettime()
 end
 
@@ -404,15 +468,8 @@ local HEADER_FMT = '{"op":"result","req":%d,"ctx":%d,"status":"%s","errors":[],"
   '"width":%d,"height":%d,"depth":%d,"t_tex_us":%d,"t_traverse_us":%d,"t_pack_us":0,"font_changed":%s,"dl_bytes":%d,' ..
   '"stages_us":{"decode":%d,"prepare":%d,"to_mark":%d,"mark_to_apply":%d,"apply":%d,"apply_to_finish":%d,"fingerprint":%d}}'
 
-function S.finish()
-  local cur = S.current
-  S.current = nil
-  if not cur then return end
-  local t1 = gettime()
-  if trace_file then trace(format("finish req %s errors %d", tostring(cur.req), #S.errors)) end
-  -- counters the unit advanced globally (\refstepcounter, \stepcounter …) are reported
-  -- (value at the end, when it differs from the replayed start value) and go back to the idle
-  -- values
+-- Counters back to their idle values (also the cleanup after an internal error: idempotent).
+local function restore_counters(cur)
   local cb = S.counter_base
   local start = cur.ctx and cur.ctx.counters or {}
   local advanced = nil
@@ -426,7 +483,45 @@ function S.finish()
       end
     end
   end
-  cur.advanced = advanced
+  return advanced
+end
+
+local finish_body
+
+function S.finish()
+  local cur = S.current
+  S.current = nil
+  if not cur then return end
+  if trace_file then trace(format("finish req %s errors %d", tostring(cur.req), #S.errors)) end
+  local ok, err = true, nil
+  if not cur.internal then ok, err = xpcall(finish_body, debug.traceback, cur) end
+  if ok and not cur.internal then return end
+  if not ok then internal_error(cur, "finish", err) end
+  -- answer, whatever failed: the host must not wait out its watchdog. Counters go back to the
+  -- idle values; state the error left behind is caught by the fingerprint (fatal: the host
+  -- restarts the engine), anything else is reported as an internal error for this unit.
+  pcall(restore_counters, cur)
+  local fok, fp1 = pcall(S.fingerprint, fp_scratch)
+  if not fok or font.current() ~= S.font_outer or not S.fp_equal(fp1, S.fp_base) then
+    send{ op = "fatal", req = cur.req, reason = "state_mismatch", internal = cur.internal,
+          before = S.fp_string(S.fp_base), after = fok and S.fp_string(fp1) or "?", errors = S.errors }
+    resp:flush()
+    os.exit(3)
+  end
+  send_result({ op = "result", req = cur.req, ctx = cur.ctx_id, status = "error", internal = cur.internal,
+    errors = { { message = "internal error: " .. tostring(cur.internal):match("^[^\n]*") } },
+    lines = 0, glyphs = 0, t_tex_us = 0, t_traverse_us = 0, t_pack_us = 0, dl_bytes = 0 }, "")
+  S.requests = S.requests + 1
+end
+
+finish_body = function(cur)
+  if cur.test_error then error("test: injected error in finish") end
+  local t1 = gettime()
+  -- counters the unit advanced globally (\refstepcounter, \stepcounter …) are reported
+  -- (value at the end, when it differs from the replayed start value) and go back to the idle
+  -- values
+  cur.advanced = restore_counters(cur)
+  if trace_file then trace("finish: counters done") end
   -- control sequences of the source whose meaning changed: a definition leaked
   local leaks = nil
   if cur.names then
@@ -438,6 +533,7 @@ function S.finish()
     end
   end
   cur.leaks = leaks
+  if trace_file then trace("finish: leak check done") end
   local fp1 = S.fingerprint(fp_scratch)
   local t1b = gettime()
   if font.current() ~= S.font_outer or not S.fp_equal(fp1, S.fp_base) then
@@ -445,6 +541,7 @@ function S.finish()
     resp:flush()
     os.exit(3)
   end
+  if trace_file then trace("finish: fingerprint done") end
   local box = tex.box[S.boxnum]
   local bytes, nlines, nglyphs, bw, bh, bd, flags = "", 0, 0, 0, 0, 0, nil
   if box then
@@ -452,6 +549,7 @@ function S.finish()
     bytes, nlines, nglyphs, bw, bh, bd, flags = dl.paragraph_binary(box, cur.ctx.color)
   end
   local t2 = gettime()
+  if trace_file then trace(format("finish: traversal done, %d bytes", #bytes)) end
   local st = (#S.errors > 0) and "error" or ((flags and next(flags)) and "ok_degraded" or "ok")
   local t_tex = floor((t1 - cur.t0) * 1e6 + 0.5)
   local t_trav = floor((t2 - t1b) * 1e6 + 0.5)
@@ -472,6 +570,7 @@ function S.finish()
       floor(((cur.t_apply or 0) - (cur.t0 or 0)) * 1e6 + 0.5), floor(((cur.t_applied or 0) - (cur.t_apply or 0)) * 1e6 + 0.5),
       floor((t1 - (cur.t_applied or 0)) * 1e6 + 0.5), floor((t1b - t1) * 1e6 + 0.5)), bytes)
   end
+  if trace_file then trace("finish: result sent req " .. tostring(cur.req)) end
   S.requests = S.requests + 1
 end
 
@@ -628,8 +727,13 @@ end
 function S.init(boxnum, countnum, cctnum)
   S.boxnum = boxnum
   S.countnum = countnum
+  -- the request pipe first: the host waits for it only after the ready frame
+  local req_path = os.getenv("RTEX_REQ")
+  if req_path and req_path ~= "" then
+    stdin = assert(io.open(req_path, "rb"), "cannot open request pipe " .. req_path)
+  end
   local path = os.getenv("RTEX_RESP")
-  resp = assert(io.open(path, "wb"), "cannot open response FIFO " .. tostring(path))
+  resp = assert(io.open(path, "wb"), "cannot open response channel " .. tostring(path))
   resp:setvbuf("full", 1 << 16)
   luatexbase.add_to_callback("show_error_hook", S.on_error, "rtex-serve")
   -- \luafunction slots: no chunk compilation per call, unlike \directlua{...}
@@ -668,7 +772,7 @@ function S.init(boxnum, countnum, cctnum)
   head_tokens = "\\luafunction" .. S.fn_mark .. " \\begingroup\\global\\setbox\\rtexbox\\vbox\\bgroup\\luafunction" .. S.fn_apply .. " "
   -- the title block's kernel macros (rtex-serve-patches.tex, 5) come back after every compile
   local restore_title = token.is_defined("rtex@restoretitle") and "\\rtex@restoretitle " or ""
-  tail_tokens = "\\par\\egroup\\endgroup" .. (nobreak_idle and "\\global\\@nobreaktrue " or "\\global\\@nobreakfalse ") .. restore_title .. "\\luafunction" .. S.fn_finish .. " "
+  tail_after_group = (nobreak_idle and "\\global\\@nobreaktrue " or "\\global\\@nobreakfalse ") .. restore_title .. "\\luafunction" .. S.fn_finish .. " "
   S.fp_base = S.fingerprint()
   S.font_outer = font.current()
   send{ op = "ready", banner = status.banner, luatex_version = status.luatex_version,
@@ -679,8 +783,10 @@ function S.init(boxnum, countnum, cctnum)
     -- Debug extras, after "ready" and under pcall: nothing here may keep the server from
     -- starting. Font loads with their cost (a first use of a big font can take seconds): the
     -- define_font callback is wrapped whoever registered it (luaotfload, or luatexja which
-    -- replaces luaotfload's). Every macro expansion goes to the TeX log (\tracingmacros), so a
-    -- loop shows in the log's last flushed block even though the killed process loses the tail.
+    -- replaces luaotfload's). With $RTEX_TRACE_MACROS (opt-in) every macro expansion goes to
+    -- the TeX log (\tracingmacros), so a loop shows in the log's last flushed block even though
+    -- the killed process loses the tail; it makes heavy compiles many times slower and the log
+    -- grows without bound, so it is not part of the default trace.
     local ok, err = pcall(function()
       local descs = luatexbase.callback_descriptions("define_font")
       local name = descs and descs[1]
@@ -693,8 +799,12 @@ function S.init(boxnum, countnum, cctnum)
         trace(format("font %s size %s id %s: %.1f ms", tostring(fname), tostring(size), tostring(id), (gettime() - t) * 1000))
         return f
       end, name)
-      tex.tracingmacros = 1
-      tex.tracingonline = 0
+      local tm = os.getenv("RTEX_TRACE_MACROS")
+      if tm and tm ~= "" and tm ~= "0" then
+        tex.tracingmacros = 1
+        tex.tracingonline = 0
+        trace("macro tracing on")
+      end
     end)
     if not ok then trace("debug extras not installed: " .. tostring(err)) end
   end
@@ -751,11 +861,15 @@ function S.step()
       if ok and type(v) == "table" then pics = v end
     end
     S.t_decoded = gettime()
-    local hok, herr = pcall(S.begin_compile, tonumber(req_id), tonumber(ctx_id), source, pics)
+    local hok, herr = xpcall(S.begin_compile, debug.traceback, tonumber(req_id), tonumber(ctx_id), source, pics)
     if not hok then
       log("handler error: " .. tostring(herr))
+      if trace_file then trace("internal error req " .. tostring(req_id) .. " in begin_compile: " .. tostring(herr)) end
       S.current = nil
-      send_error_result(tonumber(req_id), tonumber(ctx_id), "lua: " .. tostring(herr))
+      send_result({ op = "result", req = tonumber(req_id), ctx = tonumber(ctx_id), status = "error",
+        internal = "begin_compile: " .. tostring(herr),
+        errors = { { message = "internal error: begin_compile: " .. tostring(herr):match("^[^\n]*") } },
+        lines = 0, glyphs = 0, t_tex_us = 0, t_traverse_us = 0, t_pack_us = 0, dl_bytes = 0 }, "")
     end
   elseif c == nil then
     return

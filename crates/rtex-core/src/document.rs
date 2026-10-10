@@ -255,8 +255,15 @@ pub fn load_project_files(
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
     use anyhow::Context;
     let mut files = std::collections::BTreeMap::new();
-    let main_text =
-        std::fs::read_to_string(root.join(main)).with_context(|| format!("reading {main}"))?;
+    let bytes = std::fs::read(root.join(main)).with_context(|| format!("reading {main}"))?;
+    let main_text = String::from_utf8(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "{main} is not UTF-8 (invalid byte at offset {}): rtex reads UTF-8 sources, \
+             LuaLaTeX's own input encoding. An 8-bit file (luainputenc) can be converted, e.g. \
+             `iconv -f latin1 -t utf-8`, then luainputenc dropped",
+            e.utf8_error().valid_up_to()
+        )
+    })?;
     let mut queue = input_targets(&main_text);
     files.insert(main.to_string(), main_text);
     while let Some(rel) = queue.pop() {
@@ -384,8 +391,8 @@ fn compute_line_starts(text: &str) -> Vec<usize> {
 /// Boundaries of paragraph-ish units in `text`, as byte ranges with kinds (ids not assigned).
 fn segment(text: &str, extra_block_envs: &[String]) -> Vec<(Range<usize>, SpanKind)> {
     let mut out: Vec<(Range<usize>, SpanKind)> = Vec::new();
-    let begin_doc = find_uncommented(text, "\\begin{document}");
-    let end_doc = find_uncommented(text, "\\end{document}");
+    let begin_doc = find_command(text, "\\begin{document}");
+    let end_doc = find_command(text, "\\end{document}");
     let body_start = match begin_doc {
         Some(i) => {
             let e = i + "\\begin{document}".len();
@@ -460,9 +467,11 @@ fn segment_body(
             Vec::new()
         };
         let heading = HEADING_CMDS.iter().any(|h| stripped.starts_with(h));
-        let runin_heading = RUNIN_HEADING_CMDS
-            .iter()
-            .any(|h| stripped.strip_prefix(h).is_some_and(|r| !r.starts_with(|c: char| c.is_ascii_alphabetic())));
+        let runin_heading = RUNIN_HEADING_CMDS.iter().any(|h| {
+            stripped
+                .strip_prefix(h)
+                .is_some_and(|r| !r.starts_with(|c: char| c.is_ascii_alphabetic()))
+        });
         // a picture environment opened while a paragraph is open (text before it in this span
         // or on its line) is an inline box of that paragraph, as the capture sees it (no unit
         // of its own); the same rule as eligibility.rs (content_start before the \begin)
@@ -501,7 +510,8 @@ fn segment_body(
                 runin = runin_heading;
                 heading_balance = 0;
                 split_pending = false;
-            } else if (heading && (cur_kind == SpanKind::Body || (cur_kind == SpanKind::Heading && runin)))
+            } else if (heading
+                && (cur_kind == SpanKind::Body || (cur_kind == SpanKind::Heading && runin)))
                 || split_pending
             {
                 // a heading command starts a new unit even without a blank line, and a unit ends
@@ -571,19 +581,6 @@ pub fn has_control_word(line: &str, name: &str) -> bool {
 }
 
 /// Strip an unescaped `%` comment from a source line.
-/// Byte offset of the first `needle` in `text` outside `%` comments: a header comment that
-/// mentions `\begin{document}` is not where the document begins.
-pub fn find_uncommented(text: &str, needle: &str) -> Option<usize> {
-    let mut at = 0;
-    for line in text.split_inclusive('\n') {
-        if let Some(i) = strip_comment(line).find(needle) {
-            return Some(at + i);
-        }
-        at += line.len();
-    }
-    None
-}
-
 pub fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     let mut i = 0;
@@ -598,6 +595,105 @@ pub fn strip_comment(line: &str) -> &str {
         i += 1;
     }
     line
+}
+
+/// Does TeX read the body of environment `name` verbatim (`verbatim`, `Verbatim`,
+/// `lstlisting`, `minted`, `comment`, `luacode*`, `filecontents` …), so that a `\begin{document}`
+/// or a `%` in it is text?
+pub(crate) fn is_verbatim_env(name: &str) -> bool {
+    let n = name.trim_end_matches('*').to_ascii_lowercase();
+    n == "comment"
+        || n == "alltt"
+        || ["verbatim", "listing", "minted", "luacode", "filecontents"]
+            .iter()
+            .any(|p| n.contains(p))
+}
+
+/// `line` with the argument of every `\verb<c>…<c>` (and `\verb*`) blanked, delimiters
+/// included, byte for byte (offsets are kept).
+fn blank_verb(line: &str) -> String {
+    let mut b = line.as_bytes().to_vec();
+    let mut i = 0;
+    while let Some(k) = line[i..].find("\\verb") {
+        let mut j = i + k + "\\verb".len();
+        if j < b.len() && b[j].is_ascii_alphabetic() {
+            // a longer control word (\verbatim)
+            i = j;
+            continue;
+        }
+        if j < b.len() && b[j] == b'*' {
+            j += 1;
+        }
+        let Some(delim) = line[j..].chars().next() else {
+            break;
+        };
+        let body = j + delim.len_utf8();
+        let end = line[body..]
+            .find(delim)
+            .map(|e| body + e + delim.len_utf8())
+            .unwrap_or(line.len());
+        for x in &mut b[j..end] {
+            *x = b' ';
+        }
+        i = end;
+    }
+    // only whole characters were replaced by spaces
+    String::from_utf8(b).unwrap_or_else(|_| line.to_string())
+}
+
+/// Byte offset of the first `marker` (`\begin{document}`, `\end{document}`) that TeX reads as
+/// a command: not in a `%` comment, a `\verb` or the body of a verbatim-like environment (a
+/// chapter that shows a whole document in `verbatim`, a `\verb|\end{document}|`).
+pub(crate) fn find_command(text: &str, marker: &str) -> Option<usize> {
+    // the first verbatim-like `\begin{env}` in `vis`: (offset, env, length of the \begin)
+    fn verbatim_begin(vis: &str) -> Option<(usize, String, usize)> {
+        let mut from = 0;
+        while let Some(k) = vis[from..].find("\\begin{") {
+            let at = from + k;
+            let name_start = at + "\\begin{".len();
+            let close = vis[name_start..].find('}')?;
+            let env = &vis[name_start..name_start + close];
+            if is_verbatim_env(env) {
+                return Some((at, env.to_string(), name_start + close + 1 - at));
+            }
+            from = name_start;
+        }
+        None
+    }
+    let mut verb_env: Option<String> = None;
+    let mut off = 0;
+    for line in text.split_inclusive('\n') {
+        let start = off;
+        off += line.len();
+        // a cursor over the raw line: outside verbatim bodies the line is read as TeX reads it
+        // (no comments, no \verb arguments); inside one only its \end{env} counts
+        let mut pos = 0;
+        loop {
+            if let Some(env) = verb_env.take() {
+                let end = format!("\\end{{{env}}}");
+                match line[pos..].find(&end) {
+                    Some(k) => pos += k + end.len(),
+                    None => {
+                        verb_env = Some(env);
+                        break;
+                    }
+                }
+            }
+            let visible = blank_verb(&line[pos..]);
+            let visible = strip_comment(&visible);
+            let m = visible.find(marker);
+            match (m, verbatim_begin(visible)) {
+                (Some(mk), Some((bk, _, _))) if mk < bk => return Some(start + pos + mk),
+                (Some(mk), None) => return Some(start + pos + mk),
+                (_, Some((bk, env, blen))) => {
+                    pos += bk + blen;
+                    verb_env = Some(env);
+                }
+                (None, None) => break,
+            }
+        }
+    }
+    None
 }
 
 fn find_all_envs(line: &str, prefix: &str) -> Vec<String> {
@@ -617,7 +713,7 @@ fn find_all_envs(line: &str, prefix: &str) -> Vec<String> {
 
 pub struct IdAllocator(pub u64);
 impl IdAllocator {
-    pub fn next(&mut self) -> ParaId {
+    pub fn next_id(&mut self) -> ParaId {
         self.0 += 1;
         ParaId(self.0)
     }
@@ -661,7 +757,7 @@ impl FileBuf {
             .map(|(range, kind)| {
                 let hash = hash_str(&self.text[range.clone()]);
                 Span {
-                    id: ids.next(),
+                    id: ids.next_id(),
                     range,
                     kind,
                     hash,
@@ -836,9 +932,7 @@ impl FileBuf {
         }
         let mut outcome = EditOutcome::default();
         let mut spans = Vec::with_capacity(new_units.len());
-        for i in 0..prefix {
-            spans.push(old_spans[i].clone());
-        }
+        spans.extend(old_spans[..prefix].iter().cloned());
         let old_mid = &old_spans[prefix..old_spans.len() - suffix];
         let new_mid = &new_units[prefix..new_units.len() - suffix];
         if old_mid.len() == 1 && new_mid.len() == 1 {
@@ -884,7 +978,7 @@ impl FileBuf {
                         id
                     }
                     _ => {
-                        let id = ids.next();
+                        let id = ids.next_id();
                         outcome.added.push(id);
                         id
                     }
@@ -951,6 +1045,49 @@ mod tests {
     const DOC: &str = "\\documentclass{book}\n\\usepackage{microtype}\n\\begin{document}\n\\chapter{One}\n\nFirst paragraph\nspanning two lines.\n\nSecond paragraph.\n\n\\begin{itemize}\n\\item a\n\n\\item b\n\\end{itemize}\n\nThird.\n\\end{document}\n";
 
     #[test]
+    fn document_markers_in_verbatim_comments_and_verb_are_text() {
+        // a chapter that shows a document in verbatim has no preamble and no trailer
+        let chapter = "\\section{Code}\nInline \\verb|\\end{document}| here.\n\n\\begin{verbatim}\n\\documentclass{article}\n\\begin{document}\nx\n\\end{document}\n\\end{verbatim}\nAfter.\n% \\begin{document} in a comment\n";
+        let kinds: Vec<SpanKind> = segment(chapter, &[]).into_iter().map(|(_, k)| k).collect();
+        assert!(
+            !kinds.contains(&SpanKind::Preamble) && !kinds.contains(&SpanKind::Trailer),
+            "{kinds:?}"
+        );
+        // the real markers still split a main file
+        let main = "\\documentclass{article}\n% \\begin{document} (comment)\n\\begin{document}\nText \\verb|\\end{document}|.\n\\end{document}\nafter\n";
+        let spans = segment(main, &[]);
+        assert_eq!(spans[0].1, SpanKind::Preamble);
+        assert_eq!(
+            &main[spans[0].0.clone()],
+            "\\documentclass{article}\n% \\begin{document} (comment)\n\\begin{document}\n"
+        );
+        assert_eq!(spans.last().unwrap().1, SpanKind::Trailer);
+        assert!(main[spans.last().unwrap().0.clone()].starts_with("\\end{document}"));
+        assert_eq!(blank_verb("a \\verb*+%x+ b"), "a \\verb*     b");
+        // a marker inside a verbatim body opened on the same line, or after a verbatim
+        // environment closed on it
+        assert_eq!(
+            find_command("\\begin{verbatim}\\begin{document}\n", "\\begin{document}"),
+            None
+        );
+        assert_eq!(
+            find_command(
+                "x \\begin{lstlisting}[a] \\end{document}\n",
+                "\\end{document}"
+            ),
+            None
+        );
+        let two = "\\begin{verbatim}a\\end{verbatim} \\begin{comment}\n\\begin{document}\n\\end{comment}\n";
+        assert_eq!(find_command(two, "\\begin{document}"), None);
+        let after = "\\begin{verbatim}%x\\end{verbatim}\\begin{document}\n";
+        assert_eq!(
+            find_command(after, "\\begin{document}"),
+            Some(after.find("\\begin{document}").unwrap())
+        );
+        assert_eq!(blank_verb("\\verbatim"), "\\verbatim");
+    }
+
+    #[test]
     fn segments_kinds() {
         let mut ids = IdAllocator(0);
         let fb = FileBuf::new(DOC, &mut ids, 1);
@@ -972,6 +1109,20 @@ mod tests {
             "First paragraph\nspanning two lines.\n"
         );
         assert_eq!(fb.line_range(&fb.spans[2]), (6, 7));
+    }
+
+    #[test]
+    fn crlf_files_segment_like_lf_files() {
+        let mut ids = IdAllocator(0);
+        let lf = FileBuf::new(DOC, &mut ids, 1);
+        let crlf = FileBuf::new(&DOC.replace('\n', "\r\n"), &mut ids, 1);
+        let shape = |fb: &FileBuf| -> Vec<(SpanKind, (i64, i64))> {
+            fb.spans
+                .iter()
+                .map(|s| (s.kind, fb.line_range(s)))
+                .collect()
+        };
+        assert_eq!(shape(&lf), shape(&crlf));
     }
 
     #[test]
@@ -1168,7 +1319,13 @@ mod tests {
             .iter()
             .map(|s| (fb.text[s.range.clone()].trim_end(), s.kind))
             .collect();
-        assert_eq!(texts[1], ("\\paragraph{Run-in.} Text that\ncontinues here.", SpanKind::Heading));
+        assert_eq!(
+            texts[1],
+            (
+                "\\paragraph{Run-in.} Text that\ncontinues here.",
+                SpanKind::Heading
+            )
+        );
         assert_eq!(texts[2], ("\\subparagraph{Next.} More.", SpanKind::Heading));
         assert_eq!(texts[3], ("\\section{Display}", SpanKind::Heading));
         assert_eq!(texts[4], ("Body text.", SpanKind::Body));
@@ -1196,12 +1353,18 @@ mod tests {
         let doc = "% Mistake: \\usepackage after \\begin{document}, see \\end{document}\n\\documentclass{article}\n\\begin{document}\nText.\n\\end{document}\n";
         let mut ids = IdAllocator(0);
         let fb = FileBuf::new(doc, &mut ids, 1);
-        let pre = fb.spans.iter().find(|s| s.kind == SpanKind::Preamble).unwrap();
+        let pre = fb
+            .spans
+            .iter()
+            .find(|s| s.kind == SpanKind::Preamble)
+            .unwrap();
         assert!(fb.text[pre.range.clone()].ends_with("\\begin{document}\n"));
         assert!(fb.text[pre.range.clone()].contains("\\documentclass"));
         let (p, _) = crate::split_preamble(doc).unwrap();
         assert!(p.contains("\\documentclass{article}\n"));
-        assert_eq!(find_uncommented("a \\% b\n% b\nb", "b"), Some(5));
+        // an escaped \% starts no comment; a real one hides the rest of its line
+        assert_eq!(find_command("a \\% \\b\n% \\b\n\\b", "\\b"), Some(5));
+        assert_eq!(find_command("a % \\b\n\\b", "\\b"), Some(7));
     }
 
     #[test]

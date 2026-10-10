@@ -1,6 +1,6 @@
 //! `rtex bench`: the paper's in-engine line-breaking replica (hardware factor) and host-side
 //! round-trip benchmarks over paragraph categories and document sizes, with the gates of
-//! docs/BENCHMARKS.md.
+//! docs/benchmarks.md.
 
 use anyhow::{bail, Context, Result};
 use rtex_core::texlive::TexLive;
@@ -56,11 +56,14 @@ pub fn linebreak(
     _quick: bool,
 ) -> Result<BTreeMap<String, (f64, f64)>> {
     std::fs::create_dir_all(out_dir)?;
-    let out_dir = &out_dir.canonicalize()?;
+    let out_dir = rtex_core::paths::canonical(out_dir)?;
     let dir = repo.join("bench/upstream/luatex-benchmark");
     let mut cmd = tl.lualatex_cmd(&dir);
     cmd.arg("-interaction=nonstopmode")
-        .arg(format!("--output-directory={}", out_dir.display()))
+        .arg(format!(
+            "--output-directory={}",
+            rtex_core::paths::tex(&out_dir)
+        ))
         .arg("systematic-benchmark.tex");
     let out = cmd
         .output()
@@ -288,12 +291,10 @@ pub fn roundtrip(
                             "Diagnostics {:?}",
                             items.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
                         ),
-                        other => format!(
-                            "{}",
-                            serde_json::to_value(other)
-                                .map(|v| v["event"].to_string())
-                                .unwrap_or_default()
-                        ),
+                        other => serde_json::to_value(other)
+                            .map(|v| v["event"].to_string())
+                            .unwrap_or_default()
+                            .to_string(),
                     })
                     .collect();
                 bail!("no paragraph update for par {pid} ({cat}); events seen: {seen:?}; edit result: {:?}", r.reasons)

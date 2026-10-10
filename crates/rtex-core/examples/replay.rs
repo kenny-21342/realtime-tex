@@ -54,12 +54,20 @@ fn main() -> Result<()> {
     let mut opt: HashMap<String, String> = HashMap::new();
     let mut i = 1;
     while i < a.len() {
-        let k = a[i].strip_prefix("--").ok_or_else(|| anyhow!("unexpected argument {}", a[i]))?.to_string();
+        let k = a[i]
+            .strip_prefix("--")
+            .ok_or_else(|| anyhow!("unexpected argument {}", a[i]))?
+            .to_string();
         if k == "settle-each" {
             opt.insert(k, "1".into());
             i += 1;
         } else {
-            opt.insert(k, a.get(i + 1).cloned().ok_or_else(|| anyhow!("--{} needs a value", a[i]))?);
+            opt.insert(
+                k,
+                a.get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("--{} needs a value", a[i]))?,
+            );
             i += 2;
         }
     }
@@ -69,12 +77,28 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&out)?;
     let mut run = Run::default();
     let report = match mode.as_str() {
-        "ops" => replay_ops(&mut run, &PathBuf::from(get("ops")?), &PathBuf::from(get("root")?), &opt.get("main").cloned().unwrap_or("main.tex".into()), opt.get("cases").map(PathBuf::from), &out)?,
-        "type" => type_words(&mut run, &PathBuf::from(get("project")?), &get("main")?, &opt, &out)?,
+        "ops" => replay_ops(
+            &mut run,
+            &PathBuf::from(get("ops")?),
+            &PathBuf::from(get("root")?),
+            &opt.get("main").cloned().unwrap_or("main.tex".into()),
+            opt.get("cases").map(PathBuf::from),
+            &out,
+        )?,
+        "type" => type_words(
+            &mut run,
+            &PathBuf::from(get("project")?),
+            &get("main")?,
+            &opt,
+            &out,
+        )?,
         "check" => check(&PathBuf::from(get("project")?), &get("main")?, &opt, &out)?,
         _ => bail!("usage: replay ops|type ... (see the header of examples/replay.rs)"),
     };
-    std::fs::write(out.join("report.json"), serde_json::to_string_pretty(&report)?)?;
+    std::fs::write(
+        out.join("report.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
     run.print_summary();
     if run.wrong > 0 {
         std::process::exit(1);
@@ -142,7 +166,13 @@ impl Run {
     }
     fn print_summary(&self) {
         let f = |name: &str, v: &[f64]| {
-            println!("  {name:28} n={:<4} p50 {:8.2}  p95 {:8.2}  max {:8.2}", v.len(), pct(v, 0.5), pct(v, 0.95), pct(v, 1.0))
+            println!(
+                "  {name:28} n={:<4} p50 {:8.2}  p95 {:8.2}  max {:8.2}",
+                v.len(),
+                pct(v, 0.5),
+                pct(v, 0.95),
+                pct(v, 1.0)
+            )
         };
         println!("replay summary");
         println!("  open: {}", self.open);
@@ -168,7 +198,10 @@ impl Run {
         if std::env::var("REPLAY_COLD_BACKGROUND").is_ok() {
             cfg.warm_background = false;
         }
-        if let Some(ms) = std::env::var("REPLAY_BUDGET_MS").ok().and_then(|v| v.parse().ok()) {
+        if let Some(ms) = std::env::var("REPLAY_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             cfg.fast_budget = Duration::from_millis(ms);
         }
         let s = Session::open(cfg)?;
@@ -191,7 +224,14 @@ impl Run {
     }
 
     /// Apply one edit and wait for its fast result (when routed fast).
-    fn apply(&mut self, s: &Session, o: &mut Observer, label: &str, file: &str, edit: Edit) -> Result<(Applied, Value)> {
+    fn apply(
+        &mut self,
+        s: &Session,
+        o: &mut Observer,
+        label: &str,
+        file: &str,
+        edit: Edit,
+    ) -> Result<(Applied, Value)> {
         let sent = Instant::now();
         let r = s.apply_edit(file, edit)?;
         let apply_us = sent.elapsed().as_micros();
@@ -205,7 +245,13 @@ impl Run {
             routed: r.routed.clone(),
             reasons: r.reasons.clone(),
             apply_us,
-            touched: r.outcome.touched.iter().chain(r.outcome.added.iter()).copied().collect(),
+            touched: r
+                .outcome
+                .touched
+                .iter()
+                .chain(r.outcome.added.iter())
+                .copied()
+                .collect(),
         };
         let mut rec = json!({
             "label": a.label, "file": a.file, "edit_id": a.edit_id, "routed": a.routed,
@@ -223,9 +269,20 @@ impl Run {
                 for e in s.poll(Duration::from_millis(0)) {
                     o.absorb(e);
                 }
-                let mine: Vec<_> = o.updates.iter().filter(|((e, _), _)| *e == eid).map(|(_, v)| v).collect();
-                let host = mine.iter().map(|v| (v.at - sent).as_secs_f64() * 1e3).fold(0.0, f64::max);
-                let engine = mine.iter().map(|v| v.timing.total_us as f64 / 1e3).fold(0.0, f64::max);
+                let mine: Vec<_> = o
+                    .updates
+                    .iter()
+                    .filter(|((e, _), _)| *e == eid)
+                    .map(|(_, v)| v)
+                    .collect();
+                let host = mine
+                    .iter()
+                    .map(|v| (v.at - sent).as_secs_f64() * 1e3)
+                    .fold(0.0, f64::max);
+                let engine = mine
+                    .iter()
+                    .map(|v| v.timing.total_us as f64 / 1e3)
+                    .fold(0.0, f64::max);
                 let statuses: Vec<&str> = mine.iter().map(|v| v.status.as_str()).collect();
                 self.fast_ms.push(host);
                 self.engine_ms.push(engine);
@@ -246,12 +303,34 @@ impl Run {
 
     /// Serve paragraph `p` of `file` again without changing the text (insert a space at its end,
     /// then delete it) and judge the second result against the current layout.
-    fn reserve(&mut self, s: &Session, o: &mut Observer, file: &str, p: ParaId) -> Result<Option<(rtex_core::replay::Judgement, Value)>> {
+    fn reserve(
+        &mut self,
+        s: &Session,
+        o: &mut Observer,
+        file: &str,
+        p: ParaId,
+    ) -> Result<Option<(rtex_core::replay::Judgement, Value)>> {
         let text = s.document_text(file).unwrap_or_default();
-        let Some(sp) = s.spans(file).into_iter().find(|sp| sp.id == p) else { return Ok(None) };
+        let Some(sp) = s.spans(file).into_iter().find(|sp| sp.id == p) else {
+            return Ok(None);
+        };
         let at = sp.range.start + text[sp.range.clone()].trim_end().len();
-        let ins = s.apply_edit(file, Edit { start_byte: at, end_byte: at, text: " ".into() })?;
-        let del = s.apply_edit(file, Edit { start_byte: at, end_byte: at + 1, text: String::new() })?;
+        let ins = s.apply_edit(
+            file,
+            Edit {
+                start_byte: at,
+                end_byte: at,
+                text: " ".into(),
+            },
+        )?;
+        let del = s.apply_edit(
+            file,
+            Edit {
+                start_byte: at,
+                end_byte: at + 1,
+                text: String::new(),
+            },
+        )?;
         let rec = json!({"routed": [ins.routed, del.routed.clone()]});
         if del.routed != "fast" {
             return Ok(None);
@@ -266,10 +345,21 @@ impl Run {
 
     /// Request a clean pass covering `edits`, then judge the last result served per paragraph.
     fn settle(&mut self, s: &Session, o: &mut Observer, edits: &[Applied]) -> Result<Value> {
-        let rev = edits.iter().map(|a| a.rev).max().unwrap_or_else(|| s.versions().source_revision);
-        let last_sent = edits.iter().map(|a| a.sent).max().unwrap_or_else(Instant::now);
+        let rev = edits
+            .iter()
+            .map(|a| a.rev)
+            .max()
+            .unwrap_or_else(|| s.versions().source_revision);
+        let last_sent = edits
+            .iter()
+            .map(|a| a.sent)
+            .max()
+            .unwrap_or_else(Instant::now);
         if !o.settle(s, rev, SETTLE_TIMEOUT) {
-            bail!("{}", o.dump(s, &format!("no settled layout for revision {rev}")));
+            bail!(
+                "{}",
+                o.dump(s, &format!("no settled layout for revision {rev}"))
+            );
         }
         let settle_ms = (o.layout_at.unwrap() - last_sent).as_secs_f64() * 1e3;
         if std::env::var("REPLAY_EVENTS").is_ok() {
@@ -297,7 +387,11 @@ impl Run {
         let mut verdicts = vec![];
         for (p, a) in &last {
             let Some(served) = o.updates.get(&(a.edit_id, *p)).cloned() else {
-                let v = if a.routed == "fast" { "no-update" } else { "last-edit-not-fast" };
+                let v = if a.routed == "fast" {
+                    "no-update"
+                } else {
+                    "last-edit-not-fast"
+                };
                 *self.verdicts.entry(v).or_default() += 1;
                 verdicts.push(json!({"par": format!("{p:?}"), "edit_id": a.edit_id, "verdict": v}));
                 continue;
@@ -316,7 +410,10 @@ impl Run {
                         reserve = r;
                     }
                     Some((again, r)) => {
-                        details.push(format!("served again with the current context: {}", again.verdict.name()));
+                        details.push(format!(
+                            "served again with the current context: {}",
+                            again.verdict.name()
+                        ));
                         details.extend(again.details);
                         reserve = r;
                     }
@@ -328,10 +425,16 @@ impl Run {
                 .spans(&a.file)
                 .into_iter()
                 .find(|sp| sp.id == *p)
-                .and_then(|sp| s.document_text(&a.file).map(|t| t[sp.range].chars().take(400).collect::<String>()));
+                .and_then(|sp| {
+                    s.document_text(&a.file)
+                        .map(|t| t[sp.range].chars().take(400).collect::<String>())
+                });
             if name == "MISMATCH" {
                 self.wrong += 1;
-                println!("  MISMATCH par {p:?} after edit '{}' in {}:", a.label, a.file);
+                println!(
+                    "  MISMATCH par {p:?} after edit '{}' in {}:",
+                    a.label, a.file
+                );
                 println!("      source: {:?}", excerpt.as_deref().unwrap_or(""));
                 for d in &details {
                     println!("      {d}");
@@ -367,7 +470,9 @@ fn status_name(c: Option<&CompileStatus>) -> &'static str {
 }
 
 fn sha256_hex(p: &Path) -> Option<String> {
-    std::fs::read(p).ok().map(|b| hex::encode(Sha256::digest(&b)))
+    std::fs::read(p)
+        .ok()
+        .map(|b| hex::encode(Sha256::digest(&b)))
 }
 
 fn write_file(p: &Path, bytes: &[u8]) -> Result<()> {
@@ -378,11 +483,26 @@ fn write_file(p: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn pos(v: &Value) -> Result<(usize, usize)> {
-    Ok((v[0].as_u64().ok_or_else(|| anyhow!("bad position"))? as usize, v[1].as_u64().ok_or_else(|| anyhow!("bad position"))? as usize))
+    Ok((
+        v[0].as_u64().ok_or_else(|| anyhow!("bad position"))? as usize,
+        v[1].as_u64().ok_or_else(|| anyhow!("bad position"))? as usize,
+    ))
 }
 
-fn replay_ops(run: &mut Run, ops: &Path, root: &Path, main: &str, cases: Option<PathBuf>, out: &Path) -> Result<Value> {
-    let name = ops.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("script").to_string();
+fn replay_ops(
+    run: &mut Run,
+    ops: &Path,
+    root: &Path,
+    main: &str,
+    cases: Option<PathBuf>,
+    out: &Path,
+) -> Result<Value> {
+    let name = ops
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("script")
+        .to_string();
     let steps: Vec<Value> = std::fs::read_to_string(ops)?
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -392,9 +512,21 @@ fn replay_ops(run: &mut Run, ops: &Path, root: &Path, main: &str, cases: Option<
     let expect: Vec<Value> = match cases {
         Some(c) => {
             let m: Value = serde_json::from_str(&std::fs::read_to_string(c)?)?;
-            m["cases"].as_array().into_iter().flatten().find(|k| k["id"] == name.as_str()).map(|k| {
-                k["steps"].as_array().cloned().unwrap_or_default().into_iter().map(|s| json!({"engine": k["engine"], "expect": s["expect"]})).collect()
-            }).unwrap_or_default()
+            m["cases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|k| k["id"] == name.as_str())
+                .map(|k| {
+                    k["steps"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| json!({"engine": k["engine"], "expect": s["expect"]}))
+                        .collect()
+                })
+                .unwrap_or_default()
         }
         None => vec![],
     };
@@ -407,21 +539,28 @@ fn replay_ops(run: &mut Run, ops: &Path, root: &Path, main: &str, cases: Option<
         let mut applied = vec![];
         let mut edit_recs = vec![];
         for op in step["ops"].as_array().cloned().unwrap_or_default() {
-            let file = op["file"].as_str().ok_or_else(|| anyhow!("op without file"))?.to_string();
+            let file = op["file"]
+                .as_str()
+                .ok_or_else(|| anyhow!("op without file"))?
+                .to_string();
             let disk = project.join(&file);
             if let Some(t) = op.get("create") {
                 write_file(&disk, t.as_str().unwrap_or("").as_bytes())?;
             } else if op.get("delete_file").is_some() {
                 std::fs::remove_file(&disk)?;
             } else if let Some(src) = op.get("binary_from") {
-                write_file(&disk, &std::fs::read(root.join(src.as_str().unwrap_or("")))?)?;
+                write_file(
+                    &disk,
+                    &std::fs::read(root.join(src.as_str().unwrap_or("")))?,
+                )?;
             } else {
                 let (start, end) = (pos(&op["start"])?, pos(&op["end"])?);
                 let new = op["text"].as_str().unwrap_or("");
                 let tracked = session.as_ref().and_then(|(s, _)| s.document_text(&file));
                 match (tracked, session.as_mut()) {
                     (Some(text), Some((s, o))) => {
-                        let e = edit_at(&text, start, end, new).ok_or_else(|| anyhow!("step {k}: range out of bounds in {file}"))?;
+                        let e = edit_at(&text, start, end, new)
+                            .ok_or_else(|| anyhow!("step {k}: range out of bounds in {file}"))?;
                         let (a, rec) = run.apply(s, o, &label, &file, e)?;
                         write_file(&disk, s.document_text(&file).unwrap_or_default().as_bytes())?;
                         applied.push(a);
@@ -430,7 +569,8 @@ fn replay_ops(run: &mut Run, ops: &Path, root: &Path, main: &str, cases: Option<
                     _ => {
                         // a file the session does not track (a .bib, a file not yet \input): disk only
                         let text = std::fs::read_to_string(&disk)?;
-                        let e = edit_at(&text, start, end, new).ok_or_else(|| anyhow!("step {k}: range out of bounds in {file}"))?;
+                        let e = edit_at(&text, start, end, new)
+                            .ok_or_else(|| anyhow!("step {k}: range out of bounds in {file}"))?;
                         let mut t = text;
                         t.replace_range(e.start_byte..e.end_byte, &e.text);
                         write_file(&disk, t.as_bytes())?;
@@ -439,17 +579,19 @@ fn replay_ops(run: &mut Run, ops: &Path, root: &Path, main: &str, cases: Option<
                 }
             }
         }
-        let files_ok = step["files"].as_object().map(|m| m.iter().all(|(f, h)| sha256_hex(&project.join(f)).as_deref() == h.as_str())).unwrap_or(true);
-        let mut rec = json!({"step": k, "label": label, "files_match_script": files_ok, "edits": edit_recs});
+        let files_ok = step["files"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .all(|(f, h)| sha256_hex(&project.join(f)).as_deref() == h.as_str())
+            })
+            .unwrap_or(true);
+        let mut rec =
+            json!({"step": k, "label": label, "files_match_script": files_ok, "edits": edit_recs});
         if let Some(e) = expect.get(k) {
             rec["reference"] = e.clone();
         }
-        if session.is_none() {
-            session = Some(run.open(&project, main, &out.join("build"))?);
-            let (_, o) = session.as_ref().unwrap();
-            rec["settled"] = json!({"status": status_name(o.compile.as_ref()), "pages": o.pages_total, "converged": o.converged});
-        } else {
-            let (s, o) = session.as_mut().unwrap();
+        if let Some((s, o)) = session.as_mut() {
             if applied.is_empty() {
                 // file operations or a rebuild with no edit: still ask for a pass
                 let rev = s.versions().source_revision;
@@ -461,12 +603,22 @@ fn replay_ops(run: &mut Run, ops: &Path, root: &Path, main: &str, cases: Option<
             } else {
                 rec["settled"] = run.settle(s, o, &applied)?;
             }
+        } else {
+            session = Some(run.open(&project, main, &out.join("build"))?);
+            let (_, o) = session.as_ref().unwrap();
+            rec["settled"] = json!({"status": status_name(o.compile.as_ref()), "pages": o.pages_total, "converged": o.converged});
         }
         println!(
             "[{name} {k}] {label:40} {}  files {}  ref {}",
-            rec["settled"].to_string().chars().take(160).collect::<String>(),
+            rec["settled"]
+                .to_string()
+                .chars()
+                .take(160)
+                .collect::<String>(),
             if files_ok { "ok" } else { "DIFFER" },
-            rec.get("reference").map(|r| r["expect"]["status"].to_string()).unwrap_or_default()
+            rec.get("reference")
+                .map(|r| r["expect"]["status"].to_string())
+                .unwrap_or_default()
         );
         records.push(rec);
     }
@@ -484,8 +636,20 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         let t = to.join(e.file_name());
         let ft = e.file_type()?;
         if ft.is_symlink() {
-            let target = std::fs::read_link(&p)?;
-            let _ = std::os::unix::fs::symlink(target, &t);
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&p)?;
+                let _ = std::os::unix::fs::symlink(target, &t);
+            }
+            // elsewhere a link needs privileges: copy what it points at
+            #[cfg(not(unix))]
+            {
+                if p.is_dir() {
+                    copy_dir(&p, &t)?;
+                } else if p.exists() {
+                    std::fs::copy(&p, &t)?;
+                }
+            }
         } else if ft.is_dir() {
             if e.file_name() != "build" && e.file_name() != ".git" {
                 copy_dir(&p, &t)?;
@@ -497,10 +661,25 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn type_words(run: &mut Run, src: &Path, main: &str, opt: &HashMap<String, String>, out: &Path) -> Result<Value> {
-    let n_units: usize = opt.get("units").map(|v| v.parse()).transpose()?.unwrap_or(12);
+fn type_words(
+    run: &mut Run,
+    src: &Path,
+    main: &str,
+    opt: &HashMap<String, String>,
+    out: &Path,
+) -> Result<Value> {
+    let n_units: usize = opt
+        .get("units")
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or(12);
     let word = opt.get("word").cloned().unwrap_or_else(|| "quick".into());
-    let cadence = Duration::from_millis(opt.get("cadence-ms").map(|v| v.parse()).transpose()?.unwrap_or(120));
+    let cadence = Duration::from_millis(
+        opt.get("cadence-ms")
+            .map(|v| v.parse())
+            .transpose()?
+            .unwrap_or(120),
+    );
     let mut rng = Rng::new(opt.get("seed").map(|v| v.parse()).transpose()?.unwrap_or(1));
     let settle_each = opt.contains_key("settle-each");
     let project = out.join("project");
@@ -511,10 +690,17 @@ fn type_words(run: &mut Run, src: &Path, main: &str, opt: &HashMap<String, Strin
         Some(f) => f.split(',').map(String::from).collect(),
         None => {
             let mut v = vec![main.to_string()];
-            v.extend(s.layout_units().into_iter().filter_map(|u| u.file).map(|f| f.trim_start_matches("./").to_string()));
+            v.extend(
+                s.layout_units()
+                    .into_iter()
+                    .filter_map(|u| u.file)
+                    .map(|f| f.trim_start_matches("./").to_string()),
+            );
             v.sort();
             v.dedup();
-            v.into_iter().filter(|f| s.document_text(f).is_some()).collect()
+            v.into_iter()
+                .filter(|f| s.document_text(f).is_some())
+                .collect()
         }
     };
     let mut cands: Vec<(String, ParaId)> = vec![];
@@ -544,7 +730,9 @@ fn type_words(run: &mut Run, src: &Path, main: &str, opt: &HashMap<String, Strin
     let mut pending: Vec<Applied> = vec![];
     for (file, id) in &cands {
         let text = s.document_text(file).unwrap_or_default();
-        let Some(sp) = s.spans(file).into_iter().find(|sp| sp.id == *id) else { continue };
+        let Some(sp) = s.spans(file).into_iter().find(|sp| sp.id == *id) else {
+            continue;
+        };
         let par = &text[sp.range.clone()];
         let ws = safe_words(par);
         let (_, end) = ws[rng.below(ws.len())];
@@ -553,7 +741,17 @@ fn type_words(run: &mut Run, src: &Path, main: &str, opt: &HashMap<String, Strin
         for ch in format!(" {word}").chars() {
             let t = Instant::now();
             let label = format!("{file}: type {ch:?}");
-            let (a, rec) = run.apply(&s, &mut o, &label, file, Edit { start_byte: at, end_byte: at, text: ch.to_string() })?;
+            let (a, rec) = run.apply(
+                &s,
+                &mut o,
+                &label,
+                file,
+                Edit {
+                    start_byte: at,
+                    end_byte: at,
+                    text: ch.to_string(),
+                },
+            )?;
             at += ch.len_utf8();
             pending.push(a);
             keys.push(rec);
@@ -568,23 +766,43 @@ fn type_words(run: &mut Run, src: &Path, main: &str, opt: &HashMap<String, Strin
             rec["settled"] = run.settle(&s, &mut o, &pending)?;
             pending.clear();
         }
-        println!("[type] {file:40} {} keys{}", rec["keys"].as_array().map(|k| k.len()).unwrap_or(0), rec.get("settled").map(|v| format!("  settled {}", v["settle_ms"])).unwrap_or_default());
+        println!(
+            "[type] {file:40} {} keys{}",
+            rec["keys"].as_array().map(|k| k.len()).unwrap_or(0),
+            rec.get("settled")
+                .map(|v| format!("  settled {}", v["settle_ms"]))
+                .unwrap_or_default()
+        );
         words.push(rec);
     }
-    let final_settle = if pending.is_empty() { Value::Null } else { run.settle(&s, &mut o, &pending)? };
+    let final_settle = if pending.is_empty() {
+        Value::Null
+    } else {
+        run.settle(&s, &mut o, &pending)?
+    };
     s.close();
-    Ok(json!({"mode": "type", "project": src, "main": main, "word": word, "cadence_ms": cadence.as_millis() as u64,
-              "settle_each": settle_each, "summary": run.summary(), "words": words, "final_settle": final_settle}))
+    Ok(
+        json!({"mode": "type", "project": src, "main": main, "word": word, "cadence_ms": cadence.as_millis() as u64,
+              "settle_each": settle_each, "summary": run.summary(), "words": words, "final_settle": final_settle}),
+    )
 }
 
 fn check(src: &Path, main: &str, opt: &HashMap<String, String>, out: &Path) -> Result<Value> {
-    let timeout = Duration::from_secs(opt.get("timeout").map(|v| v.parse()).transpose()?.unwrap_or(120));
+    let timeout = Duration::from_secs(
+        opt.get("timeout")
+            .map(|v| v.parse())
+            .transpose()?
+            .unwrap_or(120),
+    );
     let project = out.join("project");
     copy_dir(src, &project)?;
     let t0 = Instant::now();
     let mut cfg = SessionConfig::new(&project, main.to_string());
     // `--build DIR` keeps the build directory across runs (a reopened session); OUT is cleared
-    cfg.build_dir = opt.get("build").map(PathBuf::from).unwrap_or_else(|| out.join("build"));
+    cfg.build_dir = opt
+        .get("build")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| out.join("build"));
     let s = match Session::open(cfg) {
         Ok(s) => s,
         // a project rtex cannot open (a source file that is not UTF-8) is a result too
