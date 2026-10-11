@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-From kenny-21342/realtime-tex (merged with this release's work):
+## 0.0.3 (2026-10-11)
+
+The first release of kenny-21342/realtime-tex: upstream 0.0.2 (`e35f869`) plus the fork's work:
 
 - **Native drawing of TikZ/pgf pages.** Pages whose only degradation is pgf literals and
   shadings carry their drawing operations (`pages_changed[].native`): paths, fills, strokes,
