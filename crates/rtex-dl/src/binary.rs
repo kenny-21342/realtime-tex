@@ -274,6 +274,13 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                 }
                 dl.color_base.insert(stack, entries);
             }
+            0x2D => {
+                let name = p.str().map_err(malformed)?;
+                let n = p.u32().map_err(malformed)? as usize;
+                let mask: crate::Mask = serde_json::from_slice(p.bytes(n).map_err(malformed)?)
+                    .map_err(|_| BinError::Malformed { tag, offset: start })?;
+                dl.masks.insert(name, mask);
+            }
             0x2C => {
                 let name = p.str().map_err(malformed)?;
                 let paint_type = p.u8().map_err(malformed)?;
@@ -684,6 +691,14 @@ pub fn encode(dl: &DisplayList) -> Vec<u8> {
         p.0.extend_from_slice(pat.content.as_bytes());
         body.rec(0x2C, &p.0);
     }
+    for (name, mask) in &dl.masks {
+        let mut p = Writer(Vec::new());
+        p.str(name);
+        let json = serde_json::to_vec(mask).unwrap_or_default();
+        p.u32(json.len() as u32);
+        p.0.extend_from_slice(&json);
+        body.rec(0x2D, &p.0);
+    }
     for pic in &dl.pictures {
         let mut p = Writer(Vec::new());
         p.str(&pic.key);
@@ -895,6 +910,19 @@ mod tests {
                     ystep: 3.0,
                     matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                     content: "q 0 0 m 3 3 l S Q".into(),
+                },
+            )]),
+            masks: BTreeMap::from([(
+                "pgfsmask7".to_string(),
+                crate::Mask {
+                    width: 1000,
+                    height: 800,
+                    depth: 200,
+                    items: vec![Item::Literal {
+                        mode: 0,
+                        data: "0 g 0 0 10 10 re f".into(),
+                        at: Some((0, 0)),
+                    }],
                 },
             )]),
             glyphs: 3,

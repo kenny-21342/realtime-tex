@@ -12,6 +12,12 @@ From kenny-21342/realtime-tex (merged with this release's work):
 - **Tiling patterns drawn natively.** Fills with pgf's `patterns` / `patterns.meta` patterns
   (coloured and uncoloured) name their cell (`Paint.pattern`, `NativePage.patterns`); the page
   list carries the declarations (`patterns`, binary PATTERN record), cached pictures included.
+- **pict2e and clipped images drawn natively.** pict2e's literals (picture mode, diagbox) are
+  readable like pgf's; a box resource used at its saved size with plain contents (graphicx's
+  `trim`/`clip`, `viewport`) is written as its contents, clipped to its box.
+- **Fadings drawn natively.** pgf's soft masks (`path fading`, `scope fading`) carry what their
+  form draws (`NativePage.masks`; the page list's `masks`, binary MASK record); masked paints and
+  shadings name their mask.
 - **Glossaries built between passes.** `\makeglossaries` lists (glossary, acronyms, custom
   glossaries) are built as makeglossaries builds them (makeindex with glossaries' style;
   makeglossaries-lite for xindy styles), and a changed list brings another pass.

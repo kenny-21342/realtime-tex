@@ -259,3 +259,101 @@ fn pict2e_and_tiling_patterns_are_drawn_natively() {
     let p2 = native(2);
     assert_eq!(p2.patterns.len(), 1, "{:?}", p2.patterns.keys());
 }
+
+/// graphicx clips a bitmap (`trim`/`viewport` with `clip`) by saving it in a box resource: the
+/// capture writes the box's contents in its place, clipped to the form's box, so the page is
+/// drawn natively with the image (not a `box_resource` the host cannot draw).
+#[test]
+fn clipped_images_are_drawn_from_their_box_resource() {
+    if let Err(e) = TexLive::discover() {
+        eprintln!("SKIP: {e}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-native-clip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    // a 1x1 PNG
+    let png: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    std::fs::write(project.join("dot.png"), png).unwrap();
+    let main = "\\documentclass{article}\n\\usepackage{graphicx}\n\\begin{document}\n\
+                Clipped: \\includegraphics[viewport=0 0 0.5 0.5,clip,width=2cm]{dot.png}\n\
+                \\end{document}\n";
+    std::fs::write(project.join("main.tex"), main).unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.debounce = Duration::from_millis(50);
+    let s = Session::open(cfg).unwrap();
+    let mut pages = BTreeMap::new();
+    converged(&s, &mut pages, 180);
+    s.close();
+    let (dl, n) = &pages[&1];
+    assert!(
+        !dl.flags_map().contains_key("box_resource"),
+        "{:?}",
+        dl.flags
+    );
+    let items: Vec<&Item> = dl.lines.iter().flat_map(|l| l.items.iter()).collect();
+    assert!(
+        items.iter().any(|i| matches!(i, Item::Image { .. })),
+        "the clipped image is not in the list"
+    );
+    let n = n
+        .as_ref()
+        .unwrap_or_else(|| panic!("not drawn natively: {:?}", native_graphics(dl).err()));
+    assert!(
+        n.ops.iter().any(|o| matches!(o, GfxOp::Clip { .. })),
+        "no clip"
+    );
+}
+
+/// pgf's fadings are soft masks drawing the fading's box (saved in the preamble, where the
+/// fadings library declares them): the page is drawn natively, its paints naming the mask, and
+/// each mask draws its fading's shading.
+#[test]
+fn fadings_are_drawn_as_soft_masks() {
+    if let Err(e) = TexLive::discover() {
+        eprintln!("SKIP: {e}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-native-fade-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let main = "\\documentclass{article}\n\\usepackage{tikz}\n\\usetikzlibrary{fadings}\n\
+                \\begin{document}\nFadings.\n\n\\begin{tikzpicture}\n\
+                \\fill[red, path fading=east] (0,0) rectangle (3,1);\n\
+                \\fill[blue, path fading=circle with fuzzy edge 20 percent] (4,0) rectangle (5,1);\n\
+                \\end{tikzpicture}\n\\end{document}\n";
+    std::fs::write(project.join("main.tex"), main).unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.debounce = Duration::from_millis(50);
+    let s = Session::open(cfg).unwrap();
+    let mut pages = BTreeMap::new();
+    converged(&s, &mut pages, 180);
+    s.close();
+    let (dl, n) = &pages[&1];
+    let n = n
+        .as_ref()
+        .unwrap_or_else(|| panic!("not drawn natively: {:?}", native_graphics(dl).err()));
+    assert_eq!(n.masks.len(), 2, "{:?}", n.masks.keys());
+    for (name, m) in &n.masks {
+        assert!(
+            m.ops.iter().any(|o| matches!(o, GfxOp::Shade { .. })),
+            "mask {name} draws no shading"
+        );
+    }
+    let masked = n
+        .ops
+        .iter()
+        .filter(|o| matches!(o, GfxOp::Paint { mask: Some(_), .. }))
+        .count();
+    assert_eq!(masked, 2);
+}

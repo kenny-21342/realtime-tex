@@ -23,9 +23,11 @@
 //! SC scn SCN` in DeviceGray/RGB/CMYK), pgf's opacity states (`/pgf@ca<v> gs`, `/pgf@CA<v> gs`),
 //! pdf_colorstack operations, and fills with pgf's tiling patterns (`/Pattern cs /pgfpatN scn`,
 //! `/pgfprgb cs r g b /pgfpatN scn`) declared in the display list's `patterns`: each pattern's
-//! cell is interpreted once into [`NativePage::patterns`]. Anything else (text in literals,
-//! XObjects, stroking with a pattern, other graphics states, literal modes other than
-//! origin/page, \special) is an error.
+//! cell is interpreted once into [`NativePage::patterns`], and pgf's soft masks (fadings,
+//! `/pgfsmaskN gs`) declared in the display list's `masks`: what each mask's form draws is
+//! interpreted where it is set into [`NativePage::masks`]. Anything else (text in literals,
+//! XObjects, stroking with a pattern, text under a soft mask, other graphics states, literal
+//! modes other than origin/page, \special) is an error.
 
 use crate::{DisplayList, Item, Line, Sp, SP_PER_BP};
 use serde::Serialize;
@@ -168,6 +170,9 @@ pub enum GfxOp {
         extend: [bool; 2],
         stops: Vec<(f64, Color)>,
         alpha: f64,
+        /// Painted under a soft mask (an entry of [`NativePage::masks`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mask: Option<String>,
     },
     /// Fill and/or stroke a path (fill first). `pattern`: the fill is a tiling pattern (a cell
     /// of [`NativePage::patterns`]); `fill` is then its tint (uncoloured patterns) and opacity.
@@ -180,7 +185,21 @@ pub enum GfxOp {
         stroke: Option<Stroke>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
+        /// Painted under a soft mask (an entry of [`NativePage::masks`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mask: Option<String>,
     },
+}
+
+/// A soft mask where it is set (pgf's fadings): what its form draws (`ops`, in page
+/// coordinates), and the form's box `bbox` (form space, `[x0 y0 x1 y1]`) with `ctm` mapping form
+/// space to page coordinates. Ops naming the mask are painted with, as their opacity, the
+/// luminosity of this drawing over black, which is also the mask outside the box.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MaskCell {
+    pub ops: Vec<GfxOp>,
+    pub bbox: [f64; 4],
+    pub ctm: Matrix,
 }
 
 /// A tiling pattern's cell as drawing operations: `ops` (their `ctm` maps to pattern space) are
@@ -208,6 +227,10 @@ pub struct NativePage {
     /// The tiling patterns `Paint` ops fill with, by name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub patterns: BTreeMap<String, PatternCell>,
+    /// The soft masks ops are painted under, by instance (a mask set under another
+    /// transformation is another instance).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub masks: BTreeMap<String, MaskCell>,
 }
 
 /// Why a page cannot be drawn natively.
@@ -254,6 +277,8 @@ struct GState {
     /// patterns with an RGB tint): `scn` takes the tint and a pattern name.
     fill_pattern_space: bool,
     fill_pattern: Option<String>,
+    /// The soft mask in force (an instance in `Interp::masks`).
+    mask: Option<String>,
 }
 
 impl Default for GState {
@@ -272,6 +297,7 @@ impl Default for GState {
             stroke_space: 1,
             fill_pattern_space: false,
             fill_pattern: None,
+            mask: None,
         }
     }
 }
@@ -371,6 +397,11 @@ struct Interp {
     /// Declared patterns (the page's) and the cells made of those used so far.
     declared: BTreeMap<String, crate::Pattern>,
     cells: BTreeMap<String, PatternCell>,
+    /// Declared soft masks (the page's) and the instances set so far.
+    declared_masks: BTreeMap<String, crate::Mask>,
+    masks: BTreeMap<String, MaskCell>,
+    /// Interpreting a mask's form: it may only draw (no text, rules or images, no masks).
+    in_mask: bool,
 }
 
 /// From PDF space (bp, y up, origin bottom-left) to display-list space (sp, y down).
@@ -430,7 +461,47 @@ impl Interp {
             out,
             declared: BTreeMap::new(),
             cells: BTreeMap::new(),
+            declared_masks: BTreeMap::new(),
+            masks: BTreeMap::new(),
+            in_mask: false,
         }
+    }
+
+    /// Set a declared soft mask (`/pgfsmaskN gs`): its form's items are interpreted in the form's
+    /// space, placed by the current transformation, as a new mask instance.
+    fn use_mask(&mut self, name: &str) -> Result<(), String> {
+        if self.in_mask {
+            return Err("a soft mask inside a soft mask".into());
+        }
+        let m = self
+            .declared_masks
+            .get(name)
+            .ok_or_else(|| format!("graphics state /{name}"))?
+            .clone();
+        let k = SP_PER_BP;
+        // the form's origin is the box's lower left: the baseline is at y = depth
+        let mut sub = Interp::new(m.depth as f64 / k, concat(&self.gs.ctm, &self.out));
+        sub.in_mask = true;
+        sub.declared = self.declared.clone();
+        sub.run_rows(&[(None, m.items.as_slice())])
+            .map_err(|e| format!("soft mask /{name}: {}", e.what))?;
+        self.cells.extend(std::mem::take(&mut sub.cells));
+        let id = format!("{name}#{}", self.masks.len());
+        self.masks.insert(
+            id.clone(),
+            MaskCell {
+                ops: sub.ops,
+                bbox: [
+                    0.0,
+                    0.0,
+                    m.width as f64 / k,
+                    (m.height + m.depth) as f64 / k,
+                ],
+                ctm: sub.out,
+            },
+        );
+        self.gs.mask = Some(id);
+        Ok(())
     }
 
     /// The cell of a declared pattern, interpreted once (its operators in pattern space).
@@ -603,6 +674,7 @@ impl Interp {
                     }
                     if (fill || stroke) && !path.is_empty() {
                         self.ops.push(GfxOp::Paint {
+                            mask: self.gs.mask.clone(),
                             pattern,
                             at,
                             ctm,
@@ -688,6 +760,8 @@ impl Interp {
                         } else if let Some(v) = n.strip_prefix("pgf@CA") {
                             self.gs.stroke.alpha =
                                 v.parse::<f64>().map_err(|_| format!("gs /{n}"))?;
+                        } else if n.starts_with("pgfsmask") {
+                            self.use_mask(n)?;
                         } else {
                             return Err(format!("graphics state /{n}"));
                         }
@@ -1088,7 +1162,7 @@ impl Interp {
         let k = SP_PER_BP;
         self.ops.push(GfxOp::Shade {
             at,
-            ctm: concat(&ctm, &pdf_to_dl(self.page_h)),
+            ctm: concat(&ctm, &self.out),
             bbox: [0.0, -(d as f64) / k, w as f64 / k, h as f64 / k],
             radial,
             coords,
@@ -1098,7 +1172,98 @@ impl Interp {
             ],
             stops,
             alpha: self.gs.fill.alpha,
+            mask: self.gs.mask.clone(),
         });
+        Ok(())
+    }
+}
+
+impl Interp {
+    /// Interpret rows of items (a page's `other` items then its lines; a mask's items).
+    fn run_rows(&mut self, rows: &[(Option<usize>, &[Item])]) -> Result<(), Unsupported> {
+        for &(line, items) in rows {
+            let base_depth = self.depth;
+            for (k, item) in items.iter().enumerate() {
+                let at = ItemRef { line, item: k };
+                let fail = |what: String| Unsupported { at: Some(at), what };
+                match item {
+                    Item::Literal {
+                        mode,
+                        data,
+                        at: pos,
+                    } => match (mode, pos) {
+                        (0, Some((x, y))) => {
+                            self.move_to(*x, *y);
+                            self.run(data, at, false).map_err(fail)?;
+                        }
+                        (1, _) => self.run(data, at, false).map_err(fail)?,
+                        (0, None) => return Err(fail("literal without a position".into())),
+                        (-1, _) => return Err(fail("\\special".into())),
+                        (m, _) => return Err(fail(format!("literal mode {m}"))),
+                    },
+                    Item::Color {
+                        stack,
+                        cmd,
+                        data,
+                        after,
+                    } => self
+                        .color_stack(*stack, *cmd, data, after.as_deref(), at)
+                        .map_err(fail)?,
+                    Item::Matrix { op, x, y, data } => {
+                        self.move_to(*x, *y);
+                        match op.as_str() {
+                            "save" => self.run("q", at, false).map_err(fail)?,
+                            "restore" => self.run("Q", at, false).map_err(fail)?,
+                            "set" => {
+                                let v: Vec<f64> = data
+                                    .split_ascii_whitespace()
+                                    .filter_map(|t| t.parse().ok())
+                                    .collect();
+                                if v.len() != 4 {
+                                    return Err(fail(format!("matrix {data:?}")));
+                                }
+                                self.run(
+                                    &format!("{} {} {} {} 0 0 cm", v[0], v[1], v[2], v[3]),
+                                    at,
+                                    false,
+                                )
+                                .map_err(fail)?;
+                            }
+                            o => return Err(fail(format!("matrix op {o}"))),
+                        }
+                    }
+                    Item::Glyph { .. } | Item::Rule { .. } | Item::Image { .. } => {
+                        if self.in_mask || self.gs.mask.is_some() {
+                            return Err(fail("text, a rule or an image under a soft mask".into()));
+                        }
+                        let m = self.output_map();
+                        if !is_identity(&m) {
+                            self.transforms.push((at, m));
+                        }
+                    }
+                    Item::Math { .. } => {}
+                    Item::Unsupported { kind, detail } if kind == "shading" => {
+                        let d = detail.as_str().unwrap_or("");
+                        self.shade(d, at).map_err(fail)?;
+                    }
+                    Item::Unsupported { kind, .. } => {
+                        return Err(fail(format!("unsupported item {kind}")))
+                    }
+                }
+            }
+            if !self.path.is_empty() || self.clip.is_some() {
+                return Err(Unsupported {
+                    at: None,
+                    what: "path left open at the end of a row".into(),
+                });
+            }
+            if self.depth != base_depth {
+                return Err(Unsupported {
+                    at: None,
+                    what: "q without Q in a row".into(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -1118,6 +1283,7 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
         .filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.clone())))
         .collect();
     it.declared = dl.patterns.clone();
+    it.declared_masks = dl.masks.clone();
     // `other` comes first in the page's content, then the rows in order
     let rows: Vec<(Option<usize>, &[Item])> = std::iter::once((None, dl.other.as_slice()))
         .chain(
@@ -1127,90 +1293,12 @@ pub fn native_graphics(dl: &DisplayList) -> Result<NativePage, Unsupported> {
                 .map(|(k, l): (usize, &Line)| (Some(k), l.items.as_slice())),
         )
         .collect();
-    for (line, items) in rows {
-        let base_depth = it.depth;
-        for (k, item) in items.iter().enumerate() {
-            let at = ItemRef { line, item: k };
-            let fail = |what: String| Unsupported { at: Some(at), what };
-            match item {
-                Item::Literal {
-                    mode,
-                    data,
-                    at: pos,
-                } => match (mode, pos) {
-                    (0, Some((x, y))) => {
-                        it.move_to(*x, *y);
-                        it.run(data, at, false).map_err(fail)?;
-                    }
-                    (1, _) => it.run(data, at, false).map_err(fail)?,
-                    (0, None) => return Err(fail("literal without a position".into())),
-                    (-1, _) => return Err(fail("\\special".into())),
-                    (m, _) => return Err(fail(format!("literal mode {m}"))),
-                },
-                Item::Color {
-                    stack,
-                    cmd,
-                    data,
-                    after,
-                } => it
-                    .color_stack(*stack, *cmd, data, after.as_deref(), at)
-                    .map_err(fail)?,
-                Item::Matrix { op, x, y, data } => {
-                    it.move_to(*x, *y);
-                    match op.as_str() {
-                        "save" => it.run("q", at, false).map_err(fail)?,
-                        "restore" => it.run("Q", at, false).map_err(fail)?,
-                        "set" => {
-                            let v: Vec<f64> = data
-                                .split_ascii_whitespace()
-                                .filter_map(|t| t.parse().ok())
-                                .collect();
-                            if v.len() != 4 {
-                                return Err(fail(format!("matrix {data:?}")));
-                            }
-                            it.run(
-                                &format!("{} {} {} {} 0 0 cm", v[0], v[1], v[2], v[3]),
-                                at,
-                                false,
-                            )
-                            .map_err(fail)?;
-                        }
-                        o => return Err(fail(format!("matrix op {o}"))),
-                    }
-                }
-                Item::Glyph { .. } | Item::Rule { .. } | Item::Image { .. } => {
-                    let m = it.output_map();
-                    if !is_identity(&m) {
-                        it.transforms.push((at, m));
-                    }
-                }
-                Item::Math { .. } => {}
-                Item::Unsupported { kind, detail } if kind == "shading" => {
-                    let d = detail.as_str().unwrap_or("");
-                    it.shade(d, at).map_err(fail)?;
-                }
-                Item::Unsupported { kind, .. } => {
-                    return Err(fail(format!("unsupported item {kind}")))
-                }
-            }
-        }
-        if !it.path.is_empty() || it.clip.is_some() {
-            return Err(Unsupported {
-                at: None,
-                what: "path left open at the end of a row".into(),
-            });
-        }
-        if it.depth != base_depth {
-            return Err(Unsupported {
-                at: None,
-                what: "q without Q in a row".into(),
-            });
-        }
-    }
+    it.run_rows(&rows)?;
     Ok(NativePage {
         ops: it.ops,
         transforms: it.transforms,
         patterns: it.cells,
+        masks: it.masks,
     })
 }
 
@@ -1520,5 +1608,77 @@ mod tests {
             p.patterns.insert("pgfpat2".into(), pattern(1, bad));
             assert!(native_graphics(&p).is_err(), "{bad}");
         }
+    }
+
+    fn mask() -> crate::Mask {
+        crate::Mask {
+            width: (20.0 * SP_PER_BP) as i64,
+            height: (10.0 * SP_PER_BP) as i64,
+            depth: (2.0 * SP_PER_BP) as i64,
+            items: vec![lit("0.5 g 0 0 5 5 re f", 0, 0)],
+        }
+    }
+
+    #[test]
+    fn a_soft_mask_is_drawn_where_it_is_set() {
+        let mut p = page(vec![lit(
+            "q /pgfsmask9 gs 0 0 10 10 re f Q 0 0 1 1 re f",
+            1000,
+            1000,
+        )]);
+        p.masks.insert("pgfsmask9".into(), mask());
+        let n = native_graphics(&p).unwrap();
+        let masked: Vec<Option<String>> = n
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                GfxOp::Paint { mask, .. } => Some(mask.clone()),
+                _ => None,
+            })
+            .collect();
+        // the mask holds until Q
+        assert_eq!(masked, vec![Some("pgfsmask9#0".to_string()), None]);
+        let m = &n.masks["pgfsmask9#0"];
+        assert_eq!(m.ops.len(), 1);
+        let want = [0.0, 0.0, 20.0, 12.0];
+        assert!(
+            m.bbox.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-3),
+            "{:?}",
+            m.bbox
+        );
+        // the form's origin is where the mask was set (the literal's position)
+        let (x, y) = apply(&m.ctm, 0.0, 0.0);
+        assert!(
+            (x - 1000.0).abs() < 1e-6 && (y - 1000.0).abs() < 1e-6,
+            "{x} {y}"
+        );
+        // the mask's own drawing: its baseline is `depth` above the form's origin
+        let GfxOp::Paint { ctm, .. } = &m.ops[0] else {
+            panic!()
+        };
+        let (_, by) = apply(ctm, 0.0, 0.0);
+        assert!((by - (1000.0 - mask().depth as f64)).abs() < 1e-3, "{by}");
+    }
+
+    #[test]
+    fn text_under_a_soft_mask_is_not_drawn_natively() {
+        let mut p = page(vec![
+            lit("q /pgfsmask9 gs", 1000, 1000),
+            Item::Glyph {
+                font: 1,
+                char: 65,
+                index: None,
+                x: 1000,
+                y: 1000,
+                width: 100,
+                expansion: 0,
+            },
+            lit("Q", 1000, 1000),
+        ]);
+        p.masks.insert("pgfsmask9".into(), mask());
+        assert!(native_graphics(&p).is_err());
+        // an undeclared mask is an unknown graphics state
+        let p = page(vec![lit("/pgfsmask3 gs", 1000, 1000)]);
+        assert!(native_graphics(&p).is_err());
     }
 }

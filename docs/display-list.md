@@ -119,7 +119,11 @@ Records, until END: u8 tag, u32 payload_length, payload
                    raw PDF literal or \special (mode −1); x, y: where it was output (page
                    lists, for native drawing; read when the payload has 8 more bytes)
   0x24 UNSUPPORTED str kind, str detail
-                   kind box_resource: a \useboxresource form, "index x top width height";
+                   kind box_resource: a \useboxresource form, "index x top width height"
+                   (a form used at its saved size whose contents have no whatsits, such as
+                   graphicx's trim/clip and viewport, is written as its contents instead:
+                   MATRIX save, a LITERAL `0 -d w h+d re W n` clipping to the form's box,
+                   the saved box's items, MATRIX restore);
                    kind shading: a pgf shading form, "index x top width height depth <JSON>"
   0x25 MATH        u8 on, i32 x                       inline math boundary, for hit-testing
   0x26 IMAGE       i32 resource_index, i32 x, i32 y_top, i32 width, i32 height
@@ -137,6 +141,9 @@ Records, until END: u8 tag, u32 payload_length, payload
                    `/pgfpatN scn`), as pgf declares it: paint type 1 coloured, 2 uncoloured;
                    bbox, steps and content in pattern space; the matrix maps pattern space to
                    the page's default space (bp, origin bottom-left)
+  0x2D MASK        str name, u32 n, n bytes JSON (`{"width", "height", "depth", "items"}`)
+                   a soft mask the page's literals set (pgf's fadings, `/pgfsmaskN gs`): the
+                   items its form's box draws, relative to the box's reference point
   0xFF END
 ```
 
@@ -149,8 +156,9 @@ A page whose flags are only `literal` and `shading` can be drawn without its PDF
 `rtex_dl::gfx::native_graphics(&dl)` replays the page's literals, colour stack operations,
 MATRIX records and shading forms the way LuaTeX writes them into the PDF and returns a
 `NativePage`, or the first thing it does not understand (`Unsupported`: text or XObjects in
-literals, stroking with a pattern, soft masks, literal modes other than 0/1, `\special`,
-`box_resource`).
+literals, stroking with a pattern, text under a soft mask, literal modes other than 0/1, `\special`,
+`box_resource`). pict2e's code (picture mode, diagbox) is a literal like pgf's: the capture
+routes both through Lua so their operators can be read.
 It never returns a partial drawing. `LayoutUpdate.pages_changed[].native` carries it for every
 degraded page it resolves (absent otherwise); the page stays `exact: false`, so a host that does
 not draw natively keeps using the PDF.
@@ -182,6 +190,12 @@ not draw natively keeps using the PDF.
   default space), not to the shape. The page list carries the declarations it needs
   (`patterns`, PATTERN records), and so do cached pictures, moved with the picture, as their
   PDF region keeps its tiles.
+- Soft masks (pgf's fadings): `Paint` and `Shade` ops painted under one name it (`mask`).
+  `masks` maps each instance to what its form draws (`ops`, page coordinates) and the form's box
+  (`bbox` in form space, `ctm` from form space to the list's frame). The op's opacity is the
+  luminosity of that drawing over black, which is also the mask outside the box: draw the op on
+  a layer, keep it where the mask's luminosity says, and draw the layer under the current clip.
+  The page list carries the masks it sets (`masks`, MASK records), cached pictures included.
 - `transforms` lists glyphs, rules and images that a transformed pgf scope (rotated or scaled
   node text, axis labels) moves away from their list position: draw them with that map (list
   coordinates to list coordinates) instead of their MATRIX records.

@@ -609,7 +609,7 @@ function C.shipout(b)
     if k and not pc.multi and not C.pics[k.key] and not C.pic_bad[k.key] then
       C.pics[k.key] = { env = k.env, page = C.page, x = pc.x, y = pc.y, w = pc.w, h = pc.h, d = pc.d,
                         page_height = page.page_height, state = k.state, items = pc.items, fonts = pc.fonts,
-                        patterns = C.patterns_of({ pc.items }) }
+                        patterns = (C.resources_of({ pc.items })), masks = select(2, C.resources_of({ pc.items })) }
     elseif k and (pc.multi or C.pics[k.key]) then
       C.pics[k.key] = nil
       C.pic_bad[k.key] = true
@@ -619,7 +619,7 @@ function C.shipout(b)
   do
     local lists = { page.other }
     for _, line in ipairs(page.lines) do lists[#lists + 1] = line.items end
-    page.patterns = C.patterns_of(lists)
+    page.patterns, page.masks = C.resources_of(lists)
   end
   if next(C.images) then page.images_info = C.images end
   C.pages[#C.pages + 1] = page
@@ -713,24 +713,45 @@ function C.pattern(name, paint_type, bbox, steps, matrix, content)
   C.patterns["pgfpat" .. name] = { paint_type = paint_type, bbox = nums(bbox), xstep = st[1] or 0,
                                    ystep = st[2] or 0, matrix = nums(matrix), content = content }
 end
--- The declared patterns the literals of `items` (display-list items) name, or nil.
-local function patterns_of(lists, into)
-  if not next(C.patterns) then return into end
+-- pgf's soft masks (fadings, rtex-capture.sty): graphics state name -> what the mask's form
+-- draws (rtex_dl::Mask: the items of the fading's box, relative to its reference point).
+C.masks = {}
+C.fadings = {}        -- fading name -> what its box draws (saved where pgf declares it)
+function C.fading(name, box)
+  local ok, b = pcall(tex.getboxresourcebox, box)
+  if not ok or not b then return end
+  local f = dl.fragment(b)
+  C.fadings[name] = { width = f.width, height = f.height, depth = f.depth, items = f.items }
+end
+function C.mask(form, name)
+  C.masks["pgfsmask" .. form] = C.fadings[name]
+end
+-- The declared patterns and masks the literals of `lists` (display-list item lists) name:
+-- (patterns or nil, masks or nil).
+local function resources_of(lists)
+  local pats, masks
+  if not next(C.patterns) and not next(C.masks) then return nil, nil end
   for _, items in ipairs(lists) do
     for _, it in ipairs(items or {}) do
       if it[1] == "l" and type(it[3]) == "string" then
         for n in it[3]:gmatch("/(pgfpat%d+)") do
           if C.patterns[n] then
-            into = into or {}
-            into[n] = C.patterns[n]
+            pats = pats or {}
+            pats[n] = C.patterns[n]
+          end
+        end
+        for n in it[3]:gmatch("/(pgfsmask%d+)") do
+          if C.masks[n] then
+            masks = masks or {}
+            masks[n] = C.masks[n]
           end
         end
       end
     end
   end
-  return into
+  return pats, masks
 end
-C.patterns_of = patterns_of
+C.resources_of = resources_of
 function C.literal(data)
   local n = node.new("whatsit", literal_subtype)
   n.mode = 0
