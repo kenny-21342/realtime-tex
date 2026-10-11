@@ -2,10 +2,12 @@
 
 ## Unreleased
 
+## 0.0.5 (2026-10-11)
+
 ### From upstream 0.0.3
 
-Upstream 0.0.3 and this fork's 0.0.3 are different releases. These upstream fixes
-will ship in the fork's next release; the current fork version remains 0.0.4.
+Upstream 0.0.3 and this fork's 0.0.3 are different releases. This fork's 0.0.5
+includes the upstream fixes below while preserving its own changes.
 
 - **Live typing on Windows with MiKTeX.** The live engine exited at startup with
   "exit code: 1" on every MiKTeX installation (realtime-tex-vsc-plugin#1): MiKTeX refuses to
