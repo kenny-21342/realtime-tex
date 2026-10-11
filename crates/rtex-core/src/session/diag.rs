@@ -152,6 +152,12 @@ pub fn parse_log(log: &Path) -> Vec<Diagnostic> {
         regex::Regex::new(r"^(Overfull|Underfull) \\[hv]box .* at lines (\d+)--(\d+)").unwrap();
     for (i, l) in lines.iter().enumerate() {
         if let Some(c) = re_fle.captures(l) {
+            // an error the document told LuaTeX to ignore (`\ignoreprimitiveerror`, set by the
+            // LaTeX kernel around the \vsplit that extracts marks, so every page a longtable
+            // breaks may log one): written to the log only, TeX goes on as if nothing happened
+            if c["msg"].starts_with("ignored: ") {
+                continue;
+            }
             if c["msg"].starts_with("Undefined") || !c["msg"].is_empty() {
                 out.push(Diagnostic {
                     severity: "error".into(),
@@ -250,5 +256,22 @@ mod tests {
                 (Some("D:/a/build/rtex-preamble.tex"), Some(5))
             ]
         );
+    }
+
+    #[test]
+    fn ignored_errors_are_not_diagnostics() {
+        let log = std::env::temp_dir().join(format!("rtex-diag-ign-{}.log", std::process::id()));
+        std::fs::write(
+            &log,
+            "./main.tex:89: ignored: Infinite glue shrinkage found in box being split [100] [101]\n\
+             ./main.tex:89: ignored: Infinite glue shrinkage found in box being split [102]\n\
+             ./main.tex:90: Undefined control sequence.\nl.90 \\foo\n",
+        )
+        .unwrap();
+        let d = parse_log(&log);
+        let _ = std::fs::remove_file(&log);
+        let got: Vec<(&str, Option<i64>)> =
+            d.iter().map(|d| (d.message.as_str(), d.line)).collect();
+        assert_eq!(got, vec![("Undefined control sequence.", Some(90))]);
     }
 }

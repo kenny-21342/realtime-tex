@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.0.4 (2026-10-11)
+
+- **Ignored errors are not reported.** LuaTeX logs an error the document told it to ignore
+  (`\ignoreprimitiveerror`) as `file:line: ignored: ...`, in the log only. The LaTeX kernel does
+  that around the `\vsplit` that extracts marks, so with some TeX Live versions every page a
+  `longtable` breaks logged "ignored: Infinite glue shrinkage found in box being split". Each was
+  reported as a compile error and the run ended in `PassLimitReached`; they are now skipped.
+
 ## 0.0.3 (2026-10-11)
 
 The first release of kenny-21342/realtime-tex: upstream 0.0.2 (`e35f869`) plus the fork's work:
