@@ -36,7 +36,7 @@ pub extern "C" fn rtex_version() -> *const c_char {
 
 /// Open a session. `config_json`: {"project_root": "...", "main_file": "main.tex",
 /// "build_dir": "...", "debounce_ms": 300, "max_passes": 5, "trusted_macros": [...],
-/// "fast_on_stale_context": true, "compile_timeout_ms": 5000, "pass_timeout_ms": 120000, "fast_budget_ms": 50, "fast_budget_factor": 4, "unit_envs": [...], "warm_background": true, "eligibility": "probe"|"allowlist", "picture_cache": true, "debug_dir": "/path"}. On failure returns null and
+/// "fast_on_stale_context": true, "compile_timeout_ms": 5000, "pass_timeout_ms": 120000, "fast_budget_ms": 50, "fast_budget_factor": 4, "unit_envs": [...], "warm_background": true, "eligibility": "probe"|"allowlist", "picture_cache": true, "hold_broken_pictures": true, "debug_dir": "/path"}. On failure returns null and
 /// writes an error message to `*err_out` (free with rtex_string_free).
 #[no_mangle]
 pub unsafe extern "C" fn rtex_session_open(
@@ -90,6 +90,9 @@ pub unsafe extern "C" fn rtex_session_open(
     }
     if let Some(b) = v.get("picture_cache").and_then(|x| x.as_bool()) {
         cfg.picture_cache = b;
+    }
+    if let Some(b) = v.get("hold_broken_pictures").and_then(|x| x.as_bool()) {
+        cfg.hold_broken_pictures = b;
     }
     if let Some(d) = v.get("debug_dir").and_then(|x| x.as_str()) {
         cfg.debug_dir = Some(d.into());

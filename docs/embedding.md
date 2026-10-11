@@ -95,6 +95,7 @@ briefly. The live engine and the background passes run on their own threads.
 | `trusted_macros` | `trusted_macros` | | none | macros you vouch for, treated as allow-listed |
 | `unit_envs` | `unit_envs` | | none | extra environments to treat like theorems (found automatically from `\newtheorem`) |
 | `picture_cache` | `picture_cache` | `--no-picture-cache` | on | reuse unchanged TikZ pictures from earlier passes |
+| `hold_broken_pictures` | `hold_broken_pictures` | `--no-hold-broken-pictures` | on | while an edit leaves a picture with errors, show its last good version (`LayoutUpdate.held`) |
 | `warm_background` | `warm_background` | | on | keep a standby engine with the preamble loaded for passes |
 | `fast_on_stale_context` | `fast_on_stale_context` | | on | deliver live results even when something before the unit changed since the last pass |
 | `bib_tool` | | | auto | `biber`, `bibtex` or none; auto picks from the files the pass writes |
@@ -132,6 +133,7 @@ and its left edge at `f.xs[j]`; then draw its items.
 | `placements` | where every unit's rows are now. Use these to re-anchor live results you are still showing. |
 | `convergence` | `Converged`, `Converging`, `PassLimitReached` or `Stale` ([how-it-works.md](how-it-works.md#convergence)). Good for a status indicator. A `Converging` with the reason "another pass is running" is a layout shown while a pass runs, such as a reopened session's saved layout. |
 | `compile` | `Ok`, `CompiledWithErrors{count}` (show the diagnostics) or `Failed` (keep showing the previous layout). |
+| `held` | present when a picture whose source has errors is shown in its last good version ([how-it-works.md](how-it-works.md#held-pictures)): its span (`par_id`), `file`, `line`/`end_line` and the `since_revision` it was first held at. Mark the picture as out of date; `placements` give its place. The pages (none, when only the held pictures changed) are the held ones; `compile` and the diagnostics are the real run's. |
 | `eligible_paragraphs` | the units that may go live in this layout. |
 | `wall_ms`, `passes` | how long the run took, and how many passes it needed. |
 

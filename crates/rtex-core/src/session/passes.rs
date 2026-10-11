@@ -244,8 +244,34 @@ pub(super) fn run_background_pass(s: &Shared) {
 pub(super) const PROVISIONAL_LAYOUT_AFTER: Duration = Duration::from_secs(2);
 
 pub(super) fn run_background_pass_inner(s: &Shared) {
-    let t0 = Instant::now();
     let (texts, spans, rev) = snapshot(s);
+    run_pass(s, &texts, spans, rev, &[], &[]);
+}
+
+/// A run of passes over a snapshot, published as a layout. With `held` pictures (a held run,
+/// `hold`): their bodies are blanked and the manifest offers their last good drawings; the run
+/// publishes only a clean layout that took every held picture from the cache, and returns
+/// whether it did (otherwise the caller publishes the run it is holding for). A normal run
+/// always publishes and returns true.
+fn run_pass(
+    s: &Shared,
+    source_texts: &BTreeMap<String, String>,
+    spans: Vec<SnapshotSpan>,
+    rev: Revision,
+    held: &[hold::HeldPic],
+    held_diagnostics: &[Diagnostic],
+) -> bool {
+    let t0 = Instant::now();
+    let holding = !held.is_empty();
+    let texts = if holding {
+        hold::blank(source_texts, held)
+    } else {
+        source_texts.clone()
+    };
+    // pictures are held in warm runs only: they alternate between two pass directories, so the
+    // run being held for keeps its files while the held run writes the other directory
+    let hold_on =
+        !holding && s.cfg.hold_broken_pictures && s.cfg.picture_cache && s.cfg.warm_background;
     let snap_dir = snapshot_dir(&s.cfg.build_dir);
     // a pass that cannot run is still a layout result: hosts see compile = Failed instead of a
     // pass that never ends
@@ -273,6 +299,10 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
             .fetch_max(cap.wall.as_millis() as u64, Ordering::SeqCst);
     };
     let failed_with = |msg: String, items: Vec<Diagnostic>| {
+        if holding {
+            log::debug!("held run failed: {msg}");
+            return;
+        }
         s.events
             .send(Event::Diagnostics {
                 source: "background".into(),
@@ -301,6 +331,7 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
                 eligible_paragraphs: vec![],
                 pdf_fallback: None,
                 wall_ms: t0.elapsed().as_millis() as u64,
+                held: vec![],
             })
             .ok();
     };
@@ -316,7 +347,7 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
     };
     if let Err(e) = write_snapshot(&s.cfg.project_root, &texts, &snap_dir) {
         failed(format!("snapshot: {e}"));
-        return;
+        return !holding;
     }
     let out_dir = s.cfg.build_dir.join("bg");
     let unit_envs = s.policy.lock().unit_envs_env();
@@ -324,11 +355,34 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
     // pass's PDF; the manifest is refreshed before every pass of the run (a pass's own
     // drawings serve the next one)
     let _ = std::fs::create_dir_all(&out_dir);
-    let pics: Vec<crate::piccache::PictureRef> = if s.cfg.picture_cache {
+    let mut pics: Vec<crate::piccache::PictureRef> = if s.cfg.picture_cache {
         let pre_hash = crate::piccache::preamble_hash(&texts, &s.cfg.main_file);
         crate::piccache::scan_pictures(&texts, &s.cfg.main_file, pre_hash)
     } else {
         Vec::new()
+    };
+    // a held picture's (blanked) body is replaced by its last good drawing
+    for p in &mut pics {
+        if let Some(h) = held.iter().find(|h| h.key == p.key) {
+            p.hash = h.last_good.hash;
+            p.cacheable = true;
+        }
+    }
+    let pic_ids = hold::identities(&pics, &spans);
+    let held_ids: std::collections::BTreeSet<hold::PicId> = held.iter().map(|h| h.id).collect();
+    let errors_of = |cap: &crate::capture::CaptureResult| -> Vec<(String, i64)> {
+        parse_log(&cap.log)
+            .into_iter()
+            .filter(|d| d.severity == "error")
+            .filter_map(|d| Some((d.file?, d.line?)))
+            .collect()
+    };
+    // the pictures a normal run's pass would hold
+    let to_hold = |errors: &[(String, i64)]| -> Vec<hold::HeldPic> {
+        if !hold_on || errors.is_empty() {
+            return Vec::new();
+        }
+        hold::decide(&texts, &pics, &pic_ids, errors, &s.hold.lock().last_good)
     };
     let pic_cache =
         std::sync::Mutex::new(crate::piccache::PicCache::open(&out_dir.join("pic-cache")));
@@ -354,12 +408,15 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
         if pics.is_empty() || cap.fatal() {
             return;
         }
-        let errors: Vec<(String, i64)> = parse_log(&cap.log)
-            .into_iter()
-            .filter(|d| d.severity == "error")
-            .filter_map(|d| Some((d.file?, d.line?)))
-            .collect();
-        if let Err(e) = pic_cache.lock().unwrap().absorb(
+        let mut errors = errors_of(cap);
+        // a picture about to be held is neither cached in its broken version nor taken as its
+        // last good one (a runaway's errors come after its \end)
+        for h in to_hold(&errors) {
+            errors.push((h.file.clone(), h.line as i64));
+        }
+        let mut cache = pic_cache.lock().unwrap();
+        cache.pin(s.hold.lock().last_good.values().map(|g| g.hash));
+        if let Err(e) = cache.absorb(
             &pics,
             &cap.json.recorded_pics(),
             &cap.json.pic_mismatch,
@@ -368,6 +425,38 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
         ) {
             log::warn!("picture cache: {e:#}");
         }
+        // last good versions: pictures drawn (or taken from the cache) with no error from their
+        // \begin to just after their \end (a runaway reports the line after it)
+        let mut hs = s.hold.lock();
+        for (p, id) in pics.iter().zip(&pic_ids) {
+            let Some(id) = id else { continue };
+            let Some((file, begin)) = p
+                .key
+                .rsplit_once(':')
+                .and_then(|(f, l)| Some((f, l.parse::<i64>().ok()?)))
+            else {
+                continue;
+            };
+            let near = errors.iter().any(|(f, l)| {
+                f.trim_start_matches("./") == file && (begin..=p.end_line as i64 + 2).contains(l)
+            });
+            if held_ids.contains(id) || near || !p.cacheable || !cache.has_entry(p.hash) {
+                continue;
+            }
+            if let Some(text) = hold::picture_text(&texts, p) {
+                hs.last_good.insert(
+                    *id,
+                    hold::LastGood {
+                        hash: p.hash,
+                        env: p.env.clone(),
+                        text,
+                    },
+                );
+            }
+        }
+        // pictures no longer in the sources
+        let live_ids: std::collections::BTreeSet<&hold::PicId> = pic_ids.iter().flatten().collect();
+        hs.last_good.retain(|id, _| live_ids.contains(id));
     };
     // the aux family every pass of this run starts from
     let aux_dir = last_pass_dir(s).unwrap_or_else(|| pass_dir(s, 0));
@@ -390,7 +479,11 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
     let mut on_pass = |cap: &crate::capture::CaptureResult, pass: u32| {
         // the host sees the provisional layout before the cache absorbs the pass's pictures
         // (a PDF round trip)
-        if pass_started.elapsed() >= PROVISIONAL_LAYOUT_AFTER {
+        if pass_started.elapsed() >= PROVISIONAL_LAYOUT_AFTER
+            && !holding
+            && to_hold(&errors_of(cap)).is_empty()
+        {
+            s.hold.lock().shown_clean = None;
             deliver_layout(
                 s,
                 t0,
@@ -400,6 +493,7 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
                 spans_for_provisional.clone(),
                 rev,
                 true,
+                None,
             );
         }
         let t_absorb = Instant::now();
@@ -540,7 +634,7 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
                     },
                 );
                 failed_with(stopped.0.clone(), items);
-                return;
+                return !holding;
             }
             match items.iter().find(|d| d.severity == "error") {
                 Some(first) => {
@@ -553,12 +647,63 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
                 }
                 None => failed(format!("background pass: {e:#}")),
             }
-            return;
+            return !holding;
         }
     };
-    absorb(&outcome.capture);
     let outcome_cap = outcome.capture;
-    deliver_layout(
+    if holding {
+        // the held run counts when it is clean and took every held picture from the cache (a
+        // picture it drew is recorded; its blanked body would show nothing)
+        let recorded = outcome_cap.json.recorded_pics();
+        let took_all = held.iter().all(|h| {
+            !recorded.contains_key(&h.key) && !outcome_cap.json.pic_mismatch.contains(&h.key)
+        });
+        let clean = !outcome_cap.fatal()
+            && outcome_cap.json.pages > 0
+            && !parse_log(&outcome_cap.log)
+                .iter()
+                .any(|d| d.severity == "error");
+        if !(took_all && clean) {
+            log::debug!(
+                "held run not usable (took every held picture: {took_all}, clean: {clean})"
+            );
+            return false;
+        }
+        absorb(&outcome_cap);
+        let pictures = held_pictures(s, held, rev);
+        deliver_layout(
+            s,
+            t0,
+            &outcome_cap,
+            outcome.passes,
+            outcome.aux_stable,
+            hold::depicted_spans(spans, source_texts, held),
+            rev,
+            false,
+            Some((pictures, held_diagnostics.to_vec())),
+        );
+        return true;
+    }
+    let holds = to_hold(&errors_of(&outcome_cap));
+    absorb(&outcome_cap);
+    if !holds.is_empty() {
+        let mut diagnostics = parse_log(&outcome_cap.log);
+        locate_standby_diagnostics(s, &mut diagnostics);
+        // what the held layout depicts: the held pictures' last good texts in place
+        let depicted = sources_hash(&hold::restore(&texts, &holds));
+        if s.hold.lock().shown_clean == Some(depicted) {
+            // only the held pictures changed since the pages shown: they stay
+            let pictures = held_pictures(s, &holds, rev);
+            publish_unchanged_layout(s, t0, outcome.passes, rev, diagnostics, pictures);
+            return true;
+        }
+        if run_pass(s, &texts, spans.clone(), rev, &holds, &diagnostics) {
+            s.hold.lock().shown_clean = Some(depicted);
+            return true;
+        }
+        log::debug!("hold abandoned: the held run was not clean");
+    }
+    let status = deliver_layout(
         s,
         t0,
         &outcome_cap,
@@ -567,7 +712,13 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
         spans,
         rev,
         false,
+        None,
     );
+    {
+        let mut hs = s.hold.lock();
+        hs.since.clear();
+        hs.shown_clean = (status == CompileStatus::Ok).then(|| sources_hash(&texts));
+    }
     // the sources this capture was made from: a later session on the same build directory
     // shows it at once when they have not changed (warm_start)
     if outcome_cap.json.pages > 0 && !outcome_cap.fatal() {
@@ -581,6 +732,22 @@ pub(super) fn run_background_pass_inner(s: &Shared) {
             format!("{:016x}\n", sources_hash(&texts)),
         );
     }
+    true
+}
+
+/// The held pictures as a layout reports them, with the revision each was first held at.
+fn held_pictures(s: &Shared, held: &[hold::HeldPic], rev: Revision) -> Vec<HeldPicture> {
+    let mut hs = s.hold.lock();
+    hs.since.retain(|id, _| held.iter().any(|h| h.id == *id));
+    held.iter()
+        .map(|h| HeldPicture {
+            par_id: h.id.0,
+            file: h.file.clone(),
+            line: h.line,
+            end_line: h.end_line,
+            since_revision: *hs.since.entry(h.id).or_insert(rev),
+        })
+        .collect()
 }
 
 /// Next to a finished run's capture: the hash of the sources it compiled (`sources_hash`).
@@ -627,7 +794,7 @@ fn warm_start(s: &Shared) {
                     dir.display()
                 );
                 *s.last_pass_dir.lock() = Some(dir.clone());
-                deliver_layout(s, t0, &cap, 1, true, spans, rev, true);
+                deliver_layout(s, t0, &cap, 1, true, spans, rev, true, None);
                 return;
             }
             Ok(_) => {}
@@ -671,6 +838,7 @@ pub(super) fn layout_failed(s: &Shared, t0: Instant, rev: Revision, msg: String)
             eligible_paragraphs: vec![],
             pdf_fallback: None,
             wall_ms: t0.elapsed().as_millis() as u64,
+            held: vec![],
         })
         .ok();
 }
@@ -688,14 +856,26 @@ pub(super) fn deliver_layout(
     spans: Vec<SnapshotSpan>,
     rev: Revision,
     provisional: bool,
-) {
+    held: Option<(Vec<HeldPicture>, Vec<Diagnostic>)>,
+) -> CompileStatus {
     let t = Instant::now();
-    deliver_layout_inner(s, t0, cap, passes, aux_stable, spans, rev, provisional);
+    let status = deliver_layout_inner(
+        s,
+        t0,
+        cap,
+        passes,
+        aux_stable,
+        spans,
+        rev,
+        provisional,
+        held,
+    );
     log::debug!(
         "background pass {passes}: layout delivered in {} ms ({} pages, provisional {provisional})",
         t.elapsed().as_millis(),
         cap.json.pages
     );
+    status
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -708,9 +888,16 @@ fn deliver_layout_inner(
     spans: Vec<SnapshotSpan>,
     rev: Revision,
     provisional: bool,
-) {
-    let mut diagnostics = parse_log(&cap.log);
-    locate_standby_diagnostics(s, &mut diagnostics);
+    held: Option<(Vec<HeldPicture>, Vec<Diagnostic>)>,
+) -> CompileStatus {
+    // a held layout reports the errors of the run it holds for (its own run is clean)
+    let (held, mut diagnostics) = match held {
+        Some((pictures, diagnostics)) => (pictures, diagnostics),
+        None => (Vec::new(), parse_log(&cap.log)),
+    };
+    if held.is_empty() {
+        locate_standby_diagnostics(s, &mut diagnostics);
+    }
     let errors = diagnostics.iter().filter(|d| d.severity == "error").count();
     // a fatal error leaves no PDF (at most a partial one) even when pages were shipped: the
     // pass is a failure, the previous layout stays
@@ -735,7 +922,7 @@ fn deliver_layout_inner(
                     source_revision: rev,
                     ..Default::default()
                 },
-                compile,
+                compile: compile.clone(),
                 convergence: Convergence::PassLimitReached {
                     passes,
                     reasons: vec![if fatal {
@@ -751,9 +938,10 @@ fn deliver_layout_inner(
                 eligible_paragraphs: vec![],
                 pdf_fallback: None,
                 wall_ms: t0.elapsed().as_millis() as u64,
+                held: vec![],
             })
             .ok();
-        return;
+        return compile;
     }
     let (changed, versions, placements, eligible, eligible_strict, pdf) = {
         // lock order everywhere: files, then layout, then policy (apply_edit holds the first two
@@ -794,78 +982,11 @@ fn deliver_layout_inner(
                 drop(layout);
                 drop(files);
                 layout_failed(s, t0, rev, format!("install layout: {e}"));
-                return;
+                return CompileStatus::Failed;
             }
         };
-        let versions = Versions {
-            source_revision: s.source_revision.load(Ordering::SeqCst),
-            context_revision: layout.context_revision,
-            engine_generation: s.engine_generation.load(Ordering::SeqCst),
-            layout_version: layout.layout_version,
-        };
-        let mut placements = Vec::new();
-        let mut eligible = Vec::new();
-        // units whose vocabulary the allow-list fully knows (safe to compile unprobed)
-        let mut eligible_strict: Vec<ParaId> = Vec::new();
-        let policy = s.policy.lock().clone();
-        for (id, idx) in &layout.by_span {
-            let eu = &layout.units[*idx];
-            let c = &eu.captured;
-            let rows: Vec<(i64, i64)> = c.placements.iter().map(|p| (p.x, p.y)).collect();
-            let kind = match c.kind.as_str() {
-                "par" => "par".to_string(),
-                k => format!("{k}:{}", c.name.clone().unwrap_or_default()),
-            };
-            if let Some((frags, _)) = layout.fragments(*id, &rows) {
-                placements.push(ParagraphPlacement {
-                    par_id: *id,
-                    fragments: frags,
-                    lines: eu.rows(),
-                    kind,
-                });
-            }
-            let has_ctx = eu.has_context();
-            // eligible = capture facts clean AND the span's source passes the allow-list with the
-            // shape the capture saw (what apply_edit will decide for a one-character edit)
-            let source_ok = layout
-                .snapshot_spans
-                .iter()
-                .find(|sp| sp.id == *id)
-                .map(|sp| !sp.background_only)
-                .unwrap_or(false)
-                && files
-                    .values()
-                    .find_map(|fb| fb.span_text(*id))
-                    .map(|text| {
-                        let (shape, _) = classify_source(text, &policy);
-                        match (&shape, c.kind.as_str()) {
-                            (UnitShape::Par, "par") => true,
-                            (UnitShape::Env(n), "env") => Some(n.as_str()) == c.name.as_deref(),
-                            (UnitShape::Heading(n), "heading") => {
-                                Some(n.as_str()) == c.name.as_deref()
-                            }
-                            _ => false,
-                        }
-                    })
-                    .unwrap_or(false);
-            if source_ok
-                && check_engine_unit(&c.kind, &c.everypar, has_ctx, eu.rows(), &eu.flags).is_empty()
-            {
-                eligible.push(*id);
-                let strict_ok = files
-                    .values()
-                    .find_map(|fb| fb.span_text(*id))
-                    .map(|text| classify_source_with(text, &policy, false).1.is_empty())
-                    .unwrap_or(false);
-                if strict_ok {
-                    eligible_strict.push(*id);
-                }
-            }
-        }
+        let (versions, placements, eligible, eligible_strict) = layout_lists(s, &files, &layout);
         drop(files);
-        placements.sort_by_key(|p| p.par_id);
-        eligible.sort();
-        eligible_strict.sort();
         (
             changed,
             versions,
@@ -985,7 +1106,7 @@ fn deliver_layout_inner(
     s.events
         .send(Event::LayoutUpdate {
             versions,
-            compile,
+            compile: compile.clone(),
             convergence: convergence.clone(),
             passes,
             pages_changed,
@@ -994,6 +1115,151 @@ fn deliver_layout_inner(
             eligible_paragraphs: eligible,
             pdf_fallback: if any_degraded { pdf } else { None },
             wall_ms: t0.elapsed().as_millis() as u64,
+            held,
+        })
+        .ok();
+    if matches!(convergence, Convergence::Stale { .. }) {
+        s.bg_signal.0.send(BgCmd::Pass).ok();
+    }
+    compile
+}
+
+/// The current layout's versions, placements and eligible spans (all and allow-listed), as a
+/// `LayoutUpdate` reports them.
+fn layout_lists(
+    s: &Shared,
+    files: &BTreeMap<String, FileBuf>,
+    layout: &LayoutStore,
+) -> (Versions, Vec<ParagraphPlacement>, Vec<ParaId>, Vec<ParaId>) {
+    let versions = Versions {
+        source_revision: s.source_revision.load(Ordering::SeqCst),
+        context_revision: layout.context_revision,
+        engine_generation: s.engine_generation.load(Ordering::SeqCst),
+        layout_version: layout.layout_version,
+    };
+    let mut placements = Vec::new();
+    let mut eligible = Vec::new();
+    // units whose vocabulary the allow-list fully knows (safe to compile unprobed)
+    let mut eligible_strict: Vec<ParaId> = Vec::new();
+    let policy = s.policy.lock().clone();
+    for (id, idx) in &layout.by_span {
+        let eu = &layout.units[*idx];
+        let c = &eu.captured;
+        let rows: Vec<(i64, i64)> = c.placements.iter().map(|p| (p.x, p.y)).collect();
+        let kind = match c.kind.as_str() {
+            "par" => "par".to_string(),
+            k => format!("{k}:{}", c.name.clone().unwrap_or_default()),
+        };
+        if let Some((frags, _)) = layout.fragments(*id, &rows) {
+            placements.push(ParagraphPlacement {
+                par_id: *id,
+                fragments: frags,
+                lines: eu.rows(),
+                kind,
+            });
+        }
+        let has_ctx = eu.has_context();
+        // eligible = capture facts clean AND the span's source passes the allow-list with the
+        // shape the capture saw (what apply_edit will decide for a one-character edit)
+        let source_ok = layout
+            .snapshot_spans
+            .iter()
+            .find(|sp| sp.id == *id)
+            .map(|sp| !sp.background_only)
+            .unwrap_or(false)
+            && files
+                .values()
+                .find_map(|fb| fb.span_text(*id))
+                .map(|text| {
+                    let (shape, _) = classify_source(text, &policy);
+                    match (&shape, c.kind.as_str()) {
+                        (UnitShape::Par, "par") => true,
+                        (UnitShape::Env(n), "env") => Some(n.as_str()) == c.name.as_deref(),
+                        (UnitShape::Heading(n), "heading") => Some(n.as_str()) == c.name.as_deref(),
+                        _ => false,
+                    }
+                })
+                .unwrap_or(false);
+        if source_ok
+            && check_engine_unit(&c.kind, &c.everypar, has_ctx, eu.rows(), &eu.flags).is_empty()
+        {
+            eligible.push(*id);
+            let strict_ok = files
+                .values()
+                .find_map(|fb| fb.span_text(*id))
+                .map(|text| classify_source_with(text, &policy, false).1.is_empty())
+                .unwrap_or(false);
+            if strict_ok {
+                eligible_strict.push(*id);
+            }
+        }
+    }
+    placements.sort_by_key(|p| p.par_id);
+    eligible.sort();
+    eligible_strict.sort();
+    (versions, placements, eligible, eligible_strict)
+}
+
+/// A held layout whose pages are the ones shown (only the held pictures changed since): the
+/// run's errors and the held pictures, no page.
+fn publish_unchanged_layout(
+    s: &Shared,
+    t0: Instant,
+    passes: u32,
+    rev: Revision,
+    diagnostics: Vec<Diagnostic>,
+    held: Vec<HeldPicture>,
+) {
+    let errors = diagnostics.iter().filter(|d| d.severity == "error").count();
+    let (versions, placements, eligible, pdf, pages_total, any_degraded) = {
+        let files = s.files.lock();
+        let layout = s.layout.lock();
+        let (versions, placements, eligible, _) = layout_lists(s, &files, &layout);
+        let any_degraded = layout.pages.values().any(|dl| !dl.is_exact());
+        let pages_total = layout.pages.len() as i64;
+        (
+            versions,
+            placements,
+            eligible,
+            layout.pdf.clone(),
+            pages_total,
+            any_degraded,
+        )
+    };
+    let current = s.source_revision.load(Ordering::SeqCst);
+    let convergence = if current > rev {
+        Convergence::Stale {
+            pending_since: rev + 1,
+        }
+    } else {
+        Convergence::PassLimitReached {
+            passes,
+            reasons: vec![
+                format!("{errors} compile errors"),
+                format!("{} picture(s) shown in their last good version", held.len()),
+            ],
+        }
+    };
+    *s.convergence.lock() = Some(convergence.clone());
+    s.events
+        .send(Event::Diagnostics {
+            source: "background".into(),
+            items: diagnostics,
+        })
+        .ok();
+    s.events
+        .send(Event::LayoutUpdate {
+            versions,
+            compile: CompileStatus::CompiledWithErrors { count: errors },
+            convergence: convergence.clone(),
+            passes,
+            pages_changed: vec![],
+            pages_total,
+            placements,
+            eligible_paragraphs: eligible,
+            pdf_fallback: if any_degraded { pdf } else { None },
+            wall_ms: t0.elapsed().as_millis() as u64,
+            held,
         })
         .ok();
     if matches!(convergence, Convergence::Stale { .. }) {
