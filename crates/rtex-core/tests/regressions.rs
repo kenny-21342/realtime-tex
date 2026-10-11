@@ -97,6 +97,25 @@ fn a_persistent_error_ends_the_run() {
     s.close();
 }
 
+/// LuaTeX logs an error the document asked it to ignore (`\ignoreprimitiveerror`) as
+/// `file:line: ignored: ...`, in the log only. The LaTeX kernel does that around the \vsplit
+/// that extracts marks, so a longtable breaking across pages logged one per page with some
+/// TeX Live versions: each was reported as a compile error and the run ended in
+/// `PassLimitReached` instead of converging.
+#[test]
+fn an_ignored_error_is_not_a_compile_error() {
+    let Some(s) = open(
+        "ignored",
+        "\\documentclass{article}\n\\begin{document}\nSome text.\n\n\\setbox0\\vbox{a\\par\\vskip 0pt minus 1fil b\\par}%\n{\\ignoreprimitiveerror 1 \\setbox2\\vsplit0 to 5pt}%\nMore text.\n\\end{document}\n",
+    ) else {
+        return;
+    };
+    let (compile, convergence, errors, _) = final_layout(&s, 120, Duration::from_millis(500));
+    assert_eq!(compile, CompileStatus::Ok, "errors: {errors:?}");
+    assert_eq!(convergence, Convergence::Converged);
+    s.close();
+}
+
 /// pgf node names are global: a picture can use a node named in an earlier picture. When the
 /// picture cache drew the first picture from an earlier PDF its body did not run, the name was
 /// never defined, and a later picture the cache does not take (here: it holds a `\ref`) failed
