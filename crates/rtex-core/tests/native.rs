@@ -211,3 +211,51 @@ fn cached_pictures_are_drawn_natively_like_typeset_ones() {
     eprintln!("cached regions in the pass: {raw_cached}; pages drawn natively: {drawn_from_cache}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// pict2e (picture mode, and diagbox's diagonal) writes its literals as token lists the display
+/// list cannot read; the capture routes them through Lua like pgf's. pgf's tiling patterns are
+/// drawn from their cells. Both pages are drawn natively.
+#[test]
+fn pict2e_and_tiling_patterns_are_drawn_natively() {
+    if let Err(e) = TexLive::discover() {
+        eprintln!("SKIP: {e}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-native-p2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let main = "\\documentclass{article}\n\\usepackage{pict2e,diagbox,tikz}\n\
+                \\usetikzlibrary{patterns}\n\\begin{document}\n\
+                \\begin{tabular}{|c|c|}\\hline\\diagbox{A}{B} & C\\\\\\hline\\end{tabular}\n\n\
+                \\setlength{\\unitlength}{1mm}\\begin{picture}(40,20)\n\
+                \\put(0,0){\\line(2,1){40}}\\put(20,10){\\circle{10}}\\qbezier(0,0)(20,20)(40,0)\n\
+                \\end{picture}\n\\newpage\n\
+                \\begin{tikzpicture}\\fill[pattern=north east lines, pattern color=red] (0,0) \
+                rectangle (3,2);\\end{tikzpicture}\n\\end{document}\n";
+    std::fs::write(project.join("main.tex"), main).unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.debounce = Duration::from_millis(50);
+    let s = Session::open(cfg).unwrap();
+    let mut pages = BTreeMap::new();
+    converged(&s, &mut pages, 180);
+    s.close();
+    let native = |page: i64| {
+        let (dl, n) = &pages[&page];
+        let n = n.clone().unwrap_or_else(|| {
+            panic!(
+                "page {page} is not drawn natively: {:?}",
+                native_graphics(dl).err()
+            )
+        });
+        assert!(
+            n.ops.iter().any(|o| matches!(o, GfxOp::Paint { .. })),
+            "page {page} draws nothing"
+        );
+        n
+    };
+    native(1);
+    let p2 = native(2);
+    assert_eq!(p2.patterns.len(), 1, "{:?}", p2.patterns.keys());
+}
