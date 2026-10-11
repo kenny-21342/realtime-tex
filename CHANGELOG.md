@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.4 (2026-10-11)
+
 - **Ignored errors are not reported.** LuaTeX logs an error the document told it to ignore
   (`\ignoreprimitiveerror`) as `file:line: ignored: ...`, in the log only. The LaTeX kernel does
   that around the `\vsplit` that extracts marks, so with some TeX Live versions every page a
