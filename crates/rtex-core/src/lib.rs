@@ -8,17 +8,20 @@ pub mod engine;
 pub mod ffi;
 pub mod fixtures;
 pub mod layout;
+pub mod paths;
 pub mod piccache;
 pub mod replay;
 pub mod session;
 pub mod texlive;
+mod transport;
 
 pub use document::{Edit, ParaId, Revision};
 pub use session::{Convergence, Event, Session, SessionConfig, Versions};
 
-/// Extract the preamble (everything before `\begin{document}`) from a LaTeX main file.
+/// Extract the preamble (everything before `\begin{document}`) from a LaTeX main file. A
+/// `\begin{document}` in a comment or verbatim text does not count.
 pub fn split_preamble(main_tex: &str) -> Option<(&str, &str)> {
-    let idx = document::find_uncommented(main_tex, "\\begin{document}")?;
+    let idx = document::find_command(main_tex, "\\begin{document}")?;
     Some((&main_tex[..idx], &main_tex[idx..]))
 }
 

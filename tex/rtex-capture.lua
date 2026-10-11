@@ -67,13 +67,30 @@ end
 -- place. The names come from scanning the document's source files for definitions.
 local tracked_macros = { "arraystretch", "baselinestretch" }
 local prev_macros = {}
+-- Glossary entries the source defines (\newglossaryentry, \newacronym, \newabbreviation):
+-- their first-use switch \ifglo@<label>@flag is set globally by the first \gls, so the long
+-- form appears once; tracked like a macro, it is replayed per unit (and reset after each
+-- compile) by the server.
+local gls_labels = {}
+-- \iftrue / \iffalse for a switch made by \newif (token.get_meaning has no meaning for a
+-- primitive); nil otherwise
+local IFTRUE, IFFALSE
+local function if_meaning(name)
+  local ok, t = pcall(token.create, name)
+  if not ok or not t or t.cmdname ~= "if_test" then return nil end
+  IFTRUE = IFTRUE or token.create("iftrue")
+  IFFALSE = IFFALSE or token.create("iffalse")
+  if t.mode == IFTRUE.mode then return "\\iftrue" elseif t.mode == IFFALSE.mode then return "\\iffalse" end
+  return nil
+end
 local function meaning(name)
   if token.get_meaning then
     local ok, m = pcall(token.get_meaning, name)
     if ok and m then return m end
   end
   local ok, b = pcall(token.get_macro, name)
-  return ok and b and ("->" .. b) or nil
+  if ok and b then return "->" .. b end
+  return if_meaning(name)
 end
 local function scan_definitions(path, seen, depth)
   if depth > 6 then return end
@@ -88,6 +105,16 @@ local function scan_definitions(path, seen, depth)
   for name in text:gmatch("\\[gex]?def%s*\\(%a+)") do seen[name] = true end
   for name in text:gmatch("\\let%s*\\(%a+)") do seen[name] = true end
   for name in text:gmatch("\\setlength%s*\\(%a+)") do seen[name] = true end
+  for _, cmd in ipairs({ "newglossaryentry", "longnewglossaryentry", "newacronym", "newabbreviation" }) do
+    for label in text:gmatch("\\" .. cmd .. "%s*{([%w@:%-_.]+)}") do gls_labels[label] = true end
+    for label in text:gmatch("\\" .. cmd .. "%s*%b[]%s*{([%w@:%-_.]+)}") do gls_labels[label] = true end
+  end
+  for _, pat in ipairs({ "\\loadglsentries%s*{([^}]*)}", "\\loadglsentries%s*%b[]%s*{([^}]*)}" }) do
+    for sub in text:gmatch(pat) do
+      local sp = sub:match("%.tex$") and sub or (sub .. ".tex")
+      scan_definitions(sp, seen, depth + 1)
+    end
+  end
   for sub in text:gmatch("\\input%s*{([^}]*)}") do
     local sp = sub:match("%.tex$") and sub or (sub .. ".tex")
     scan_definitions(sp, seen, depth + 1)
@@ -137,7 +164,6 @@ function C.setup(opts)
   C.attr_unit = luatexbase.new_attribute("rtex_unit")
   luatexbase.add_to_callback("pre_linebreak_filter", C.pre_linebreak, "rtex-capture")
   luatexbase.add_to_callback("post_linebreak_filter", C.post_linebreak, "rtex-capture")
-  luatexbase.add_to_callback("pre_shipout_filter", C.pre_shipout, "rtex-capture")
   local extra = os.getenv("RTEX_UNIT_ENVS") or ""
   for name in extra:gmatch("[^,%s]+") do C.BLOCK_ENVS[#C.BLOCK_ENVS + 1] = name end
 end
@@ -165,13 +191,29 @@ function C.begin_document()
   prev_macros = {}
   local seen = {}
   scan_definitions(tex.jobname .. ".tex", seen, 0)
+  -- index commands are recorded afresh by each run (index_command)
+  os.remove((os.getenv("RTEX_CAPTURE_DIR") or os.getenv("TEXMF_OUTPUT_DIRECTORY") or ".") ..
+            "/" .. tex.jobname .. ".rtex-idxcmd")
+  -- a body-only pass (standby engine) has the preamble in rtex-preamble.tex, the main file's
+  -- preamble lines blanked: definitions made there (glossary entries) are read from it
+  local pre = kpse.find_file("rtex-preamble.tex")
+  if pre then scan_definitions(pre, seen, 0) end
   for name in pairs(seen) do
     local known = false
     for i = 1, #tracked_macros do if tracked_macros[i] == name then known = true end end
     -- only macros (not counters, lengths or primitives): \c@…, \the…, \if… are handled elsewhere
     if not known and not name:match("^the") and not name:match("^if") then tracked_macros[#tracked_macros + 1] = name end
   end
+  local labels = {}
+  for label in pairs(gls_labels) do labels[#labels + 1] = label end
+  table.sort(labels)
+  for _, label in ipairs(labels) do tracked_macros[#tracked_macros + 1] = "ifglo@" .. label .. "@flag" end
   C.outer = snapshot_outer()
+  -- registered now, after the preamble's packages: this filter sees the page as they leave it
+  luatexbase.add_to_callback("pre_shipout_filter", function(b)
+    C.shipout(b)
+    return true
+  end, "rtex-capture")
 end
 
 -- Units ------------------------------------------------------------------------------------------
@@ -535,52 +577,15 @@ local function page_rotate(attrs)
 end
 C.page_rotate = page_rotate
 
--- Marks a page leaves on paper: glyphs, rules (images and box resources included), literals and
--- specials, anywhere in the box.
-local Dn = node.direct
-local INK = { [node.id("glyph")] = true, [node.id("rule")] = true }
-local LIST = { [node.id("hlist")] = true, [node.id("vlist")] = true }
-local WHATSIT = node.id("whatsit")
-local INK_WHATSITS = { [node.subtype("pdf_literal")] = true, [node.subtype("special")] = true }
-local function ink(head)
-  local n = 0
-  for x, id, sub in Dn.traverse(head) do
-    if INK[id] then
-      n = n + 1
-    elseif LIST[id] then
-      local h = Dn.getlist(x)
-      if h then n = n + ink(h) end
-    elseif id == WHATSIT and INK_WHATSITS[sub] then
-      n = n + 1
-    end
-  end
-  return n
-end
+-- shipout/before: the page attributes in force for the page about to ship.
+function C.page_attr(s) C.next_page_attr = s end
 
--- The box LaTeX finally ships: material added after shipout/before (shipout/background and
--- /foreground: eso-pic, pdfpages, watermarks) is not in the captured page. Such a page says so
--- (`shipout_extras`, Degraded): drawn from its PDF.
-function C.pre_shipout(head)
-  local want = C.pending_ink
-  C.pending_ink = nil
-  if want then
-    local d = Dn.todirect(head)
-    local id = Dn.getid(d)
-    local have = LIST[id] and ink(Dn.getlist(d)) or ink(d)
-    local page = C.pages[#C.pages]
-    if have > want and page then
-      page.flags = page.flags or {}
-      page.flags.shipout_extras = have - want
-    end
-  end
-  return true
-end
-
-function C.shipout(boxnum, pageattr)
+-- pre_shipout_filter: `b` is the page box as shipped.
+function C.shipout(b)
   C.page = C.page + 1
-  local b = tex.box[boxnum]
+  local attr = C.next_page_attr or ""
+  C.next_page_attr = nil
   if not b then return end
-  C.pending_ink = ink(Dn.getlist(Dn.todirect(b)))
   -- color stacks carry over from page to page (\pdfcolorstackinit page): the page records the
   -- stacks it starts with when they are not the color package's initial black
   local base = C.color_carry or { ["0"] = { "0 g 0 G" } }
@@ -593,7 +598,9 @@ function C.shipout(boxnum, pageattr)
     if not (id == "0" and #st == 1 and st[1] == "0 g 0 G") and #st > 0 then plain = false end
   end
   if not plain then page.color_base = base end
-  local rot = page_rotate(pageattr)
+  -- a /Rotate page attribute (pdflscape): the display list keeps the unturned page's
+  -- coordinates and says how viewers turn it (rows inside a turned box are `transformed_rows`)
+  local rot = page_rotate(attr)
   if rot ~= 0 then page.rotate = rot end
   for _, pc in ipairs(page.pics or {}) do
     local k = C.pic_keys[pc.id]
@@ -601,13 +608,19 @@ function C.shipout(boxnum, pageattr)
     -- lines or pages is not recorded (never cached)
     if k and not pc.multi and not C.pics[k.key] and not C.pic_bad[k.key] then
       C.pics[k.key] = { env = k.env, page = C.page, x = pc.x, y = pc.y, w = pc.w, h = pc.h, d = pc.d,
-                        page_height = page.page_height, state = k.state, items = pc.items, fonts = pc.fonts }
+                        page_height = page.page_height, state = k.state, items = pc.items, fonts = pc.fonts,
+                        patterns = C.patterns_of({ pc.items }) }
     elseif k and (pc.multi or C.pics[k.key]) then
       C.pics[k.key] = nil
       C.pic_bad[k.key] = true
     end
   end
   page.pics = nil
+  do
+    local lists = { page.other }
+    for _, line in ipairs(page.lines) do lists[#lists + 1] = line.items end
+    page.patterns = C.patterns_of(lists)
+  end
   if next(C.images) then page.images_info = C.images end
   C.pages[#C.pages + 1] = page
   for _, line in ipairs(page.lines) do
@@ -625,6 +638,19 @@ end
 local function out_path(name)
   local dir = os.getenv("RTEX_CAPTURE_DIR") or os.getenv("TEXMF_OUTPUT_DIRECTORY") or "."
   return dir .. "/" .. name
+end
+
+-- imakeidx's index commands (`makeindex -s style.ist main.idx`, `texindy ... main.idx`), one
+-- per line in <jobname>.rtex-idxcmd: the session runs them between passes (the document's own
+-- call would run in the source directory, where the .idx is not, and needs shell escape)
+local idxcmd_started = false
+function C.index_command(cmd)
+  local f = io.open(out_path(C.jobname .. ".rtex-idxcmd"), idxcmd_started and "a" or "w")
+  idxcmd_started = true
+  if f then
+    f:write((cmd:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")), "\n")
+    f:close()
+  end
 end
 
 function C.finish()
@@ -673,6 +699,38 @@ dl.shadings = C.shadings
 function C.shading(idx, kind, space, domain, coords, func, extend)
   C.shadings[idx] = json.encode({ kind = kind, space = space, domain = domain, coords = coords, ["function"] = func, extend = extend })
 end
+-- pgf's tiling patterns (rtex-capture.sty): resource name -> the pattern as pgf declares it
+-- (rtex_dl::Pattern). A pattern is declared once, where it is first used; pages and recorded
+-- pictures carry the ones their literals name.
+C.patterns = {}
+local function nums(s)
+  local t = {}
+  for v in tostring(s):gmatch("%S+") do t[#t + 1] = tonumber(v) or 0 end
+  return t
+end
+function C.pattern(name, paint_type, bbox, steps, matrix, content)
+  local st = nums(steps)
+  C.patterns["pgfpat" .. name] = { paint_type = paint_type, bbox = nums(bbox), xstep = st[1] or 0,
+                                   ystep = st[2] or 0, matrix = nums(matrix), content = content }
+end
+-- The declared patterns the literals of `items` (display-list items) name, or nil.
+local function patterns_of(lists, into)
+  if not next(C.patterns) then return into end
+  for _, items in ipairs(lists) do
+    for _, it in ipairs(items or {}) do
+      if it[1] == "l" and type(it[3]) == "string" then
+        for n in it[3]:gmatch("/(pgfpat%d+)") do
+          if C.patterns[n] then
+            into = into or {}
+            into[n] = C.patterns[n]
+          end
+        end
+      end
+    end
+  end
+  return into
+end
+C.patterns_of = patterns_of
 function C.literal(data)
   local n = node.new("whatsit", literal_subtype)
   n.mode = 0

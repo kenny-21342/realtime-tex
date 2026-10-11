@@ -8,7 +8,9 @@ Usage: gfx_compare.py PDF DUMP.jsonl [--show N]
 Every fill/stroke rtex would draw is matched against PyMuPDF's `page.get_drawings()` by type,
 bounding box (0.05 pt), colors (0.01) and stroke width (0.02 pt); display-list rules are matched
 against the stroked lines LuaTeX draws them as. A page is NATIVE-EXACT when both sides match
-completely. Exit status 1 when any interpreted page differs.
+completely. Tiling-pattern fills are not reported by get_drawings and are left out (counted as
+`pattern_fills`); the plugin's render check (test/render) compares them in pixels. Exit status 1
+when any interpreted page differs.
 """
 import json
 import math
@@ -95,10 +97,18 @@ def bbox(pts):
 
 
 def ours(entry):
+    """Our fills and strokes, the display-list rules, and how many pattern fills were left out
+    (MuPDF's get_drawings does not report tiling-pattern fills: test/render checks them)."""
     out = []
+    pattern_fills = 0
     for op in entry["page"]["ops"]:
         if op["op"] != "Paint":
             continue
+        if op.get("pattern") and op["fill"]:
+            pattern_fills += 1
+            op = dict(op, fill=None)
+            if not op["stroke"]:
+                continue
         m = op["ctm"]
         pts = [(x / SP_PER_BP, y / SP_PER_BP) for x, y in path_points(op["path"], m)]
         if not pts:
@@ -124,7 +134,7 @@ def ours(entry):
         else:
             merged.append(o)
     rules = [bbox([(x / SP_PER_BP, y / SP_PER_BP) for x, y in r]) for r in entry.get("rules", [])]
-    return merged, rules
+    return merged, rules, pattern_fills
 
 
 def close(a, b, tol=TOL):
@@ -245,7 +255,8 @@ def main():
             print(f"page {pno}: not native: {e['error']}")
             continue
         totals["interpreted"] += 1
-        mine, rules = ours(e)
+        mine, rules, pattern_fills = ours(e)
+        totals["pattern_fills"] = totals.get("pattern_fills", 0) + pattern_fills
         drawings = []
         for d in visible_drawings(doc[pno - 1]):
             d["_bbox"] = items_bbox(d)
@@ -284,7 +295,8 @@ def main():
         bad += not ok
         print(f"page {pno}: {'NATIVE-EXACT' if ok else 'DIFFERS'} ops {len(mine)} rules {len(rules)} "
               f"pdf drawings {len(drawings)}; unmatched ours {len(unmatched)} rules {len(rules_left)} pdf {len(left)}; "
-              f"moved glyphs {len(e.get('moved_glyphs', []))}, misplaced {len(glyphs_bad)}")
+              f"moved glyphs {len(e.get('moved_glyphs', []))}, misplaced {len(glyphs_bad)}"
+              + (f"; pattern fills {pattern_fills} (not compared)" if pattern_fills else ""))
         for g in glyphs_bad[:show]:
             print(f"    glyph: {g}")
         for o in unmatched[:show]:

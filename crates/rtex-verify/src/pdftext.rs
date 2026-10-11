@@ -158,17 +158,17 @@ fn load_font(doc: &Document, resource: &str, id: ObjectId) -> Result<PdfFont> {
             let w = doc.dereference(w)?.1.as_array()?.clone();
             let mut i = 0;
             while i < w.len() {
-                let first = f(&doc.dereference(&w[i])?.1)? as u32;
+                let first = f(doc.dereference(&w[i])?.1)? as u32;
                 if i + 1 < w.len() {
                     let second = doc.dereference(&w[i + 1])?.1.clone();
                     if let Ok(list) = second.as_array() {
                         for (k, wv) in list.iter().enumerate() {
-                            widths.insert(first + k as u32, f(&doc.dereference(wv)?.1)?);
+                            widths.insert(first + k as u32, f(doc.dereference(wv)?.1)?);
                         }
                         i += 2;
                     } else {
                         let last = f(&second)? as u32;
-                        let wv = f(&doc.dereference(&w[i + 2])?.1)?;
+                        let wv = f(doc.dereference(&w[i + 2])?.1)?;
                         for c in first..=last {
                             widths.insert(c, wv);
                         }
@@ -189,7 +189,7 @@ fn load_font(doc: &Document, resource: &str, id: ObjectId) -> Result<PdfFont> {
         if let Ok(w) = dict.get(b"Widths") {
             let w = doc.dereference(w)?.1.as_array()?.clone();
             for (k, wv) in w.iter().enumerate() {
-                widths.insert(first + k as u32, f(&doc.dereference(wv)?.1)?);
+                widths.insert(first + k as u32, f(doc.dereference(wv)?.1)?);
             }
         }
     }
@@ -239,30 +239,57 @@ fn page_fonts(doc: &Document, page_id: ObjectId) -> Result<HashMap<String, PdfFo
 fn page_forms(doc: &Document, page_id: ObjectId) -> Result<HashMap<String, ([f64; 4], Matrix)>> {
     let (res, res_ids) = doc.get_page_resources(page_id)?;
     let mut dicts: Vec<Dictionary> = res.into_iter().cloned().collect();
-    dicts.extend(res_ids.into_iter().filter_map(|id| doc.get_dictionary(id).ok().cloned()));
+    dicts.extend(
+        res_ids
+            .into_iter()
+            .filter_map(|id| doc.get_dictionary(id).ok().cloned()),
+    );
     let nums = |o: &Object| -> Option<Vec<f64>> {
-        doc.dereference(o).ok()?.1.as_array().ok()?.iter().map(|v| f(v).ok()).collect()
+        doc.dereference(o)
+            .ok()?
+            .1
+            .as_array()
+            .ok()?
+            .iter()
+            .map(|v| f(v).ok())
+            .collect()
     };
     let mut forms = HashMap::new();
     for d in dicts {
         let Ok(xd) = d.get(b"XObject") else { continue };
-        let Ok(xd) = doc.dereference(xd)?.1.as_dict().cloned() else { continue };
+        let Ok(xd) = doc.dereference(xd)?.1.as_dict().cloned() else {
+            continue;
+        };
         for (name, obj) in xd.iter() {
             let Ok(id) = obj.as_reference() else { continue };
-            let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else { continue };
+            let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
+                continue;
+            };
             let sd = &stream.dict;
             if sd.get(b"Subtype").ok().and_then(|o| o.as_name().ok()) != Some(b"Form".as_slice()) {
                 continue;
             }
-            let Some(bbox) = sd.get(b"BBox").ok().and_then(nums).filter(|v| v.len() == 4) else { continue };
+            let Some(bbox) = sd.get(b"BBox").ok().and_then(nums).filter(|v| v.len() == 4) else {
+                continue;
+            };
             let m = sd
                 .get(b"Matrix")
                 .ok()
                 .and_then(nums)
                 .filter(|v| v.len() == 6)
-                .map(|v| Matrix { a: v[0], b: v[1], c: v[2], d: v[3], e: v[4], f: v[5] })
+                .map(|v| Matrix {
+                    a: v[0],
+                    b: v[1],
+                    c: v[2],
+                    d: v[3],
+                    e: v[4],
+                    f: v[5],
+                })
                 .unwrap_or(Matrix::IDENTITY);
-            forms.insert(String::from_utf8_lossy(name).to_string(), ([bbox[0], bbox[1], bbox[2], bbox[3]], m));
+            forms.insert(
+                String::from_utf8_lossy(name).to_string(),
+                ([bbox[0], bbox[1], bbox[2], bbox[3]], m),
+            );
         }
     }
     Ok(forms)
@@ -515,13 +542,31 @@ pub fn extract(path: &Path) -> Result<Vec<PdfPage>> {
                     // an image fills the unit square, a form (an included PDF) its BBox under
                     // its Matrix; both then mapped by the CTM (the corners' bounding box)
                     let (corners, m) = match forms.get(&name) {
-                        Some(([x0, y0, x1, y1], fm)) => ([(*x0, *y0), (*x1, *y0), (*x0, *y1), (*x1, *y1)], fm.mul(&ctm)),
+                        Some(([x0, y0, x1, y1], fm)) => (
+                            [(*x0, *y0), (*x1, *y0), (*x0, *y1), (*x1, *y1)],
+                            fm.mul(&ctm),
+                        ),
                         None => ([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)], ctm),
                     };
-                    let pts: Vec<(f64, f64)> = corners.iter().map(|(x, y)| m.apply(*x, *y)).collect();
-                    let (minx, maxx) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
-                    let (miny, maxy) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
-                    page.images.push(PdfImage { name, x: minx, y: miny, w: maxx - minx, h: maxy - miny });
+                    let pts: Vec<(f64, f64)> =
+                        corners.iter().map(|(x, y)| m.apply(*x, *y)).collect();
+                    let (minx, maxx) = pts
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                            (lo.min(p.0), hi.max(p.0))
+                        });
+                    let (miny, maxy) = pts
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                            (lo.min(p.1), hi.max(p.1))
+                        });
+                    page.images.push(PdfImage {
+                        name,
+                        x: minx,
+                        y: miny,
+                        w: maxx - minx,
+                        h: maxy - miny,
+                    });
                 }
                 "re" if ops.len() == 4 => {
                     let (x, y, w, h) = (f(&ops[0])?, f(&ops[1])?, f(&ops[2])?, f(&ops[3])?);
@@ -586,14 +631,26 @@ mod tests {
             "Contents" => content,
             "Resources" => dictionary! { "XObject" => dictionary! { "Fm1" => form, "Im1" => image } },
         });
-        doc.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(
+                dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+            ),
+        );
         let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
         doc.trailer.set("Root", catalog);
         let path = std::env::temp_dir().join(format!("rtex-forms-{}.pdf", std::process::id()));
         doc.save(&path).unwrap();
         let pages = extract(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        let rects: Vec<(f64, f64, f64, f64)> = pages[0].images.iter().map(|i| (i.x, i.y, i.w, i.h)).collect();
-        assert_eq!(rects, vec![(10.0, 20.0, 350.0, 175.0), (300.0, 400.0, 100.0, 50.0)]);
+        let rects: Vec<(f64, f64, f64, f64)> = pages[0]
+            .images
+            .iter()
+            .map(|i| (i.x, i.y, i.w, i.h))
+            .collect();
+        assert_eq!(
+            rects,
+            vec![(10.0, 20.0, 350.0, 175.0), (300.0, 400.0, 100.0, 50.0)]
+        );
     }
 }

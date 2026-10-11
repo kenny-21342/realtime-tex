@@ -14,16 +14,35 @@ fn main() {
             Ok(n) => {
                 // rules in display-list coordinates, through their transform when a scope moved them
                 let mut rules = Vec::new();
-                let rows = std::iter::once((None, &dl.other)).chain(dl.lines.iter().enumerate().map(|(k, l)| (Some(k), &l.items)));
+                let rows = std::iter::once((None, &dl.other)).chain(
+                    dl.lines
+                        .iter()
+                        .enumerate()
+                        .map(|(k, l)| (Some(k), &l.items)),
+                );
                 for (line, items) in rows {
                     for (k, it) in items.iter().enumerate() {
-                        if let Item::Rule { x, y_top, width, height } = it {
+                        if let Item::Rule {
+                            x,
+                            y_top,
+                            width,
+                            height,
+                        } = it
+                        {
                             let r = ItemRef { line, item: k };
-                            let m = n.transforms.iter().find(|(a, _)| *a == r).map(|(_, m)| *m).unwrap_or(rtex_dl::gfx::IDENTITY);
-                            let pts: Vec<(f64, f64)> = [(0, 0), (*width, 0), (*width, *height), (0, *height)]
+                            let m = n
+                                .transforms
                                 .iter()
-                                .map(|(dx, dy)| apply(&m, (*x + dx) as f64, (*y_top + dy) as f64))
-                                .collect();
+                                .find(|(a, _)| *a == r)
+                                .map(|(_, m)| *m)
+                                .unwrap_or(rtex_dl::gfx::IDENTITY);
+                            let pts: Vec<(f64, f64)> =
+                                [(0, 0), (*width, 0), (*width, *height), (0, *height)]
+                                    .iter()
+                                    .map(|(dx, dy)| {
+                                        apply(&m, (*x + dx) as f64, (*y_top + dy) as f64)
+                                    })
+                                    .collect();
                             rules.push(pts);
                         }
                     }
@@ -42,7 +61,9 @@ fn main() {
                 }
                 serde_json::json!({"file": path, "ok": true, "candidate": candidate, "flags": dl.flags, "page": n, "rules": rules, "moved_glyphs": moved})
             }
-            Err(e) => serde_json::json!({"file": path, "ok": false, "candidate": candidate, "flags": dl.flags, "error": e.to_string()}),
+            Err(e) => {
+                serde_json::json!({"file": path, "ok": false, "candidate": candidate, "flags": dl.flags, "error": e.to_string()})
+            }
         };
         println!("{out}");
     }

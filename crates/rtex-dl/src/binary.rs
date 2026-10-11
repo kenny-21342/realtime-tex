@@ -1,4 +1,4 @@
-//! Binary display-list encoding, revision 1 (docs/DISPLAY_LIST.md): decoder and encoder.
+//! Binary display-list encoding, revision 1 (docs/display-list.md): decoder and encoder.
 
 use crate::{DisplayList, FontDesc, ImageInfo, Item, Line, Sp};
 #[cfg(test)]
@@ -274,6 +274,29 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                 }
                 dl.color_base.insert(stack, entries);
             }
+            0x2C => {
+                let name = p.str().map_err(malformed)?;
+                let paint_type = p.u8().map_err(malformed)?;
+                let mut f = [0.0; 12];
+                for v in f.iter_mut() {
+                    *v = p.f64().map_err(malformed)?;
+                }
+                let n = p.u32().map_err(malformed)? as usize;
+                let content = std::str::from_utf8(p.bytes(n).map_err(malformed)?)
+                    .map_err(|_| BinError::Utf8)?
+                    .to_string();
+                dl.patterns.insert(
+                    name,
+                    crate::Pattern {
+                        paint_type,
+                        bbox: [f[0], f[1], f[2], f[3]],
+                        xstep: f[4],
+                        ystep: f[5],
+                        matrix: [f[6], f[7], f[8], f[9], f[10], f[11]],
+                        content,
+                    },
+                );
+            }
             0x29 => {
                 let key = p.str().map_err(malformed)?;
                 dl.pictures.push(crate::PictureSpot {
@@ -370,7 +393,10 @@ pub fn decode(bytes: &[u8]) -> Result<DisplayList, BinError> {
                         let data = p.str().map_err(malformed)?;
                         // the position is a later addition: absent in older lists
                         let at = if p.remaining() >= 8 {
-                            Some((p.i32().map_err(malformed)? as Sp, p.i32().map_err(malformed)? as Sp))
+                            Some((
+                                p.i32().map_err(malformed)? as Sp,
+                                p.i32().map_err(malformed)? as Sp,
+                            ))
                         } else {
                             None
                         };
@@ -497,7 +523,12 @@ fn write_items(out: &mut Writer, items: &[Item]) {
                 p.i32(*height);
                 out.rec(0x21, &p.0);
             }
-            Item::Color { stack, cmd, data, after } => {
+            Item::Color {
+                stack,
+                cmd,
+                data,
+                after,
+            } => {
                 let mut p = Writer(Vec::new());
                 p.u8(cmd.map(|c| c as u8).unwrap_or(255));
                 p.u8(0);
@@ -636,6 +667,22 @@ pub fn encode(dl: &DisplayList) -> Vec<u8> {
             p.str(e);
         }
         body.rec(0x2B, &p.0);
+    }
+    for (name, pat) in &dl.patterns {
+        let mut p = Writer(Vec::new());
+        p.str(name);
+        p.u8(pat.paint_type);
+        for v in pat
+            .bbox
+            .iter()
+            .chain([pat.xstep, pat.ystep].iter())
+            .chain(pat.matrix.iter())
+        {
+            p.f64(*v);
+        }
+        p.u32(pat.content.len() as u32);
+        p.0.extend_from_slice(pat.content.as_bytes());
+        body.rec(0x2C, &p.0);
     }
     for pic in &dl.pictures {
         let mut p = Writer(Vec::new());
@@ -779,10 +826,31 @@ mod tests {
                         height: 800,
                     },
                     // graphicx scaling: every record of the group survives the round trip
-                    Item::Matrix { op: "save".into(), x: 1500, y: 2000, data: String::new() },
-                    Item::Matrix { op: "set".into(), x: 1500, y: 2000, data: ".5 0 0 .5".into() },
-                    Item::Image { index: 3, x: 1500, y_top: 1000, width: 800, height: 800 },
-                    Item::Matrix { op: "restore".into(), x: 1500, y: 2000, data: String::new() },
+                    Item::Matrix {
+                        op: "save".into(),
+                        x: 1500,
+                        y: 2000,
+                        data: String::new(),
+                    },
+                    Item::Matrix {
+                        op: "set".into(),
+                        x: 1500,
+                        y: 2000,
+                        data: ".5 0 0 .5".into(),
+                    },
+                    Item::Image {
+                        index: 3,
+                        x: 1500,
+                        y_top: 1000,
+                        width: 800,
+                        height: 800,
+                    },
+                    Item::Matrix {
+                        op: "restore".into(),
+                        x: 1500,
+                        y: 2000,
+                        data: String::new(),
+                    },
                     Item::Literal {
                         mode: 0,
                         data: "q Q".into(),
@@ -806,9 +874,29 @@ mod tests {
                 after: None,
             }],
             flags: serde_json::json!({"literal": 1}),
-            pictures: vec![crate::PictureSpot { key: "main.tex:12".into(), x: 100, top: 200, width: 3000, height: 1500 }],
+            pictures: vec![crate::PictureSpot {
+                key: "main.tex:12".into(),
+                x: 100,
+                top: 200,
+                width: 3000,
+                height: 1500,
+            }],
             rotate: 90,
-            color_base: BTreeMap::from([("0".to_string(), vec!["0 g 0 G".to_string(), "0 0 1 rg 0 0 1 RG".to_string()])]),
+            color_base: BTreeMap::from([(
+                "0".to_string(),
+                vec!["0 g 0 G".to_string(), "0 0 1 rg 0 0 1 RG".to_string()],
+            )]),
+            patterns: BTreeMap::from([(
+                "pgfpat1".to_string(),
+                crate::Pattern {
+                    paint_type: 2,
+                    bbox: [-0.5, -0.5, 3.5, 3.5],
+                    xstep: 3.0,
+                    ystep: 3.0,
+                    matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    content: "q 0 0 m 3 3 l S Q".into(),
+                },
+            )]),
             glyphs: 3,
             width: 5000,
             height: 700,

@@ -5,7 +5,9 @@
 
 use crate::document::{Edit, ParaId};
 use crate::layout::Fragment;
-use crate::session::{CompileStatus, Convergence, Diagnostic, Event, ParagraphPlacement, Session, Timing, Versions};
+use crate::session::{
+    CompileStatus, Convergence, Diagnostic, Event, ParagraphPlacement, Session, Timing, Versions,
+};
 use rtex_dl::{DisplayList, Item, Line};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -16,14 +18,14 @@ impl Rng {
     pub fn new(seed: u64) -> Rng {
         Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1)
     }
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
     pub fn below(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
+        (self.next_u64() % n.max(1) as u64) as usize
     }
 }
 
@@ -85,9 +87,16 @@ pub fn safe_words(par: &str) -> Vec<(usize, usize)> {
 /// Picture code in a paragraph (an inline tikzpicture or plot) is not text: a word there is a
 /// key or a coordinate name.
 pub fn has_picture_code(par: &str) -> bool {
-    ["\\begin{tikzpicture}", "\\tikz", "\\begin{axis}", "\\addplot", "\\draw", "\\begin{circuitikz}"]
-        .iter()
-        .any(|k| par.contains(k))
+    [
+        "\\begin{tikzpicture}",
+        "\\tikz",
+        "\\begin{axis}",
+        "\\addplot",
+        "\\draw",
+        "\\begin{circuitikz}",
+    ]
+    .iter()
+    .any(|k| par.contains(k))
 }
 
 /// One paragraph result of the fast path, as it arrived.
@@ -179,7 +188,8 @@ impl Observer {
             Event::BackgroundScheduled { par_id, reasons, edit_id } => format!("BackgroundScheduled par {par_id:?} edit {edit_id} reasons {reasons:?}"),
             Event::PdfExported { job_id, status, converged, passes, .. } => format!("PdfExported job {job_id} {status:?} converged {converged} passes {passes}"),
         };
-        self.log.push_back(format!("{:9.3}s {line}", self.t0.elapsed().as_secs_f64()));
+        self.log
+            .push_back(format!("{:9.3}s {line}", self.t0.elapsed().as_secs_f64()));
         if self.log.len() > 60 {
             self.log.pop_front();
         }
@@ -220,13 +230,17 @@ impl Observer {
                 self.kinds = pl.iter().map(|p| (p.par_id, p.kind.clone())).collect();
                 self.eligible = eligible_paragraphs;
                 self.converged = matches!(convergence, Convergence::Converged);
-                self.ended = matches!(convergence, Convergence::Converged | Convergence::PassLimitReached { .. });
+                self.ended = matches!(
+                    convergence,
+                    Convergence::Converged | Convergence::PassLimitReached { .. }
+                );
                 self.versions = Some(versions);
                 self.compile = Some(compile);
                 self.layouts += 1;
                 self.layout_at = Some(now);
                 let keep_background = std::mem::take(&mut self.background_diagnostics_this_pass);
-                self.diagnostics.retain(|src, _| keep_background && src == "background");
+                self.diagnostics
+                    .retain(|src, _| keep_background && src == "background");
             }
             Event::ParagraphUpdate {
                 par_id,
@@ -240,7 +254,15 @@ impl Observer {
             } => {
                 self.updates.insert(
                     (edit_id, par_id),
-                    Served { par_id, status, reasons, pagination_stale, dl, timing, at: now },
+                    Served {
+                        par_id,
+                        status,
+                        reasons,
+                        pagination_stale,
+                        dl,
+                        timing,
+                        at: now,
+                    },
                 );
             }
             Event::BackgroundScheduled { edit_id, .. } => {
@@ -257,7 +279,12 @@ impl Observer {
     }
 
     /// Absorb events until `until` holds (true) or `timeout` passes (false).
-    pub fn pump(&mut self, s: &Session, timeout: Duration, mut until: impl FnMut(&Observer) -> bool) -> bool {
+    pub fn pump(
+        &mut self,
+        s: &Session,
+        timeout: Duration,
+        mut until: impl FnMut(&Observer) -> bool,
+    ) -> bool {
         let end = Instant::now() + timeout;
         loop {
             if until(self) {
@@ -279,7 +306,12 @@ impl Observer {
         let before = self.layouts;
         s.request_layout();
         self.pump(s, timeout, |o| {
-            o.layouts > before && o.ended && o.versions.as_ref().map(|v| v.source_revision >= rev).unwrap_or(false)
+            o.layouts > before
+                && o.ended
+                && o.versions
+                    .as_ref()
+                    .map(|v| v.source_revision >= rev)
+                    .unwrap_or(false)
         })
     }
 
@@ -289,7 +321,10 @@ impl Observer {
         for f in self.placements.get(&id)? {
             let page = self.pages.get(&f.page)?;
             for (x, y) in f.xs.iter().zip(f.baselines.iter()) {
-                let l = page.lines.iter().find(|l| l.unit != 0 && l.x == *x && l.y == *y)?;
+                let l = page
+                    .lines
+                    .iter()
+                    .find(|l| l.unit != 0 && l.x == *x && l.y == *y)?;
                 out.push((l, page));
             }
         }
@@ -301,20 +336,37 @@ impl Observer {
         if served.status != "ok" {
             let mut d = served.reasons.clone();
             d.push(format!("status {}", served.status));
-            return Judgement { verdict: Verdict::DeclinedStatus, details: d };
+            return Judgement {
+                verdict: Verdict::DeclinedStatus,
+                details: d,
+            };
         }
         let Some(rows) = self.rows(served.par_id) else {
-            return Judgement { verdict: Verdict::NotFoundAfterPass, details: vec![] };
+            return Judgement {
+                verdict: Verdict::NotFoundAfterPass,
+                details: vec![],
+            };
         };
         let d = diff(&served.dl, &rows);
         if d.is_empty() {
-            Judgement { verdict: Verdict::Match, details: d }
-        } else if rows.len() < served.dl.lines.len() && every_pass_row_is_a_fast_row(&served.dl, &rows) {
+            Judgement {
+                verdict: Verdict::Match,
+                details: d,
+            }
+        } else if rows.len() < served.dl.lines.len()
+            && every_pass_row_is_a_fast_row(&served.dl, &rows)
+        {
             // capture attributes the text after a display formula to the next unit: the rows it
             // does attribute are all equal, the rest cannot be compared
-            Judgement { verdict: Verdict::AttributionOnly, details: d }
+            Judgement {
+                verdict: Verdict::AttributionOnly,
+                details: d,
+            }
         } else {
-            Judgement { verdict: Verdict::Mismatch, details: d }
+            Judgement {
+                verdict: Verdict::Mismatch,
+                details: d,
+            }
         }
     }
 }
@@ -370,31 +422,81 @@ pub fn every_pass_row_is_a_fast_row(fast: &DisplayList, rows: &[(&Line, &Display
 pub fn diff(fast: &DisplayList, rows: &[(&Line, &DisplayList)]) -> Vec<String> {
     let mut d = Vec::new();
     if fast.lines.len() != rows.len() {
-        d.push(format!("row count: fast {} vs pass {}", fast.lines.len(), rows.len()));
+        d.push(format!(
+            "row count: fast {} vs pass {}",
+            fast.lines.len(),
+            rows.len()
+        ));
         return d;
     }
     for (k, (fl, (rl, page))) in fast.lines.iter().zip(rows.iter()).enumerate() {
         if fl.w != rl.w || fl.h != rl.h || fl.d != rl.d || (fl.gs - rl.gs).abs() > 1e-12 {
-            d.push(format!("row {} box: fast ({},{},{} gs {}) pass ({},{},{} gs {})", k + 1, fl.w, fl.h, fl.d, fl.gs, rl.w, rl.h, rl.d, rl.gs));
+            d.push(format!(
+                "row {} box: fast ({},{},{} gs {}) pass ({},{},{} gs {})",
+                k + 1,
+                fl.w,
+                fl.h,
+                fl.d,
+                fl.gs,
+                rl.w,
+                rl.h,
+                rl.d,
+                rl.gs
+            ));
         }
         let (ox, oy) = (rl.x - fl.x, rl.y - fl.y);
-        let fg: Vec<&Item> = fl.items.iter().filter(|i| matches!(i, Item::Glyph { .. })).collect();
-        let rg: Vec<&Item> = rl.items.iter().filter(|i| matches!(i, Item::Glyph { .. })).collect();
+        let fg: Vec<&Item> = fl
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Glyph { .. }))
+            .collect();
+        let rg: Vec<&Item> = rl
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Glyph { .. }))
+            .collect();
         if fg.len() != rg.len() {
-            d.push(format!("row {} glyph count {} vs {}", k + 1, fg.len(), rg.len()));
+            d.push(format!(
+                "row {} glyph count {} vs {}",
+                k + 1,
+                fg.len(),
+                rg.len()
+            ));
             continue;
         }
         for (a, b) in fg.iter().zip(rg.iter()) {
             if let (
-                Item::Glyph { font: fa, char: ca, index: ia, x: xa, y: ya, width: wa, expansion: ea },
-                Item::Glyph { font: fb, char: cb, index: ib, x: xb, y: yb, width: wb, expansion: eb },
+                Item::Glyph {
+                    font: fa,
+                    char: ca,
+                    index: ia,
+                    x: xa,
+                    y: ya,
+                    width: wa,
+                    expansion: ea,
+                },
+                Item::Glyph {
+                    font: fb,
+                    char: cb,
+                    index: ib,
+                    x: xb,
+                    y: yb,
+                    width: wb,
+                    expansion: eb,
+                },
             ) = (a, b)
             {
                 let font_ok = match (fast.font(*fa), page.font(*fb)) {
                     (Some(x), Some(y)) => x.key() == y.key(),
                     _ => fa == fb,
                 };
-                if !(font_ok && ca == cb && ia == ib && xa + ox == *xb && ya + oy == *yb && wa == wb && ea == eb)
+                if !(font_ok
+                    && ca == cb
+                    && ia == ib
+                    && xa + ox == *xb
+                    && ya + oy == *yb
+                    && wa == wb
+                    && ea == eb)
                     && d.len() < 8
                 {
                     d.push(format!("row {} glyph: fast {:?} pass {:?}", k + 1, a, b));
@@ -402,10 +504,16 @@ pub fn diff(fast: &DisplayList, rows: &[(&Line, &DisplayList)]) -> Vec<String> {
             }
         }
         for (kind, pred) in [
-            ("rule", (|i: &&Item| matches!(i, Item::Rule { .. })) as fn(&&Item) -> bool),
+            (
+                "rule",
+                (|i: &&Item| matches!(i, Item::Rule { .. })) as fn(&&Item) -> bool,
+            ),
             ("image", |i: &&Item| matches!(i, Item::Image { .. })),
         ] {
-            let (a, b) = (fl.items.iter().filter(pred).count(), rl.items.iter().filter(pred).count());
+            let (a, b) = (
+                fl.items.iter().filter(pred).count(),
+                rl.items.iter().filter(pred).count(),
+            );
             if a != b {
                 d.push(format!("row {} {kind} count {a} vs {b}", k + 1));
             }

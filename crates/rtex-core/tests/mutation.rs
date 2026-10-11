@@ -25,7 +25,10 @@ use rtex_dl::Item;
 use std::time::Duration;
 
 fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// A random mutation of the paragraph at `base` (absolute byte offset of `par`): (name, edit).
@@ -49,7 +52,10 @@ fn mutate(rng: &mut Rng, par: &str, base: usize) -> Option<(&'static str, Edit)>
             let (os, oe) = words[rng.below(words.len())];
             ("insert-word", edit(e, e, format!(" {}", &par[os..oe])))
         }
-        1 => ("delete-word", edit(s, e + 1.min(par.len() - e), String::new())),
+        1 => (
+            "delete-word",
+            edit(s, e + 1.min(par.len() - e), String::new()),
+        ),
         2 if w.len() >= 4 => {
             let k = 1 + rng.below(w.len() - 2);
             let mut v: Vec<u8> = w.bytes().collect();
@@ -108,7 +114,8 @@ fn random_edits_are_never_served_wrong() {
         panic!("{}", st.dump(&s, "no first layout"));
     }
     let mut report: Vec<serde_json::Value> = Vec::new();
-    let (mut matched, mut wrong, mut declined, mut no_update, mut skipped, mut attribution_only) = (0, 0, 0, 0, 0, 0);
+    let (mut matched, mut wrong, mut declined, mut no_update, mut skipped, mut attribution_only) =
+        (0, 0, 0, 0, 0, 0);
     let mut done = 0;
     let mut guard = 0;
     while done < n_edits && guard < n_edits * 6 {
@@ -129,7 +136,8 @@ fn random_edits_are_never_served_wrong() {
                 break;
             }
             let sp = cands[rng.below(cands.len())];
-            let Some((name, edit)) = mutate(&mut rng, &doc[sp.range.clone()], sp.range.start) else {
+            let Some((name, edit)) = mutate(&mut rng, &doc[sp.range.clone()], sp.range.start)
+            else {
                 skipped += 1;
                 continue;
             };
@@ -137,7 +145,17 @@ fn random_edits_are_never_served_wrong() {
             match s.apply_edit(&main, edit) {
                 Ok(r) => {
                     used.push(sp.id);
-                    applied.push((name, sp.id, r.edit_id, format!("{} | routed {} {:?}", excerpt.replace('\n', " "), r.routed, r.reasons)));
+                    applied.push((
+                        name,
+                        sp.id,
+                        r.edit_id,
+                        format!(
+                            "{} | routed {} {:?}",
+                            excerpt.replace('\n', " "),
+                            r.routed,
+                            r.reasons
+                        ),
+                    ));
                     if r.routed != "fast" {
                         // declined at routing: nothing to compare
                     }
@@ -150,13 +168,21 @@ fn random_edits_are_never_served_wrong() {
         }
         // collect the fast results, then force a clean pass and wait for it to converge
         st.pump(&s, Duration::from_secs(60), |st| {
-            applied.iter().all(|(_, id, eid, note)| st.updates.contains_key(&(*eid, *id)) || !note.contains("routed fast"))
+            applied.iter().all(|(_, id, eid, note)| {
+                st.updates.contains_key(&(*eid, *id)) || !note.contains("routed fast")
+            })
         });
         let rev = s.versions().source_revision;
         let before = st.layouts;
         s.request_layout();
         let ok = st.pump(&s, wait, |st| {
-            st.layouts > before && st.ended && st.versions.as_ref().map(|v| v.source_revision >= rev).unwrap_or(false)
+            st.layouts > before
+                && st.ended
+                && st
+                    .versions
+                    .as_ref()
+                    .map(|v| v.source_revision >= rev)
+                    .unwrap_or(false)
         });
         if ok && !st.converged {
             panic!("{}", st.dump(&s, "the clean pass ended without converging"));
@@ -179,7 +205,13 @@ fn random_edits_are_never_served_wrong() {
                 }
                 Some(mut served) => {
                     if std::env::var("RTEX_MUTATION_SABOTAGE").is_ok() && served.status == "ok" {
-                        if let Some(Item::Glyph { x, .. }) = served.dl.lines.iter_mut().flat_map(|l| l.items.iter_mut()).find(|i| matches!(i, Item::Glyph { .. })) {
+                        if let Some(Item::Glyph { x, .. }) = served
+                            .dl
+                            .lines
+                            .iter_mut()
+                            .flat_map(|l| l.items.iter_mut())
+                            .find(|i| matches!(i, Item::Glyph { .. }))
+                        {
                             *x += 1;
                         }
                     }
@@ -210,7 +242,10 @@ fn random_edits_are_never_served_wrong() {
     }
     s.close();
     let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(wrong, 0, "the fast path served results the clean pass contradicts");
+    assert_eq!(
+        wrong, 0,
+        "the fast path served results the clean pass contradicts"
+    );
     assert!(matched + declined > 0, "no edit could be judged");
 }
 

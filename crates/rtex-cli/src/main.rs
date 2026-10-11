@@ -92,8 +92,8 @@ enum Cmd {
         #[arg(long)]
         build: Option<PathBuf>,
         /// Per-unit fast-path budget in milliseconds: a unit whose compiles take longer three
-        /// times in a row goes to the background path until the next layout (default 5).
-        #[arg(long, default_value_t = 5)]
+        /// times in a row goes to the background path until the next layout (default 50).
+        #[arg(long, default_value_t = 50)]
         fast_budget_ms: u64,
         /// The budget follows the document: a compile is over budget only when it also takes
         /// longer than this many times the median of the session's recent compiles (default 4;
@@ -137,6 +137,9 @@ enum Cmd {
     PdfCompare { a: PathBuf, b: PathBuf },
     /// Convert a binary display list to its JSON mirror.
     Dl2json { file: PathBuf },
+    /// Check the installation: rtex's support files and LuaLaTeX. Exit status 1 when the
+    /// support files are missing, 2 when LuaLaTeX is.
+    Doctor,
     /// Benchmarks: in-engine line breaking (hardware factor) and warm round trips with gates.
     Bench {
         /// Projects to benchmark (fixture directories with main.tex).
@@ -298,6 +301,38 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Cmd::Doctor => {
+            println!("rtex {}", env!("CARGO_PKG_VERSION"));
+            let tex = rtex_core::texlive::find_rtex_texdir();
+            match &tex {
+                Ok(d) => println!("support files: {}", d.display()),
+                Err(e) => println!("support files: missing ({e})"),
+            }
+            let lua = rtex_core::texlive::find_lualatex();
+            match &lua {
+                Ok((_, l)) => {
+                    let v = std::process::Command::new(l)
+                        .arg("--version")
+                        .output()
+                        .ok()
+                        .and_then(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .next()
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    println!("lualatex: {} ({v})", l.display());
+                }
+                Err(e) => println!("lualatex: missing ({e})"),
+            }
+            if tex.is_err() {
+                std::process::exit(1);
+            }
+            if lua.is_err() {
+                std::process::exit(2);
+            }
+        }
         Cmd::Dl2json { file } => {
             let bytes = std::fs::read(&file)?;
             let dl = rtex_dl::DisplayList::from_binary(&bytes)?;
@@ -352,7 +387,7 @@ fn main() -> anyhow::Result<()> {
                     std::env::temp_dir().join(format!("rtex-export-check-{}", std::process::id()));
                 let o = rtex_core::background::run_pass(
                     &tl,
-                    &project.canonicalize()?,
+                    &rtex_core::paths::canonical(&project)?,
                     &main,
                     &tmp,
                     5,

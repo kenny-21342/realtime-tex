@@ -10,18 +10,18 @@ use rtex_core::{Edit, Event, Session, SessionConfig};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-fn med(v: &mut Vec<f64>) -> f64 {
+fn med(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
 }
-fn p95(v: &mut Vec<f64>) -> f64 {
+fn p95(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[((v.len() as f64) * 0.95) as usize]
 }
 
 pub fn run(project: PathBuf, main: String, n: usize, build: PathBuf) -> Result<()> {
     let tl = TexLive::discover()?;
-    let project = project.canonicalize()?;
+    let project = rtex_core::paths::canonical(&project)?;
     std::fs::create_dir_all(&build)?;
     let cap = run_capture(&tl, &project, &main, &build.join("capture"), true)?;
     let preamble = rtex_core::project_preamble(&project, &main)?;

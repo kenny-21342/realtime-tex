@@ -19,9 +19,17 @@ fn corpus() -> std::path::PathBuf {
 fn converged(s: &Session, pages: &mut BTreeMap<i64, (DisplayList, Option<NativePage>)>, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        assert!(Instant::now() < deadline, "no converged layout within {secs} s");
+        assert!(
+            Instant::now() < deadline,
+            "no converged layout within {secs} s"
+        );
         for ev in s.poll(Duration::from_millis(200)) {
-            if let Event::LayoutUpdate { pages_changed, convergence, .. } = ev {
+            if let Event::LayoutUpdate {
+                pages_changed,
+                convergence,
+                ..
+            } = ev
+            {
                 for p in pages_changed {
                     pages.insert(p.page, (p.dl, p.native));
                 }
@@ -47,7 +55,14 @@ fn paints(n: &NativePage) -> Vec<String> {
     n.ops
         .iter()
         .filter_map(|o| match o {
-            GfxOp::Paint { ctm, path, fill, stroke, even_odd, .. } => Some(format!(
+            GfxOp::Paint {
+                ctm,
+                path,
+                fill,
+                stroke,
+                even_odd,
+                ..
+            } => Some(format!(
                 "paint {:?} {:?} {:?} {:?} {}",
                 ctm.iter().map(|v| v.round() as i64).collect::<Vec<_>>(),
                 path,
@@ -60,7 +75,13 @@ fn paints(n: &NativePage) -> Vec<String> {
                 ctm.iter().map(|v| v.round() as i64).collect::<Vec<_>>(),
                 path
             )),
-            GfxOp::Shade { ctm, bbox, coords, stops, .. } => Some(format!(
+            GfxOp::Shade {
+                ctm,
+                bbox,
+                coords,
+                stops,
+                ..
+            } => Some(format!(
                 "shade {:?} {:?} {:?} {:?}",
                 ctm.iter().map(|v| v.round() as i64).collect::<Vec<_>>(),
                 bbox,
@@ -96,7 +117,15 @@ fn cached_pictures_are_drawn_natively_like_typeset_ones() {
     // takes the pictures from the cache
     let doc = s.document_text("main.tex").unwrap();
     let at = doc.find("\\begin{document}").unwrap() + "\\begin{document}\n".len();
-    s.apply_edit("main.tex", Edit { start_byte: at, end_byte: at, text: "A new first paragraph that moves the rest down.\n\n".into() }).unwrap();
+    s.apply_edit(
+        "main.tex",
+        Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "A new first paragraph that moves the rest down.\n\n".into(),
+        },
+    )
+    .unwrap();
     s.request_layout();
     pages.clear();
     converged(&s, &mut pages, 180);
@@ -106,7 +135,11 @@ fn cached_pictures_are_drawn_natively_like_typeset_ones() {
     // put back) hold cached regions
     let mut raw_cached = 0;
     for dir in ["pass-0", "pass-1"] {
-        for ent in std::fs::read_dir(root.join("build/bg").join(dir)).into_iter().flatten().flatten() {
+        for ent in std::fs::read_dir(root.join("build/bg").join(dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let name = ent.file_name().to_string_lossy().into_owned();
             if name.contains(".rtex-page") {
                 let text = std::fs::read_to_string(ent.path()).unwrap();
@@ -114,36 +147,67 @@ fn cached_pictures_are_drawn_natively_like_typeset_ones() {
             }
         }
     }
-    assert!(raw_cached > 0, "the last pass took no picture from the cache");
+    assert!(
+        raw_cached > 0,
+        "the last pass took no picture from the cache"
+    );
 
     // the same source captured without the cache: every picture typeset
     let clean_dir = root.join("clean");
     std::fs::create_dir_all(clean_dir.join("src")).unwrap();
     std::fs::write(clean_dir.join("src/main.tex"), &src).unwrap();
-    let clean = run_pass(&tl, &clean_dir.join("src"), "main.tex", &clean_dir.join("out"), 5, BibTool::None, true).unwrap();
+    let clean = run_pass(
+        &tl,
+        &clean_dir.join("src"),
+        "main.tex",
+        &clean_dir.join("out"),
+        5,
+        BibTool::None,
+        true,
+    )
+    .unwrap();
 
     let mut drawn_from_cache = 0;
     for (n, (dl, native)) in &pages {
         let flags = dl.flags_map();
-        assert!(!flags.contains_key("pic_cache"), "page {n}: a cached picture without its drawing ({flags:?})");
+        assert!(
+            !flags.contains_key("pic_cache"),
+            "page {n}: a cached picture without its drawing ({flags:?})"
+        );
         assert_eq!(cached_pictures(dl), 0, "page {n}");
         let typeset = clean.capture.page(*n).unwrap();
         let want = native_graphics(&typeset);
         match (native, want) {
             (Some(got), Ok(want)) => {
-                assert_eq!(paints(got), paints(&want), "page {n}: the cached drawing differs from the typeset one");
+                assert_eq!(
+                    paints(got),
+                    paints(&want),
+                    "page {n}: the cached drawing differs from the typeset one"
+                );
                 assert_eq!(got.transforms.len(), want.transforms.len(), "page {n}");
                 drawn_from_cache += 1;
             }
             (None, Err(_)) => {}
-            (got, want) => panic!("page {n}: native {:?} vs typeset {:?}", got.is_some(), want.map(|_| ())),
+            (got, want) => panic!(
+                "page {n}: native {:?} vs typeset {:?}",
+                got.is_some(),
+                want.map(|_| ())
+            ),
         }
     }
     assert!(drawn_from_cache > 0, "no page was drawn natively");
     // the pictures put back are listed by key and place (hosts copy them into live units)
-    let spots: Vec<_> = pages.values().flat_map(|(dl, _)| dl.pictures.iter()).collect();
+    let spots: Vec<_> = pages
+        .values()
+        .flat_map(|(dl, _)| dl.pictures.iter())
+        .collect();
     assert!(!spots.is_empty(), "no picture spot on the pages");
-    assert!(spots.iter().all(|p| p.key.starts_with("main.tex:") && p.width > 0 && p.height > 0), "{spots:?}");
+    assert!(
+        spots
+            .iter()
+            .all(|p| p.key.starts_with("main.tex:") && p.width > 0 && p.height > 0),
+        "{spots:?}"
+    );
     eprintln!("cached regions in the pass: {raw_cached}; pages drawn natively: {drawn_from_cache}");
     let _ = std::fs::remove_dir_all(&root);
 }

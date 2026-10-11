@@ -1,13 +1,16 @@
 //! The persistent paragraph server: one `lualatex` process kept alive after `\begin{document}`.
-//! Requests go down its stdin as JSON lines; responses come back as length-prefixed JSON frames
-//! on a FIFO (stdout is not clean: the banner is printed even in batch mode — see ENGINE_NOTES).
+//! Requests go to it as JSON lines; responses come back as length-prefixed JSON frames on a
+//! channel of their own (stdout is not clean: the banner is printed even in batch mode — see
+//! docs/engine-protocol.md). The channel is a FIFO on Unix and a pair of named pipes on Windows
+//! (`transport`).
 
 use crate::texlive::TexLive;
-use anyhow::{anyhow, bail, Context, Result};
+use crate::transport::{Frame, Transport};
+use anyhow::{bail, Context, Result};
 use rtex_dl::DisplayList;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -61,6 +64,11 @@ pub struct CompileResult {
     pub pics_seen: Option<i64>,
     #[serde(default)]
     pub pics_used: Option<i64>,
+    /// A Lua error in the server while handling the request (with its traceback): the result
+    /// is an error the unit's text did not cause, sent instead of nothing so the host does not
+    /// wait out the watchdog.
+    #[serde(default)]
+    pub internal: Option<String>,
     /// Host-side stage times (µs): send, wait, read, parse.
     #[serde(skip)]
     pub host_us: [u64; 4],
@@ -80,7 +88,7 @@ pub enum Response {
     #[serde(rename = "ok")]
     Ok { id: i64 },
     #[serde(rename = "result")]
-    Result(CompileResult),
+    Result(Box<CompileResult>),
     #[serde(rename = "fatal")]
     Fatal {
         #[serde(default)]
@@ -128,8 +136,13 @@ pub struct RoundTrip {
 
 pub struct FastServer {
     child: Child,
-    stdin: std::process::ChildStdin,
-    resp: BufReader<File>,
+    /// The request channel (the server's stdin on Unix, a named pipe on Windows).
+    stdin: File,
+    /// Frames from the response channel, in order, drained by a dedicated reader thread with
+    /// blocking reads (see `transport`).
+    frames: crossbeam_channel::Receiver<Frame>,
+    /// A frame `wait_readable` took off the channel, not yet parsed.
+    pending: Option<Frame>,
     pub generation: u64,
     pub work_dir: PathBuf,
     pub banner: String,
@@ -139,7 +152,6 @@ pub struct FastServer {
     /// How long to busy-poll for a reply before blocking (default 3 ms; zero disables).
     pub spin: Duration,
     next_req: i64,
-    frame_buf: Vec<u8>,
 }
 
 impl FastServer {
@@ -175,7 +187,7 @@ impl FastServer {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<FastServer> {
         std::fs::create_dir_all(work_dir)?;
-        let work_dir = &work_dir.canonicalize()?;
+        let work_dir = &crate::paths::canonical(work_dir)?;
         let own_aux = work_dir.join(format!("rtex-serve-g{generation}.aux"));
         let _ = std::fs::remove_file(&own_aux);
         if let Some(a) = aux {
@@ -185,7 +197,8 @@ impl FastServer {
             }
             // the bibliography data of that pass (biblatex reads \jobname.bbl at
             // \begin{document}; bibtex's .bbl is \input by \bibliography, in the body)
-            for ext in ["bbl"] {
+            {
+                let ext = "bbl";
                 let src = a.with_extension(ext);
                 let dst = work_dir.join(format!("rtex-serve-g{generation}.{ext}"));
                 let _ = std::fs::remove_file(&dst);
@@ -211,20 +224,20 @@ impl FastServer {
                     "\\makeatletter\\newbox\\rtex@imgbox\\IfPackageLoadedTF{{graphicx}}{{\\AddToHook{{cmd/Gin@setfile/after}}{{\\setbox\\rtex@imgbox\\hbox{{\\csname\\Gin@base\\Gin@ext\\space image\\ifdefined\\Gin@attr@hash\\Gin@attr@hash\\fi\\endcsname}}\\directlua{{rtex_serve.image(\\number\\lastsavedimageresourceindex,\"\\luaescapestring{{\\Gin@base\\Gin@ext}}\",\"\\luaescapestring{{\\Gin@page}}\",\\number\\lastsavedimageresourcepages,\"\\luaescapestring{{\\Gin@base\\Gin@ext\\space image\\ifdefined\\Gin@attr@hash\\Gin@attr@hash\\fi}}\",\\number\\rtex@imgbox)}}}}}}{{}}\\makeatother\n",
                     "\\loop\\rtexstep\\ifnum\\rtexcontinue>0 \\repeat\n\\end{{document}}\n"
                 ),
-                preamble_file.display()
+                crate::paths::tex(&preamble_file)
             ),
         )?;
-        let fifo = work_dir.join(format!("resp-{}.fifo", std::process::id()));
-        let _ = std::fs::remove_file(&fifo);
-        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).context("mkfifo")?;
+        let transport = Transport::create(work_dir)?;
         let mut cmd: Command = tl.lualatex_cmd(cwd);
         cmd.arg("-interaction=batchmode")
-            .arg(format!("--output-directory={}", work_dir.display()))
+            .arg(format!(
+                "--output-directory={}",
+                crate::paths::tex(work_dir)
+            ))
             .arg(driver.as_os_str())
-            .env("RTEX_RESP", &fifo)
-            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        transport.configure(&mut cmd);
         if trace {
             cmd.env(
                 "RTEX_TRACE",
@@ -233,13 +246,12 @@ impl FastServer {
         }
         let t0 = Instant::now();
         let mut child = cmd.spawn().context("spawning lualatex server")?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
-        // Opening the FIFO for reading blocks until the server opens it for writing. Poll the
-        // child so a crash during the preamble does not hang us forever.
-        // A server that fails to start (a preamble that loops, a crash) is killed: a dropped
+        // Connecting waits until the server has opened the response channel and written its
+        // first frame. It polls the child so a crash during the preamble does not hang us. A
+        // server that fails to start (a preamble that loops, a crash) is killed: a dropped
         // Child keeps running.
-        let resp = match open_fifo_with_timeout(&fifo, &mut child, Duration::from_secs(120), cancel) {
-            Ok(f) => f,
+        let conn = match transport.connect(&mut child, Duration::from_secs(120), cancel) {
+            Ok(c) => c,
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -248,8 +260,9 @@ impl FastServer {
         };
         let mut s = FastServer {
             child,
-            stdin,
-            resp: BufReader::new(resp),
+            stdin: conn.requests,
+            frames: conn.frames,
+            pending: conn.first,
             generation,
             work_dir: work_dir.to_path_buf(),
             banner: String::new(),
@@ -261,7 +274,6 @@ impl FastServer {
                 .map(Duration::from_micros)
                 .unwrap_or(Duration::from_millis(3)),
             next_req: 1,
-            frame_buf: Vec::with_capacity(1 << 16),
         };
         match s.recv()? {
             Response::Ready { banner, .. } => {
@@ -302,45 +314,58 @@ impl FastServer {
         Ok(())
     }
 
-    /// Wait until a frame header is readable or `timeout` elapses (watchdog). On timeout the
-    /// server is killed; the caller restarts it with a new generation.
+    /// Wait until a frame has arrived or `timeout` elapses (watchdog). On timeout the server
+    /// is killed; the caller restarts it with a new generation.
     fn wait_readable(&mut self, timeout: Duration) -> Result<()> {
-        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-        use std::os::fd::AsFd;
-        if self.resp.buffer().len() >= 4 {
+        use crossbeam_channel::{RecvTimeoutError, TryRecvError};
+        if self.pending.is_some() {
             return Ok(());
         }
+        let ended = || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the response reader ended",
+            ))
+        };
         let deadline = Instant::now() + timeout;
-        // Bounded busy-poll: the reply to a compile is expected within a few ms, and waking a
-        // blocked thread costs tens of µs on most systems (more in VMs).
+        // Bounded busy-poll of the channel: the reply to a compile is expected within a few
+        // ms, and waking a blocked thread costs tens of µs on most systems (more in VMs).
         if !self.spin.is_zero() {
             let spin_until = Instant::now() + self.spin;
             while Instant::now() < spin_until {
-                let mut fds = [PollFd::new(self.resp.get_ref().as_fd(), PollFlags::POLLIN)];
-                if poll(&mut fds, PollTimeout::ZERO)? > 0 {
-                    return Ok(());
+                match self.frames.try_recv() {
+                    Ok(f) => {
+                        self.pending = Some(f);
+                        return Ok(());
+                    }
+                    // yield, not a pure spin: the reader thread that delivers the frame
+                    // needs a core, and a busy host must not keep it waiting
+                    Err(TryRecvError::Empty) => std::thread::yield_now(),
+                    Err(TryRecvError::Disconnected) => {
+                        self.pending = Some(ended());
+                        return Ok(());
+                    }
                 }
-                std::hint::spin_loop();
             }
         }
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+        match self
+            .frames
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(f) => {
+                self.pending = Some(f);
+                Ok(())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.pending = Some(ended());
+                Ok(())
+            }
+            Err(RecvTimeoutError::Timeout) => {
                 self.kill();
                 bail!(
                     "engine watchdog: no response within {:?}; server killed",
                     timeout
                 );
-            }
-            // Short slices instead of one long blocking poll: on macOS a blocking poll on the
-            // response FIFO is not reliably woken by a write, so replies were only noticed when
-            // the watchdog interval expired (round trips of exactly the timeout) and the server
-            // was killed. Measured: boundary_change_and_preamble_change fails 3/3 without, passes 3/3 with.
-            let ms = remaining.as_millis().min(2) as u16;
-            let mut fds = [PollFd::new(self.resp.get_ref().as_fd(), PollFlags::POLLIN)];
-            let n = poll(&mut fds, PollTimeout::from(ms))?;
-            if n > 0 {
-                return Ok(());
             }
         }
     }
@@ -352,17 +377,17 @@ impl FastServer {
 
     fn recv_timed(&mut self) -> Result<Response> {
         let t0 = Instant::now();
-        let mut hdr = [0u8; 4];
-        self.resp
-            .read_exact(&mut hdr)
-            .context("server closed the response channel")?;
-        let n = u32::from_le_bytes(hdr) as usize;
-        let mut buf = std::mem::take(&mut self.frame_buf);
-        buf.resize(n, 0);
-        let res = self.resp.read_exact(&mut buf);
-        let r = self.parse_frame(&buf, t0, res);
-        self.frame_buf = buf;
-        r
+        let frame = match self.pending.take() {
+            Some(f) => f,
+            None => self.frames.recv().unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the response reader ended",
+                ))
+            }),
+        };
+        let buf = frame.context("server closed the response channel")?;
+        self.parse_frame(&buf, t0, Ok(()))
     }
 
     fn parse_frame(
@@ -404,7 +429,7 @@ impl FastServer {
                 }
                 cr.host_us[2] = t_read.as_micros() as u64;
                 cr.host_us[3] = (t0.elapsed() - t_read).as_micros() as u64;
-                Ok(Response::Result(cr))
+                Ok(Response::Result(Box::new(cr)))
             }
             k => bail!("unknown frame kind {k}"),
         }
@@ -442,12 +467,10 @@ impl FastServer {
         r
     }
 
-    /// A second handle on the server's stdin so another thread can submit compile frames
+    /// A second handle on the request channel so another thread can submit compile frames
     /// directly (the owner keeps reading results in order).
     pub fn stdin_clone(&self) -> Result<File> {
-        use std::os::fd::{AsFd, OwnedFd};
-        let fd: OwnedFd = self.stdin.as_fd().try_clone_to_owned()?;
-        Ok(File::from(fd))
+        Ok(self.stdin.try_clone()?)
     }
 
     /// Submit a compile without waiting; the result is read with `recv`.
@@ -491,7 +514,7 @@ impl FastServer {
                     t_traverse: Duration::from_micros(cr.t_traverse_us as u64),
                     t_pack: Duration::from_micros(cr.t_pack_us as u64),
                 };
-                Ok((cr, rt))
+                Ok((*cr, rt))
             }
             Response::Fatal {
                 reason,
@@ -567,55 +590,4 @@ impl Drop for FastServer {
             let _ = self.child.wait();
         }
     }
-}
-
-fn open_fifo_with_timeout(
-    fifo: &Path,
-    child: &mut Child,
-    timeout: Duration,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<File> {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-    use std::os::fd::AsFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    // Open the read end once, non-blocking, so the open itself never blocks and the server's
-    // own open(2) for writing succeeds as soon as it gets there. Never close and reopen:
-    // a write into a FIFO without a reader would be lost (EPIPE on the server side).
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(fifo)?;
-    let t0 = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            bail!("lualatex server exited during startup with {status}");
-        }
-        if t0.elapsed() > timeout {
-            bail!("timed out waiting for the server to open the response FIFO");
-        }
-        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
-            bail!("server startup cancelled");
-        }
-        // Linux does not report POLLHUP for a FIFO that never had a writer, so poll blocks
-        // until the first bytes ("ready" frame) arrive.
-        let mut fds = [PollFd::new(f.as_fd(), PollFlags::POLLIN)];
-        let n = poll(&mut fds, PollTimeout::from(50u16))?;
-        if n > 0 {
-            if let Some(ev) = fds[0].revents() {
-                if ev.contains(PollFlags::POLLIN) {
-                    break;
-                }
-                if ev.contains(PollFlags::POLLHUP) {
-                    bail!("server closed the response FIFO during startup");
-                }
-            }
-        }
-    }
-    // Back to blocking mode for normal framed reads.
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
-    let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL)?;
-    let mut oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
-    oflags.remove(nix::fcntl::OFlag::O_NONBLOCK);
-    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
-    Ok(f)
 }
