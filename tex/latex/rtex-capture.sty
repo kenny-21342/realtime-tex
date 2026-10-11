@@ -51,7 +51,19 @@
     \protected\def\pgfsys@invoke##1{\directlua{rtex_capture.literal("\luaescapestring{##1}")}}%
     \protected\def\pgfsys@color@unstacked##1{\directlua{rtex_capture.literal("\luaescapestring{\csname\string\color@##1\endcsname}")}}%
   \fi}
+% Also when the driver is read: pictures made in the preamble (the fadings library's fading
+% boxes) are drawn by their literals too.
+\AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfliterals}
 \AddToHook{begindocument/before}{\rtex@hookpgfliterals}
+% pict2e's PDF code (picture mode, diagbox), the same way: p2e-luatex.def writes
+% \pdfextension literal{ q #1 Q }, a token list the display list cannot read.
+% Only the driver's own definition is replaced (option `hide` gobbles the code).
+\def\rtex@pIIe@driver#1{\pdfextension literal{ q #1 Q }}
+\def\rtex@hookpicttwoe{%
+  \ifx\pIIe@code\rtex@pIIe@driver
+    \protected\def\pIIe@code##1{\directlua{rtex_capture.literal("\luaescapestring{ q ##1 Q }")}}%
+  \fi}
+\AddToHook{package/pict2e/after}{\rtex@hookpicttwoe}
 % pgf's axial and radial shadings: record what each saved form paints (rtex_capture.shading).
 % The coordinates are computed exactly as pgfsys-luatex.def computes them. Installed when the
 % driver is read (shadings declared in the preamble are saved there) and, failing that, at
@@ -104,6 +116,20 @@
   \fi\fi}
 \AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfpatterns}
 \AddToHook{begindocument/before}{\rtex@hookpgfpatterns}
+% pgf's fadings: record what a fading's box draws where pgf saves it (rtex_capture.fading; the
+% box is written out, and its list gone, when the mask is installed), and which fading a soft
+% mask installs (rtex_capture.mask), where it is first used.
+\def\rtex@hookpgfmasks{%
+  \ifdefined\rtex@pgf@installmask\else\ifdefined\pgf@sys@pdf@install@mask
+    \let\rtex@pgf@fadingfrombox\pgfsys@fadingfrombox
+    \def\pgfsys@fadingfrombox##1##2{\rtex@pgf@fadingfrombox{##1}{##2}%
+      \directlua{rtex_capture.fading("\luaescapestring{##1}", \the\lastsavedboxresourceindex)}}%
+    \let\rtex@pgf@installmask\pgf@sys@pdf@install@mask
+    \def\pgf@sys@pdf@install@mask##1{\rtex@pgf@installmask{##1}%
+      \directlua{rtex_capture.mask(\the\lastsavedboxresourceindex, "\luaescapestring{##1}")}}%
+  \fi\fi}
+\AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfmasks}
+\AddToHook{begindocument/before}{\rtex@hookpgfmasks}
 % imakeidx: record the index commands instead of running them (rtex-capture.lua, index_command)
 \AddToHook{package/imakeidx/after}{%
   \def\imki@exec#1{\directlua{rtex_capture.index_command("\luaescapestring{#1}")}}%

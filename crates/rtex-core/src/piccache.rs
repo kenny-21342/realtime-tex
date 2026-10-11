@@ -63,6 +63,9 @@ pub struct RecordedPic {
     /// The tiling patterns its literals fill with (as declared, on the recording page).
     #[serde(default, deserialize_with = "rtex_dl::map_or_empty_array")]
     pub patterns: BTreeMap<String, rtex_dl::Pattern>,
+    /// The soft masks its literals set (pgf's fadings).
+    #[serde(default, deserialize_with = "rtex_dl::map_or_empty_array")]
+    pub masks: BTreeMap<String, rtex_dl::Mask>,
 }
 
 /// What a cached picture draws, kept with its PDF region: the items of its display list
@@ -80,24 +83,41 @@ pub struct Fragment {
     /// them, so they move with the picture.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub patterns: BTreeMap<String, rtex_dl::Pattern>,
+    /// The soft masks its literals set (their drawing is placed by the literals themselves).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub masks: BTreeMap<String, rtex_dl::Mask>,
+}
+
+/// The names of a pass's own resources a literal uses: `/pgfpatN` (patterns), `/pgfsmaskN`
+/// (soft masks). They are numbered per pass, so a picture taken from the cache renames them.
+fn resource_names(data: &str) -> impl Iterator<Item = &str> {
+    ["/pgfpat", "/pgfsmask"]
+        .into_iter()
+        .flat_map(move |prefix| {
+            let p = prefix.len() - 1;
+            data.match_indices(prefix).filter_map(move |(i, _)| {
+                let rest = &data[i + 1..];
+                let end = rest[p..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .map_or(rest.len(), |k| k + p);
+                (end > p).then(|| &rest[..end])
+            })
+        })
 }
 
 /// The `/pgfpatN` names in a literal's operators.
+#[cfg(test)]
 fn pattern_names(data: &str) -> impl Iterator<Item = &str> {
-    data.match_indices("/pgfpat").filter_map(move |(i, _)| {
-        let rest = &data[i + 1..];
-        let end = rest[6..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map_or(rest.len(), |k| k + 6);
-        (end > 6).then(|| &rest[..end])
-    })
+    resource_names(data).filter(|n| n.starts_with("pgfpat"))
 }
 
 /// `data` with every `/old` name token that is a key of `names` renamed.
 fn rename_patterns(data: &str, names: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(data.len());
     let mut last = 0;
-    for name in pattern_names(data) {
+    let mut found: Vec<&str> = resource_names(data).collect();
+    found.sort_by_key(|n| n.as_ptr() as usize);
+    for name in found {
         let start = name.as_ptr() as usize - data.as_ptr() as usize;
         if let Some(new) = names.get(name) {
             out.push_str(&data[last..start]);
@@ -115,6 +135,7 @@ impl Fragment {
     fn from_recorded(r: &RecordedPic) -> Option<Fragment> {
         let items = r.items.as_ref()?;
         let mut patterns = BTreeMap::new();
+        let mut masks = BTreeMap::new();
         let (ox, oy) = (
             r.x as f64 / rtex_dl::SP_PER_BP,
             (r.page_height - r.y) as f64 / rtex_dl::SP_PER_BP,
@@ -122,8 +143,12 @@ impl Fragment {
         let ok = items.iter().all(|i| match i {
             rtex_dl::Item::Unsupported { kind, .. } => kind == "shading",
             rtex_dl::Item::Image { .. } => false,
-            // every pattern it fills with is known
-            rtex_dl::Item::Literal { data, .. } => pattern_names(data).all(|n| {
+            // every pattern it fills with and every mask it sets is known
+            rtex_dl::Item::Literal { data, .. } => resource_names(data).all(|n| {
+                if let Some(m) = r.masks.get(n) {
+                    masks.insert(n.to_string(), m.clone());
+                    return true;
+                }
                 let Some(p) = r.patterns.get(n) else {
                     return false;
                 };
@@ -140,6 +165,7 @@ impl Fragment {
             fonts: r.fonts.clone(),
             h: r.h,
             patterns,
+            masks,
         })
     }
 }
@@ -990,6 +1016,7 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
     let mut fonts = dl.fonts.clone();
     let mut spots: Vec<rtex_dl::PictureSpot> = Vec::new();
     let mut patterns: BTreeMap<String, rtex_dl::Pattern> = BTreeMap::new();
+    let mut masks: BTreeMap<String, rtex_dl::Mask> = BTreeMap::new();
     let mut next_id = fonts
         .keys()
         .filter_map(|k| k.parse::<i64>().ok())
@@ -1050,6 +1077,11 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
                     patterns.insert(new.clone(), p);
                     names.insert(n.clone(), new);
                 }
+            }
+            for (n, m) in &frag.masks {
+                let new = format!("{n}c{replaced}");
+                masks.insert(new.clone(), m.clone());
+                names.insert(n.clone(), new);
             }
             // the fragment's font ids are the recording pass's: map them onto this page's
             let mut ids: BTreeMap<i64, i64> = BTreeMap::new();
@@ -1157,6 +1189,7 @@ pub fn substitute(dl: &mut rtex_dl::DisplayList, fragments: &BTreeMap<String, Fr
     }
     dl.fonts = fonts;
     dl.patterns.extend(patterns);
+    dl.masks.extend(masks);
     dl.glyphs += glyphs;
     dl.pictures.extend(spots);
     let mut flags = dl.flags_map();
@@ -1343,6 +1376,19 @@ mod tests {
     }
 
     #[test]
+    fn mask_names_are_renamed_with_pattern_names() {
+        let d = "/pgfsmask12 gs /pgfpat3 scn /pgfsmask1x";
+        let names = BTreeMap::from([
+            ("pgfsmask12".to_string(), "pgfsmask12c0".to_string()),
+            ("pgfpat3".to_string(), "pgfpat3c0".to_string()),
+        ]);
+        assert_eq!(
+            rename_patterns(d, &names),
+            "/pgfsmask12c0 gs /pgfpat3c0 scn /pgfsmask1x"
+        );
+    }
+
+    #[test]
     fn cached_pictures_keep_their_patterns_where_their_tiles_were() {
         use rtex_dl::{DisplayList, Item, Line, Pattern, SP_PER_BP};
         let k = SP_PER_BP;
@@ -1448,6 +1494,7 @@ mod tests {
             fonts: frag_fonts,
             h: 3000,
             patterns: BTreeMap::new(),
+            masks: BTreeMap::new(),
         };
         let mut fragments = BTreeMap::new();
         fragments.insert("main.tex:12".to_string(), frag);

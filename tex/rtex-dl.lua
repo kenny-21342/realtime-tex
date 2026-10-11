@@ -334,6 +334,39 @@ end
 
 local hlist_out, vlist_out
 
+-- \useboxresource of a box saved with \saveboxresource (graphicx's trim/clip and viewport): the
+-- saved box's contents, written where the form is used, clipped to the form's box as the PDF
+-- form clips them (a literal `re W n` between MATRIX save/restore): native drawing and hosts
+-- draw them like any other material. Only forms used at their saved size whose contents have
+-- no whatsits but bookkeeping ones (a literal, colour or matrix inside the form is written in
+-- the form's own stream, with its own position bookkeeping); anything else stays a
+-- `box_resource` item.
+local function plain_form(b)
+  for n, id in D.traverse(D.getlist(b)) do
+    if id == whatsit_id and not silent_whatsit(D.getsubtype(n)) then return false end
+    if (id == hlist_id or id == vlist_id) and not plain_form(n) then return false end
+  end
+  return true
+end
+local form_out = function(st, idx, x, baseline, w, h, d)
+  local get = tex.getboxresourcebox
+  if not get or (st.form_depth or 0) > 0 then return false end
+  local ok, b = pcall(get, idx)
+  if not ok or not b then return false end
+  b = todirect(b)
+  local bw, bh, bd = getwhd(b)
+  if bw ~= w or bh ~= h or bd ~= d or not plain_form(b) then return false end
+  local k = 65536 * 72.27 / 72
+  st:emit({ "M", "save", x, baseline, "" })
+  st:emit({ "l", 0, string.format("0 %.5f %.5f %.5f re W n", -d / k, w / k, (h + d) / k), x, baseline })
+  st:flag("literal")
+  st.form_depth = 1
+  if getid(b) == hlist_id then hlist_out(st, b, x, baseline) else vlist_out(st, b, x, baseline - h) end
+  st.form_depth = 0
+  st:emit({ "M", "restore", x, baseline, "" })
+  return true
+end
+
 -- Walk an hlist's content list. Returns final cur_h. `walk` is re-entered for disc replace lists.
 -- The current glyph run (binary mode) is mirrored in locals while walking; `sync_out`/`sync_in`
 -- move it to/from the state around calls that may emit records or recurse.
@@ -553,6 +586,8 @@ hlist_out = function(st, box, left, base_v)
           local sh = M.shadings and M.shadings[idx]
           if sh then
             st:emit({ "u", "shading", string.format("%d %d %d %d %d %d %s", idx, cur_h, base_v - h, w, h, d, sh) }); st:flag("shading")
+          elseif form_out(st, idx, cur_h, base_v, w, h, d) then
+            -- drawn from the saved box's contents
           else
             st:emit({ "u", "box_resource", string.format("%d %d %d %d %d", idx, cur_h, base_v - h, w, h + d) }); st:flag("box_resource")
           end
@@ -690,6 +725,8 @@ vlist_out = function(st, box, left, top)
         local sh = M.shadings and M.shadings[idx]
         if sh then
           st:emit({ "u", "shading", string.format("%d %d %d %d %d %d %s", idx, left, cur_v, w, h, d, sh) }); st:flag("shading")
+        elseif form_out(st, idx, left, cur_v + h, w, h, d) then
+          -- drawn from the saved box's contents
         else
           st:emit({ "u", "box_resource", string.format("%d %d %d %d %d", idx, left, cur_v, w, h + d) }); st:flag("box_resource")
         end
@@ -915,6 +952,16 @@ end
 
 -- Paragraph box (a \vbox whose top-level hlists are the lines). Origin: top-left of the box.
 -- `initial_color` (raw PDF color operators) is the color in force when the paragraph starts.
+-- A box's items relative to its reference point (left edge, baseline), as one list: what a
+-- soft mask's form draws (rtex-capture.lua, pgf's fadings).
+function M.fragment(boxnode)
+  local box = todirect(boxnode)
+  local st = new_state({})
+  local w, h, d = getwhd(box)
+  if getid(box) == hlist_id then hlist_out(st, box, 0, 0) else vlist_out(st, box, 0, -h) end
+  return { width = w, height = h, depth = d, items = st.other, glyphs = st.glyphs }
+end
+
 function M.paragraph(boxnode, initial_color)
   local box = todirect(boxnode)
   local st = new_state({ lines_at_top = true })

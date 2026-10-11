@@ -417,6 +417,27 @@ pub struct DisplayList {
         deserialize_with = "map_or_empty_array"
     )]
     pub patterns: BTreeMap<String, Pattern>,
+    /// The soft masks this page's literals set (pgf's fadings: `/pgfsmaskN gs`), by graphics
+    /// state name; capture pages only. Native drawing needs what each mask draws.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "map_or_empty_array"
+    )]
+    pub masks: BTreeMap<String, Mask>,
+}
+
+/// A luminosity soft mask as pgf installs one (a fading): the items of the box its form draws,
+/// relative to the box's reference point (left edge, baseline; sp, y down), and the box's size.
+/// The form's space has its origin at the box's lower left; it is placed by the transformation
+/// in force where the mask is set. Outside the box the mask is black (fully transparent).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Mask {
+    pub width: Sp,
+    pub height: Sp,
+    pub depth: Sp,
+    #[serde(default)]
+    pub items: Vec<Item>,
 }
 
 /// A PDF tiling pattern (PatternType 1) as pgf declares it: the cell's content stream and its
