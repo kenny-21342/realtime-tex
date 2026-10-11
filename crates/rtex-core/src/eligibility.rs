@@ -2392,14 +2392,7 @@ impl<'a> Scan<'a> {
             {
                 self.text_group_pending = true;
             }
-            if (name == "tag"
-                || name == "notag"
-                || name == "nonumber"
-                || name == "intertext"
-                || name == "eqref")
-                && !policy.amsmath
-                && name != "nonumber"
-            {
+            if matches!(name.as_str(), "tag" | "notag" | "intertext" | "eqref") && !policy.amsmath {
                 self.push(Reason::NeedsPackage("amsmath".into()));
             }
             ok
