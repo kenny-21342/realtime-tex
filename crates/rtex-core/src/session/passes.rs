@@ -1018,6 +1018,7 @@ fn deliver_layout_inner(
                     source: warm,
                     pics: String::new(),
                     pics_n: 0,
+                    pic_fragments: BTreeMap::new(),
                     seq: eu.uid,
                     ctx: None,
                     versions: Versions {

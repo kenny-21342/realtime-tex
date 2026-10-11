@@ -1,0 +1,24 @@
+% rtex-literals.tex: readable PDF literal nodes, shared by capture and live compilation.
+% Before input, define \rtex@litns as the Lua table providing literal(data).
+\begingroup\catcode`\@=11\relax
+% pgf's PDF literals, made from Lua so the display list can read their operators (see
+% \rtex@litns.literal). \protected: like the primitive, never expanded inside an \edef.
+\gdef\rtex@hookpgfliterals{%
+  \ifdefined\pgfsys@invoke
+    \protected\def\pgfsys@invoke##1{\directlua{\rtex@litns.literal("\luaescapestring{##1}")}}%
+    \protected\def\pgfsys@color@unstacked##1{\directlua{\rtex@litns.literal("\luaescapestring{\csname\string\color@##1\endcsname}")}}%
+  \fi}
+% Also when the driver is read: pictures made in the preamble (the fadings library's fading
+% boxes) are drawn by their literals too.
+\AddToHook{file/pgfsys-luatex.def/after}{\rtex@hookpgfliterals}
+\AddToHook{begindocument/before}{\rtex@hookpgfliterals}
+% pict2e's PDF code (picture mode, diagbox), the same way: p2e-luatex.def writes
+% \pdfextension literal{ q #1 Q }, a token list the display list cannot read.
+% Only the driver's own definition is replaced (option `hide` gobbles the code).
+\gdef\rtex@pIIe@driver#1{\pdfextension literal{ q #1 Q }}
+\gdef\rtex@hookpicttwoe{%
+  \ifx\pIIe@code\rtex@pIIe@driver
+    \protected\def\pIIe@code##1{\directlua{\rtex@litns.literal("\luaescapestring{ q ##1 Q }")}}%
+  \fi}
+\AddToHook{package/pict2e/after}{\rtex@hookpicttwoe}
+\endgroup

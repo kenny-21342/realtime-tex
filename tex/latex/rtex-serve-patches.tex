@@ -5,6 +5,11 @@
 % definition it was written against and is skipped otherwise. Row-exactness against the
 % background pass is checked by `rtex verify` (docs/correctness.md).
 \makeatletter
+% The preamble is already loaded: install the shared pgf/pict2e hooks now.
+\def\rtex@litns{rtex_serve}
+\input{rtex-literals.tex}
+\rtex@hookpgfliterals
+\rtex@hookpicttwoe
 %
 % 1. Running-head marks. \markright/\markboth insert \marks nodes that only the output routine
 %    reads; the unit box is never shipped. Keep the one typesetting side effect (a \nobreak

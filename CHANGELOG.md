@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Draw pictures in live label edits.** The live server shares capture's readable pgf/pict2e
+  literal hooks. `ParagraphUpdate.native` carries complete native drawing operations and glyph
+  transforms, restoring unchanged cached pictures alongside an edited one, so hosts keep
+  axes, lines and rotated labels while a label is edited. An
+  unsupported live picture has no partial drawing; hosts keep its previous complete drawing
+  until the full compile.
+
 ## 0.0.6 (2026-10-11)
 
 - **Held pictures.** While an edit leaves a TikZ picture with errors (a half-typed coordinate

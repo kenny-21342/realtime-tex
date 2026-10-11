@@ -62,8 +62,8 @@ impl Session {
         let mut expected_rows = 0i64;
         let mut derived_from: Option<(ParaId, ParaId, bool)> = None;
         let mut probe = false;
-        let (pics, pics_n, pics_cached) =
-            self.unit_pics(rel_path, files, fb, span, rev, layout.layout_version);
+        let (pics, pics_n, pics_cached, pic_fragments) =
+            self.unit_pics(rel_path, files, fb, span, rev, layout);
         // the unit's only vocabulary beyond the allow-list is picture environments, and the
         // cache holds every one of them: their bodies are not run, so there is nothing for a
         // probe to prove (a probe compiles the snapshot's text, whose pictures the entries of
@@ -191,6 +191,7 @@ impl Session {
             ),
             pics,
             pics_n,
+            pic_fragments,
             seq,
             ctx,
             versions: Versions {
@@ -222,8 +223,13 @@ impl Session {
         fb: &FileBuf,
         span: &Span,
         rev: Revision,
-        layout_version: u64,
-    ) -> (String, usize, usize) {
+        layout: &LayoutStore,
+    ) -> (
+        String,
+        usize,
+        usize,
+        BTreeMap<String, crate::piccache::Fragment>,
+    ) {
         use crate::piccache::{preamble_hash, scan_pictures, PicCache, PICTURE_ENVS};
         let text = &fb.text[span.range.clone()];
         if !self.shared.cfg.picture_cache
@@ -231,7 +237,7 @@ impl Session {
                 .iter()
                 .any(|e| text.contains(&format!("\\begin{{{e}}}")))
         {
-            return (String::new(), 0, 0);
+            return (String::new(), 0, 0, BTreeMap::new());
         }
         let pics = {
             let mut scan = self.shared.pic_scan.lock();
@@ -251,6 +257,7 @@ impl Session {
         };
         let (first, last) = fb.line_range(span);
         let file = rel_path.trim_start_matches("./");
+        let layout_version = layout.layout_version;
         let mut idx = self.shared.pic_index.lock();
         if idx
             .as_ref()
@@ -264,6 +271,7 @@ impl Session {
         }
         let cache = &idx.as_ref().unwrap().1;
         let mut entries = Vec::new();
+        let mut offered = Vec::new();
         let (mut scanned, mut cached) = (0usize, 0usize);
         for p in pics.iter() {
             let Some((f, line)) = p.key.rsplit_once(':') else {
@@ -279,16 +287,43 @@ impl Session {
             if let Some(mut e) = cache.entry_json(p) {
                 e["line"] = serde_json::Value::from(line - first + 1);
                 entries.push(e);
+                offered.push(p.clone());
                 cached += 1;
             }
         }
         if cached == 0 {
-            return (String::new(), 0, 0);
+            return (String::new(), 0, 0, BTreeMap::new());
         }
+        // A previously typed label can already exist in the persistent cache. Its bitmap
+        // still differs from the current page, so restore its recorded drawing as well.
+        // Hashing picture bodies/setup ignores ordinary surrounding text edits.
+        let changed_picture = cached == scanned
+            && layout.snapshot_span(span.id).is_none_or(|old| {
+                let source = crate::document::fast_source(
+                    fb,
+                    span,
+                    self.shared.inputted.lock().contains(rel_path),
+                );
+                let hashes = |text: &str| {
+                    let texts = BTreeMap::from([("unit".into(), text.to_string())]);
+                    scan_pictures(&texts, "unit", 0)
+                        .into_iter()
+                        .map(|p| (p.env, p.hash))
+                        .collect::<Vec<_>>()
+                };
+                hashes(&source) != hashes(&old.text)
+            });
         (
             serde_json::to_string(&entries).unwrap_or_default(),
             scanned,
             cached,
+            // Ordinary cache-only text edits need no expanded drawing. Mixed units need the
+            // exact fragments behind the offered PDF entries, not a later index by key.
+            if cached < scanned || changed_picture {
+                cache.fragments(&offered)
+            } else {
+                BTreeMap::new()
+            },
         )
     }
 

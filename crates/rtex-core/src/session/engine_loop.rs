@@ -960,6 +960,7 @@ pub(super) fn handle_result(
                 pagination_stale: false,
                 context_stale: req.context_stale,
                 dl: cr.dl.unwrap_or_default(),
+                native: None,
                 diagnostics,
                 timing,
             })
@@ -1074,6 +1075,28 @@ pub(super) fn handle_result(
     if stale || counters_changed || !reasons.is_empty() {
         s.bg_signal.0.send(BgCmd::Pass).ok();
     }
+    // A unit can contain an edited picture and unchanged cached ones. Expand the latter
+    // exactly as a background page does, and send that list only when all drawing resolves.
+    // Cache-only text edits keep their opaque cached_picture items and existing host path.
+    let native = if dl.flags_map().contains_key("literal")
+        || dl.flags_map().contains_key("shading")
+        || !req.pic_fragments.is_empty()
+    {
+        let mut drawing = dl.clone();
+        drawing.page_height = Some(dl.height + dl.depth);
+        if !req.pic_fragments.is_empty() {
+            crate::piccache::substitute(&mut drawing, &req.pic_fragments);
+        }
+        let native = rtex_dl::gfx::only_literals(&drawing)
+            .then(|| rtex_dl::gfx::native_graphics(&drawing).ok())
+            .flatten();
+        if native.is_some() {
+            dl = drawing;
+        }
+        native
+    } else {
+        None
+    };
     let total_us = timing.total_us;
     s.events
         .send(Event::ParagraphUpdate {
@@ -1090,6 +1113,7 @@ pub(super) fn handle_result(
             pagination_stale: stale,
             context_stale: req.context_stale,
             dl,
+            native,
             diagnostics,
             timing,
         })

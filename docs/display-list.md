@@ -163,6 +163,27 @@ It never returns a partial drawing. `LayoutUpdate.pages_changed[].native` carrie
 degraded page it resolves (absent otherwise); the page stays `exact: false`, so a host that does
 not draw natively keeps using the PDF.
 
+Live `ParagraphUpdate.native` uses the same format. Capture and live compilation share
+`rtex-literals.tex`, which creates readable pgf and pict2e literal nodes. The live interpreter
+uses the unit box height as its coordinate frame (`dl.page_height`), since binary paragraph
+lists omit page dimensions. Operations and glyph transforms stay in that frame: place a row
+by translating the canvas base matrix by the fragment's `(x, baseline)` minus the row's
+`(x, y)`, then draw its items and the ops indexed by its zero-based line number. Apply this
+translation outside the native transforms, so rotated labels move with the paths.
+
+A unit can contain an edited picture beside unchanged cached pictures. In that mixed case,
+the engine restores the cache's recorded drawing using the exact fragments offered with the
+request, then emits the expanded display list and native operations if every item resolves.
+Returning to an earlier label version already present in the cache also uses that recorded
+drawing, rather than copying a different label from the current page. The rows and placements
+are unchanged. Ordinary cache-only text edits keep their existing
+`cached_picture` items, avoiding this extra work.
+
+No partial native drawing is sent. Resources declared in the preamble that the live run does
+not record (patterns and fadings) keep `native` absent. A host must retain the previous complete
+unit drawing until the next full page, without outlining it as an error. This also supports
+older engines whose live literals contain only `"data"`.
+
 - `ops` are in content order; each names the item (`at`: row `line`, or `null` for the page's
   `other` items, and `item` index) whose operator produced it. Draw them interleaved with the
   list's glyphs, rules and images: an op tagged with item *k* goes right after item *k*.
