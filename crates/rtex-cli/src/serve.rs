@@ -17,6 +17,7 @@ pub fn run(
     pass_timeout_ms: u64,
     eligibility: &str,
     picture_cache: bool,
+    hold_broken_pictures: bool,
     debug_dir: Option<PathBuf>,
 ) -> Result<()> {
     let mut cfg = SessionConfig::new(project, main);
@@ -24,6 +25,7 @@ pub fn run(
     cfg.fast_budget_factor = fast_budget_factor;
     cfg.pass_timeout = Duration::from_millis(pass_timeout_ms);
     cfg.picture_cache = picture_cache;
+    cfg.hold_broken_pictures = hold_broken_pictures;
     if debug_dir.is_some() {
         cfg.debug_dir = debug_dir;
     }

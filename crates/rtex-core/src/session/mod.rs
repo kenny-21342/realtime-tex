@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 mod diag;
 mod engine_loop;
+mod hold;
 mod live;
 mod passes;
 mod route;
@@ -31,6 +32,7 @@ mod route;
 pub use diag::parse_log;
 use diag::*;
 use engine_loop::*;
+pub use hold::HeldPicture;
 use live::*;
 use passes::*;
 
@@ -73,6 +75,10 @@ pub struct SessionConfig {
     /// Background passes reuse unchanged pictures (tikzpicture, circuitikz) from an earlier
     /// pass's PDF instead of drawing them again (default true; `docs/how-it-works.md`).
     pub picture_cache: bool,
+    /// While an edit leaves a picture with errors, layouts show the picture's last good drawing
+    /// (default true; needs `picture_cache`). The errors are still reported; `LayoutUpdate.held`
+    /// names the pictures (docs/how-it-works.md, "Held pictures").
+    pub hold_broken_pictures: bool,
     /// Debugging: a directory the session writes diagnostics into (default: `$RTEX_DEBUG_DIR`
     /// when set, else none). Every engine failure (watchdog, state mismatch, crash) leaves a
     /// bundle there with the request's source, context and picture entries, the server's
@@ -152,6 +158,7 @@ impl SessionConfig {
             warm_background: true,
             eligibility: EligibilityMode::Probe,
             picture_cache: true,
+            hold_broken_pictures: true,
             debug_dir: std::env::var_os("RTEX_DEBUG_DIR")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -253,6 +260,10 @@ pub enum Event {
         eligible_paragraphs: Vec<ParaId>,
         pdf_fallback: Option<PathBuf>,
         wall_ms: u64,
+        /// Pictures shown in their last good version while their source has errors (empty
+        /// when none; `SessionConfig::hold_broken_pictures`).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        held: Vec<HeldPicture>,
     },
     Diagnostics {
         source: String,
@@ -398,6 +409,8 @@ struct Shared {
     /// The source scan for pictures at a revision (the whole project; one scan per edit, not
     /// one per routed span).
     pic_scan: Mutex<Option<(Revision, Arc<Vec<crate::piccache::PictureRef>>)>>,
+    /// Last good picture versions and what the pages shown depict (`hold`).
+    hold: Mutex<hold::HoldState>,
 }
 
 enum BgCmd {
@@ -496,6 +509,7 @@ impl Session {
             last_pass_dir: Mutex::new(None),
             pic_index: Mutex::new(None),
             pic_scan: Mutex::new(None),
+            hold: Mutex::new(hold::HoldState::default()),
         });
         let mut threads = Vec::new();
         {

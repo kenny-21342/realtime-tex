@@ -206,6 +206,9 @@ struct Index {
 pub struct PicCache {
     dir: PathBuf,
     index: Index,
+    /// Entries kept whatever their age (`pin`): the last good drawings of pictures an edit has
+    /// broken, which no current picture wants while they are held (`session::hold`).
+    pinned: BTreeSet<String>,
 }
 
 /// Passes an entry survives without being wanted (edits that toggle a picture back and forth).
@@ -227,7 +230,24 @@ impl PicCache {
                 .unwrap_or(1)
                 .max(1);
         }
-        PicCache { dir, index }
+        PicCache {
+            dir,
+            index,
+            pinned: BTreeSet::new(),
+        }
+    }
+
+    /// Keep the entries of these hashes through eviction (see `pinned`).
+    pub fn pin(&mut self, hashes: impl IntoIterator<Item = u64>) {
+        self.pinned = hashes.into_iter().map(|h| h.to_string()).collect();
+    }
+
+    /// Whether an entry for this picture hash exists (its PDF on disk).
+    pub fn has_entry(&self, hash: u64) -> bool {
+        self.index
+            .entries
+            .get(&hash.to_string())
+            .is_some_and(|e| self.dir.join(&e.pdf).exists())
     }
 
     pub fn entries(&self) -> usize {
@@ -327,22 +347,9 @@ impl PicCache {
             self.index.bad.insert(k.clone(), serial + KEEP_PASSES);
         }
         let mut new: Vec<(&PictureRef, &RecordedPic)> = Vec::new();
-        let has_error = |p: &PictureRef| {
-            let Some((file, line)) = p.key.rsplit_once(':') else {
-                return false;
-            };
-            let Ok(begin) = line.parse::<i64>() else {
-                return false;
-            };
-            errors.iter().any(|(f, l)| {
-                f.trim_start_matches("./") == file.trim_start_matches("./")
-                    && (begin..=p.end_line as i64).contains(l)
-            })
-        };
-        for p in pics
-            .iter()
-            .filter(|p| p.cacheable && !self.index.bad.contains_key(&p.key) && !has_error(p))
-        {
+        for p in pics.iter().filter(|p| {
+            p.cacheable && !self.index.bad.contains_key(&p.key) && !has_error(p, errors)
+        }) {
             let Some(r) = recorded.get(&p.key) else {
                 continue;
             };
@@ -417,9 +424,10 @@ impl PicCache {
             }
         }
         // eviction: entries no current picture wants for KEEP_PASSES passes
+        let pinned = &self.pinned;
         self.index
             .entries
-            .retain(|_, e| e.last_used + KEEP_PASSES >= serial);
+            .retain(|h, e| e.last_used + KEEP_PASSES >= serial || pinned.contains(h));
         // PDFs nothing references any more
         let referenced: BTreeSet<&str> = self
             .index
@@ -441,6 +449,21 @@ impl PicCache {
         self.save()?;
         Ok(added)
     }
+}
+
+/// Whether a pass reported an error (`errors`: its `(file, line)` error locations) between the
+/// picture's `\begin` and `\end` lines.
+pub fn has_error(p: &PictureRef, errors: &[(String, i64)]) -> bool {
+    let Some((file, line)) = p.key.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(begin) = line.parse::<i64>() else {
+        return false;
+    };
+    errors.iter().any(|(f, l)| {
+        f.trim_start_matches("./") == file.trim_start_matches("./")
+            && (begin..=p.end_line as i64).contains(l)
+    })
 }
 
 /// Write `data` to `path` through a temporary file and a rename: a reader (the live engine's

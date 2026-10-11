@@ -111,6 +111,10 @@ enum Cmd {
         /// unchanged ones from an earlier pass's PDF.
         #[arg(long)]
         no_picture_cache: bool,
+        /// Show a picture whose source has errors as it is, instead of in its last good
+        /// version (docs/how-it-works.md, "Held pictures").
+        #[arg(long)]
+        no_hold_broken_pictures: bool,
         /// Write diagnostics here: a bundle per engine failure (request source, context,
         /// server log and stage trace) and one line per live compile in requests.log
         /// (default: $RTEX_DEBUG_DIR when set).
@@ -274,6 +278,7 @@ fn main() -> anyhow::Result<()> {
             pass_timeout_ms,
             eligibility,
             no_picture_cache,
+            no_hold_broken_pictures,
             debug_dir,
         } => serve::run(
             project,
@@ -284,6 +289,7 @@ fn main() -> anyhow::Result<()> {
             pass_timeout_ms,
             &eligibility,
             !no_picture_cache,
+            !no_hold_broken_pictures,
             debug_dir,
         )?,
         Cmd::Edit {

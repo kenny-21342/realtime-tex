@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Held pictures.** While an edit leaves a TikZ picture with errors (a half-typed coordinate
+  reads the rest of the document into it), layouts keep the picture's last good drawing instead
+  of losing it and the text after it. The errors are still reported; `LayoutUpdate.held` names
+  the pictures, and a held layout is never `Converged`. When only the held picture changed, no
+  extra pass runs. On by default: `hold_broken_pictures` (C ABI), `--no-hold-broken-pictures`
+  (`rtex serve`). See docs/how-it-works.md, "Held pictures".
+
 ## 0.0.5 (2026-10-11)
 
 ### From upstream 0.0.3

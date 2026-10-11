@@ -203,6 +203,36 @@ Every layout update says how final it is:
 Separately, the compile status is `Ok`, `CompiledWithErrors` (pages were produced but the log
 has errors: the layout is partial), or `Failed` (no pages; the previous layout stays).
 
+### Held pictures
+
+Typing inside a TikZ picture often passes through broken states: a half-typed coordinate
+`(1.5,` makes TeX read the rest of the document into it, and the pass that compiles it loses
+the picture and the text after it. While the picture an edit broke has errors, layouts keep its
+last good drawing instead (`hold_broken_pictures`, on by default; it needs the picture cache).
+
+After each pass, rtex remembers every picture's last version drawn with no error between its
+`\begin` and just after its `\end` (the picture cache keeps that drawing; a picture is known by
+its unit and its place in the unit, so lines added above do not lose it). When a pass ends with
+errors and every located error comes at or after a picture changed since its last good version
+(in its file from its `\begin` on, or in the file that `\input`s it from that line on: a
+runaway reports errors up to `\end{document}`), the picture is held. A changed picture after the
+first error of its file is not the cause and is not held; an error before every changed picture
+means the document has another problem, and nothing is held. Then:
+
+- If only the held pictures changed since the pages shown, those pages stay: the layout has no
+  page, only the errors and `held`.
+- Otherwise a held run follows: the same sources with each held picture's body blanked (line
+  numbers kept) and its last good drawing taken from the cache. It counts only when it is clean
+  and took every held picture from the cache; otherwise the real run is shown as usual (the
+  errors are elsewhere, or the hold could not work, e.g. another picture uses a node this one
+  names).
+
+The real run always compiles the broken source, so its errors are reported, and a held layout
+is `CompiledWithErrors` and never `Converged`. Exports compile the real sources. A picture with
+no good version yet (one being typed from scratch), one that does not start its line, or one
+whose `\end` line is being edited is not held. A picture that compiles but draws something odd
+mid-edit (`(3,)`) is shown as compiled.
+
 The files compared between passes are the `.aux` (including those of `\include`d chapters),
 `.toc`, `.lof`, `.lot`, `.out`, `.bcf`, `.bbl`, `.idx` and every `.ind`.
 

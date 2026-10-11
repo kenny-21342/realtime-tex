@@ -30,6 +30,8 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
    checked against MuPDF by `scripts/gfx_compare.py` / `scripts/gfx_shading_check.py` (inputs from the
    `gfx_dump` and `native_session` examples); pattern fills by the plugin's pixel render check (`test/render`).
 6. Glossaries (`\makeglossaries`) built between passes (`background.rs` `run_makeglossaries`).
+7. Held pictures (`session/hold.rs`, `LayoutUpdate.held`): a picture an edit broke keeps its last good drawing
+   (`tests/held.rs`, docs/how-it-works.md "Held pictures").
 5. Session: pass timeout (`pass_timeout_ms`), relative fast-path budget (`fast_budget_factor` on top of
    upstream's 50 ms floor), warm start of the background build, diagnostics for fatal passes, page `rotate`
    and `color_base` in the display list.
