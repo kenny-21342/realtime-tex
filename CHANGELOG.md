@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.6 (2026-10-11)
+
 - **Held pictures.** While an edit leaves a TikZ picture with errors (a half-typed coordinate
   reads the rest of the document into it), layouts keep the picture's last good drawing instead
   of losing it and the text after it. The errors are still reported; `LayoutUpdate.held` names
