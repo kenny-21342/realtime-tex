@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### From upstream 0.0.3
+
+Upstream 0.0.3 and this fork's 0.0.3 are different releases. These upstream fixes
+will ship in the fork's next release; the current fork version remains 0.0.4.
+
+- **Live typing on Windows with MiKTeX.** The live engine exited at startup with
+  "exit code: 1" on every MiKTeX installation (realtime-tex-vsc-plugin#1): MiKTeX refuses to
+  let LuaTeX write outside the output directory, which includes the engine's response pipe.
+  rtex now sets `MIKTEX_ALLOWUNSAFEOUTPUTFILES=1` for the LuaLaTeX processes it starts, the
+  MiKTeX equivalent of the `openout_any=a` it already sets for TeX Live.
+- When the live engine cannot start, the error quotes the first TeX or Lua error from its log
+  instead of only the exit code.
+- The live driver path uses forward slashes on Windows.
+- A job runs a live-editing session on Windows with MiKTeX, in paths with spaces and non-ASCII
+  characters and on a CRLF document.
+  MiKTeX downloads use a fixed server and retries.
+
 ## 0.0.4 (2026-10-11)
 
 - **Ignored errors are not reported.** LuaTeX logs an error the document told it to ignore
@@ -62,10 +79,10 @@ The first release of kenny-21342/realtime-tex: upstream 0.0.2 (`e35f869`) plus t
 
 - **Prebuilt binaries** for Linux (x86_64, arm64), macOS (Apple silicon, Intel) and Windows
   (x86_64), attached to each release by CI. Each holds `rtex`, the shared C library, `rtex.h`
-  and the support files. The binaries for 0.0.2 are built from this branch, which differs from
-  the tag only in packaging, docs and benchmarks.
+  and the support files.
 - `rtex` finds its support files next to its executable (`share/rtex/tex`), so an unpacked
   archive works from anywhere. `rtex doctor` checks the installation.
+
 - GitHub counts the project as Rust: fixtures, benchmarks and the TeX/Lua files are marked as
   vendored for language statistics.
 
