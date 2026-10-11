@@ -30,6 +30,10 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
    checked against MuPDF by `scripts/gfx_compare.py` / `scripts/gfx_shading_check.py` (inputs from the
    `gfx_dump` and `native_session` examples); pattern fills by the plugin's pixel render check (`test/render`).
 6. Glossaries (`\makeglossaries`) built between passes (`background.rs` `run_makeglossaries`).
+8. Live picture drawing (`ParagraphUpdate.native`): capture and live compilation share
+   `tex/latex/rtex-literals.tex`; `tests/live_pictures.rs` checks rotated labels and path equality
+   against the next page (including mixed cached/edited units), pict2e, and unsupported patterns. Hosts translate native ops with the
+   unit rows and retain the previous drawing when no complete native drawing is available.
 7. Held pictures (`session/hold.rs`, `LayoutUpdate.held`): a picture an edit broke keeps its last good drawing
    (`tests/held.rs`, docs/how-it-works.md "Held pictures").
 5. Session: pass timeout (`pass_timeout_ms`), relative fast-path budget (`fast_budget_factor` on top of

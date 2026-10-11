@@ -45,10 +45,12 @@ fn open(name: &str) -> Option<(PathBuf, Session)> {
 }
 
 fn has_cached_picture(dl: &DisplayList) -> bool {
-    dl.lines
-        .iter()
-        .flat_map(|l| l.items.iter())
-        .any(|i| matches!(i, Item::Unsupported { kind, .. } if kind == "cached_picture"))
+    !dl.pictures.is_empty()
+        || dl
+            .lines
+            .iter()
+            .flat_map(|l| l.items.iter())
+            .any(|i| matches!(i, Item::Unsupported { kind, .. } if kind == "cached_picture"))
 }
 
 fn insert(s: &Session, root: &std::path::Path, needle: &str, text: &str) -> EditResult {
@@ -147,26 +149,27 @@ fn an_edited_picture_before_a_cached_one() {
     let (status, dl) = seen.expect("a paragraph update");
     assert_ne!(status, "error");
     // one row holds both pictures: the cached one is the right-hand one (after \hfill)
+    // Mixed live/cached units now restore the cache's recorded drawing when it is native;
+    // picture spots still prove which picture was reused and where it was placed.
     let row = dl
         .lines
         .iter()
-        .find(|l| {
-            l.items
-                .iter()
-                .any(|i| matches!(i, Item::Unsupported { kind, .. } if kind == "cached_picture"))
-        })
-        .expect("a row with the cached picture");
-    let cached: Vec<i64> = row
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Unsupported { kind, detail } if kind == "cached_picture" => detail
-                .as_str()
-                .and_then(|d| d.split(' ').nth(1))
-                .and_then(|x| x.parse().ok()),
-            _ => None,
-        })
-        .collect();
+        .find(|l| !l.items.is_empty())
+        .expect("a picture row");
+    let cached: Vec<i64> = if dl.pictures.is_empty() {
+        row.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Unsupported { kind, detail } if kind == "cached_picture" => detail
+                    .as_str()
+                    .and_then(|d| d.split(' ').nth(1))
+                    .and_then(|x| x.parse().ok()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        dl.pictures.iter().map(|p| p.x).collect()
+    };
     assert_eq!(
         cached.len(),
         1,

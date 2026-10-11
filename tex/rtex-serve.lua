@@ -13,6 +13,15 @@ local gettime = os.gettimeofday
 local pack, format, floor = string.pack, string.format, math.floor
 local stdin = io.stdin
 
+-- The same mode-0 PDF literal node capture uses: its data is readable by rtex-dl.
+local literal_subtype = node.subtype("pdf_literal")
+function S.literal(data)
+  local n = node.new("whatsit", literal_subtype)
+  n.mode = 0
+  n.data = data
+  node.write(n)
+end
+
 local resp
 
 local function send(tbl)

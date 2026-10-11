@@ -246,6 +246,9 @@ pub enum Event {
         pagination_stale: bool,
         context_stale: bool,
         dl: DisplayList,
+        /// Native drawing in the unit display list's coordinates, when fully supported.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        native: Option<rtex_dl::gfx::NativePage>,
         diagnostics: Vec<Diagnostic>,
         timing: Timing,
     },
@@ -314,6 +317,8 @@ struct FastRequest {
     /// empty when none is cached), and how many pictures the source has.
     pics: String,
     pics_n: usize,
+    /// Drawings offered to this mixed cached/edited unit, frozen with its cache manifest.
+    pic_fragments: BTreeMap<String, crate::piccache::Fragment>,
     seq: i64,
     /// Context object for the server; None when the engine link already holds this context
     /// (the engine thread builds it from the layout store when it must send it).
@@ -835,6 +840,7 @@ impl Session {
                             pagination_stale: true,
                             context_stale: false,
                             dl: DisplayList::default(),
+                            native: None,
                             diagnostics: vec![],
                             timing: Timing::default(),
                         })

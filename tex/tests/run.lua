@@ -38,4 +38,23 @@ check("round_xn_over_d matches exact rounding", okc)
 -- expansion formula: ef in millionths, 2% stretch of 431102 sp
 check("expansion 2%", dl.round_xn_over_d(431102, 1020000, 1000000) == 439724)
 
+-- Load the real capture and live modules with just the LuaTeX API used at load time stubbed.
+kpse = { find_file = function(name) return "tex/" .. name end }
+token = { create = function() return { mode = 1 } end }
+luatexbase = { new_attribute = function() return 1 end }
+node.subtype = function(name) assert(name == "pdf_literal"); return 22 end
+node.new = function(kind, subtype) return { id = kind, subtype = subtype } end
+local written
+node.write = function(n) written = n end
+local capture = dofile("tex/rtex-capture.lua")
+local serve = dofile("tex/rtex-serve.lua")
+local code = "q 0.7 0.2 0.1 RG 0 0 m 10 20 l S Q"
+capture.literal(code)
+local c = written
+serve.literal(code)
+local s = written
+check("live and capture literals have identical readable node data",
+  c.id == "whatsit" and c.subtype == 22 and c.mode == 0 and c.data == code
+  and s.id == c.id and s.subtype == c.subtype and s.mode == c.mode and s.data == c.data)
+
 if failures > 0 then print(failures .. " failure(s)"); os.exit(1) else print("all Lua tests passed") end

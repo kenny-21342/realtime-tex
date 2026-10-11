@@ -113,6 +113,7 @@ Events arrive in order on one queue. Every event that comes from the engine or a
 | `par_id` | the unit (span) this replaces. Remove everything this unit drew before. |
 | `status` | `ok` draw it. `ok_degraded` draw it, but something in it could not be represented: see `reasons`, and expect a pass. `error` TeX reported an error: show `diagnostics`, don't trust the display list. `removed` the span no longer exists (merged or deleted): clear it. |
 | `dl` | the unit's display list: rows of glyphs, rules and images, relative to the unit's box. |
+| `native` | optional native picture drawing in `dl` coordinates, including rotated glyph transforms. Draw each row with its indexed operations, translating the base matrix by `fragments` minus the row's `(x, y)`. If the list has literals and `native` is absent, retain the unit's previous drawing until the full compile; do not replace it with labels alone. |
 | `fragments` | where to draw it: one entry per page the unit spans, with the page number, the rows it holds (`first_line..last_line`) and each row's `x` and `baseline` on that page. |
 | `pagination_stale` | the unit's height or row count changed, so the material after it is out of place until the next layout, which is already scheduled. |
 | `context_stale` | something before the unit changed since the last pass (or the unit borrowed a neighbour's context). The result is the best available; the next layout confirms it. |
