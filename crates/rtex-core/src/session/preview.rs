@@ -140,7 +140,17 @@ fn plan(s: &Shared, snapshot: &[SnapshotSpan]) -> Option<Plan> {
         let page = unit.captured.placements.iter().map(|p| p.page).min()?;
         first_page = first_page.min(page.saturating_sub(1).max(1));
         changed.insert(new.id);
-        rows.insert(new.id, *count);
+        // Captured paragraphs containing display math may have a different live-box row
+        // decomposition than their page rows. Their capture completion marker decides;
+        // a fresh plain paragraph additionally waits for its entire live row count.
+        rows.insert(
+            new.id,
+            if layout.unit(new.id).is_some_and(|u| u.rows() > 0) {
+                1
+            } else {
+                *count
+            },
+        );
     }
     // A new paragraph can push the following drawing onto another page. Keep the
     // run until that next unchanged unit is visible too, rather than dropping the
