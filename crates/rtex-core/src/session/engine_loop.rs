@@ -997,6 +997,7 @@ pub(super) fn handle_result(
                 req.versions.source_revision,
                 wanted_gen,
                 dl.lines.len() as i64,
+                crate::document::hash_str(&req.source),
             ),
         );
     }

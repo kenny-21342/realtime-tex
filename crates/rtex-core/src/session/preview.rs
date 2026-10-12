@@ -52,7 +52,7 @@ fn plain_change(old: &str, new: &str) -> bool {
     plain_file_change(old, new) && local_commands(old) && local_commands(new)
 }
 
-fn plan(s: &Shared, snapshot: &[SnapshotSpan]) -> Option<Plan> {
+fn plan(s: &Shared, snapshot: &[SnapshotSpan], require_validation: bool) -> Option<Plan> {
     if !s.cfg.warm_background || !s.preview_base_ok.load(Ordering::SeqCst) {
         return None;
     }
@@ -133,10 +133,15 @@ fn plan(s: &Shared, snapshot: &[SnapshotSpan]) -> Option<Plan> {
             }
             unit
         };
-        let (revision, gen, count) = validated.get(&new.id)?;
-        if *revision < new.last_revision || *gen != generation {
+        let validation = validated.get(&new.id).filter(|(revision, gen, _, hash)| {
+            *revision >= new.last_revision
+                && *gen == generation
+                && *hash == crate::document::hash_str(&new.text)
+        });
+        if require_validation && validation.is_none() {
             return None;
         }
+        let count = validation.map(|(_, _, count, _)| *count).unwrap_or(0);
         let page = unit.captured.placements.iter().map(|p| p.page).min()?;
         first_page = first_page.min(page.saturating_sub(1).max(1));
         changed.insert(new.id);
@@ -148,7 +153,7 @@ fn plan(s: &Shared, snapshot: &[SnapshotSpan]) -> Option<Plan> {
             if layout.unit(new.id).is_some_and(|u| u.rows() > 0) {
                 1
             } else {
-                *count
+                count
             },
         );
     }
@@ -199,11 +204,16 @@ pub(super) struct PreviewRun<'a> {
     invalid: bool,
     checked_revision: Revision,
     completed: BTreeSet<ParaId>,
+    ready: bool,
+    buffered: Vec<PageCapture>,
 }
 
 impl<'a> PreviewRun<'a> {
     pub fn new(s: &'a Shared, spans: &'a [SnapshotSpan], revision: Revision) -> Option<Self> {
-        let plan = plan(s, spans)?;
+        let candidate = plan(s, spans, false)?;
+        let ready = plan(s, spans, true);
+        let active = ready.is_some();
+        let plan = ready.unwrap_or(candidate);
         Some(Self {
             s,
             spans,
@@ -215,6 +225,8 @@ impl<'a> PreviewRun<'a> {
             invalid: false,
             checked_revision: revision,
             completed: BTreeSet::new(),
+            ready: active,
+            buffered: Vec::new(),
         })
     }
 
@@ -241,6 +253,39 @@ impl<'a> PreviewRun<'a> {
         if self.invalid || self.s.bg_paused.load(Ordering::SeqCst) {
             return true;
         }
+        // A cold borrowed context may finish after the brief background debounce.
+        // Capture progress immediately, but publish nothing until this exact source is
+        // validated. If newer validated text arrives first, yield the obsolete snapshot.
+        if !self.ready {
+            if let Some(active) = plan(self.s, self.spans, true) {
+                self.plan = active;
+                self.ready = true;
+                for page in std::mem::take(&mut self.buffered) {
+                    if !self.update(PreviewUpdate::Page(Box::new(page)), fragments) {
+                        return false;
+                    }
+                }
+            } else {
+                if self.s.source_revision.load(Ordering::SeqCst) > self.revision {
+                    let (_, latest, _) = snapshot(self.s);
+                    if plan(self.s, &latest, true).is_some_and(|p| !p.changed.is_empty()) {
+                        self.stop.set(true);
+                        return false;
+                    }
+                }
+                if let PreviewUpdate::Page(page) = update {
+                    if page.dl.page.unwrap_or(0) >= self.plan.first_page {
+                        if self.buffered.len() >= 8 {
+                            self.buffered.clear();
+                            self.invalid = true;
+                        } else {
+                            self.buffered.push(*page);
+                        }
+                    }
+                }
+                return true;
+            }
+        }
         if matches!(update, PreviewUpdate::Tick) {
             let current = self.s.source_revision.load(Ordering::SeqCst);
             if self.plan.changed.is_empty()
@@ -250,11 +295,11 @@ impl<'a> PreviewRun<'a> {
                     .preview_validated
                     .lock()
                     .values()
-                    .any(|(r, _, _)| *r >= current)
+                    .any(|(r, _, _, _)| *r >= current)
             {
                 let (_, spans, _) = snapshot(self.s);
                 self.checked_revision = current;
-                if plan(self.s, &spans).is_some_and(|p| !p.changed.is_empty()) {
+                if plan(self.s, &spans, true).is_some_and(|p| !p.changed.is_empty()) {
                     self.stop.set(true);
                     return false;
                 }
@@ -270,7 +315,7 @@ impl<'a> PreviewRun<'a> {
             // reflow edit. It has no new page to show, so it may yield before its first page.
             if current > self.revision {
                 let (_, spans, _) = snapshot(self.s);
-                if plan(self.s, &spans).is_some_and(|p| !p.changed.is_empty()) {
+                if plan(self.s, &spans, true).is_some_and(|p| !p.changed.is_empty()) {
                     self.stop.set(true);
                     return false;
                 }

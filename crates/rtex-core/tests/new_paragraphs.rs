@@ -23,7 +23,7 @@ fn new_paragraphs_preview_before_the_suffix_and_match_a_clean_pdf() {
     let root = std::env::temp_dir().join(format!("rtex-new-paragraph-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let text = "\\documentclass{article}\n\\usepackage[paperwidth=240pt,paperheight=320pt,margin=20pt]{geometry}\n\\pdfvariable suppressoptionalinfo 767\n\\begin{document}\nAnchor words.\n\nFollowing text and a later page.\n\n\\newpage\n\\directlua{local t=os.clock()+1; while os.clock()<t do end}\nSlow suffix.\n\\end{document}\n";
+    let text = "\\documentclass{article}\n\\usepackage[paperwidth=240pt,paperheight=320pt,margin=20pt]{geometry}\n\\pdfvariable suppressoptionalinfo 767\n\\AddToHook{para/begin}{\\directlua{if rtex_serve then local t=os.clock()+0.15; while os.clock()<t do end end}}\n\\begin{document}\nAnchor words.\n\nFollowing text and a later page.\n\n\\newpage\n\\directlua{local t=os.clock()+1; while os.clock()<t do end}\nSlow suffix.\n\\end{document}\n";
     std::fs::write(root.join("main.tex"), text).unwrap();
     let mut cfg = SessionConfig::new(&root, "main.tex");
     cfg.build_dir = root.join("build");
