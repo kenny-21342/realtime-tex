@@ -2,10 +2,15 @@
 use rtex_core::{Convergence, Edit, Event, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
-fn settled(s: &Session) -> (u64, i64) {
+fn settled(s: &Session, minimum_revision: u64) -> (u64, i64) {
     let end = Instant::now() + Duration::from_secs(120);
     loop {
-        assert!(Instant::now() < end, "no settled layout");
+        assert!(
+            Instant::now() < end,
+            "no settled layout: {:?}, {:?}",
+            s.convergence(),
+            s.versions()
+        );
         for e in s.poll(Duration::from_millis(100)) {
             if let Event::LayoutUpdate {
                 convergence: Convergence::Converged,
@@ -14,7 +19,9 @@ fn settled(s: &Session) -> (u64, i64) {
                 ..
             } = e
             {
-                return (versions.source_revision, pages_total);
+                if versions.source_revision >= minimum_revision {
+                    return (versions.source_revision, pages_total);
+                }
             }
         }
     }
@@ -49,11 +56,10 @@ fn continuous_reflow(name: &str, paragraph: &str, live: bool) {
     cfg.debounce = Duration::from_millis(200);
     cfg.fast_budget = Duration::from_secs(5);
     let s = Session::open(cfg).unwrap();
-    settled(&s);
+    settled(&s, 0);
     let initial = s.versions().layout_version;
     let mut page_progress = false;
     let mut reflow = false;
-    let mut last_settled = None;
     for _ in 0..60 {
         let doc = s.document_text("main.tex").unwrap();
         let at = doc.find("Anchor").unwrap() + "Anchor".len();
@@ -78,16 +84,8 @@ fn continuous_reflow(name: &str, paragraph: &str, live: bool) {
                         pagination_stale: true,
                         ..
                     } => reflow = true,
-                    Event::LayoutUpdate {
-                        versions,
-                        convergence,
-                        pages_total,
-                        ..
-                    } if versions.layout_version > initial => {
+                    Event::LayoutUpdate { versions, .. } if versions.layout_version > initial => {
                         page_progress = true;
-                        if convergence == Convergence::Converged {
-                            last_settled = Some((versions.source_revision, pages_total));
-                        }
                     }
                     _ => {}
                 }
@@ -101,10 +99,10 @@ fn continuous_reflow(name: &str, paragraph: &str, live: bool) {
         page_progress,
         "a full-page update must arrive during continuous typing"
     );
-    // A fast final pass may already have arrived during the last polling interval.
-    let (revision, pages) = last_settled
-        .filter(|(revision, _)| *revision == s.versions().source_revision)
-        .unwrap_or_else(|| settled(&s));
+    // The final word can fit without reflow after an earlier pass already settled. It then
+    // needs only a live overlay, so request a final layout explicitly for the PDF oracle.
+    s.request_layout();
+    let (revision, pages) = settled(&s, s.versions().source_revision);
     assert_eq!(
         revision,
         s.versions().source_revision,
