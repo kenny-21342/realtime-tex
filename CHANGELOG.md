@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.9 (2026-10-13)
+
 - New plain-text paragraphs and paragraph splits can use live-validated page previews without
   waiting for a full document pass. Shifted source line ranges no longer disable progress.
   Live boxes for new paragraphs that outgrow their guessed page position are retained with
