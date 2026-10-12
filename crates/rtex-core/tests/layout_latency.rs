@@ -87,6 +87,23 @@ fn continuous_reflow(name: &str, paragraph: &str, live: bool) {
                     Event::LayoutUpdate { versions, .. } if versions.layout_version > initial => {
                         page_progress = true;
                     }
+                    Event::PagePreview {
+                        source_revision,
+                        page,
+                        placements,
+                        ..
+                    } if source_revision > 1 && page.dl.lines.len() > 1 => {
+                        assert!(live, "structural body edits must retain full layouts");
+                        assert!(
+                            page.exact || page.native.is_some(),
+                            "preview must draw a complete page"
+                        );
+                        assert!(
+                            !placements.is_empty(),
+                            "page progress needs source placements"
+                        );
+                        page_progress = true;
+                    }
                     _ => {}
                 }
             }
