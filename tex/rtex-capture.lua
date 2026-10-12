@@ -650,18 +650,24 @@ function C.shipout(b)
     local pf = assert(io.open(dir .. "/" .. C.jobname .. ".rtex-preview-page" .. C.page .. ".json", "w"))
     pf:write(json.encode(page))
     pf:close()
-    local units = {}
+    local units, complete, closed = {}, {}, {}
     for _, u in ipairs(C.units) do
       local last = u.end_line or u.begin_line
+      local rows = 0
       for _, seq in ipairs(u.seqs) do
         local p = C.paras[seq]
         if p and p.file == u.file then last = math.max(last, p.end_line or last) end
+        if p then rows = rows + (p.lines or 0) end
       end
+      -- A paragraph may span several pages. Yield only after its final rows ship,
+      -- otherwise typing near its end would repeatedly cancel before that page arrives.
+      if u.end_line then closed[#closed + 1] = u.uid end
+      if u.end_line and rows > 0 and #u.placements >= rows then complete[#complete + 1] = u.uid end
       units[#units + 1] = { uid = u.uid, kind = u.kind, nest = u.nest, file = u.file,
                             begin_line = u.begin_line, end_line = last, rows = #u.placements }
     end
     local f = assert(io.open(dir .. "/" .. C.jobname .. ".rtex-preview.jsonl", "a"))
-    f:write(json.encode({ page = C.page, units = units }), "\n")
+    f:write(json.encode({ page = C.page, units = units, complete = complete, closed = closed }), "\n")
     f:close()
   end
 end

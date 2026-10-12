@@ -77,6 +77,9 @@ fi
 export PATH="$(if [ "$WINDOWS" = 1 ]; then cygpath -u "$BIN"; else echo "$BIN"; fi):$PATH"
 echo "==> Installing packages"
 "$TLMGR" option repository "$TL_REPO" >/dev/null
+# Cached installations can outlive the manager version required by the live mirror.
+# Refresh infrastructure first; otherwise package installation exits before any tests run.
+"$TLMGR" update --self
 "$TLMGR" install "${PACKAGES[@]}"
 
 echo "==> Building formats and font database"

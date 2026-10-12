@@ -988,14 +988,25 @@ pub(super) fn handle_result(
         && s.layout
             .lock()
             .unit(req.par_id)
-            .is_some_and(|u| u.advanced() == cr.counters)
+            .map(|u| u.advanced() == cr.counters)
+            .unwrap_or_else(|| req.seq < 0 && cr.counters.is_empty())
     {
-        s.preview_validated
-            .lock()
-            .insert(req.par_id, (req.versions.source_revision, wanted_gen));
+        let mut records = s.preview_validated.lock();
+        let history = records.entry(req.par_id).or_default();
+        // Keep exact validated snapshots while later keystrokes arrive. Replacing the
+        // only record would repeatedly invalidate a background snapshot during typing.
+        history.push_back((
+            req.versions.source_revision,
+            wanted_gen,
+            dl.lines.len() as i64,
+            crate::document::hash_str(&req.source),
+        ));
+        while history.len() > 64 {
+            history.pop_front();
+        }
     }
     let rows: Vec<(i64, i64)> = dl.lines.iter().map(|l| (l.x, l.y)).collect();
-    let (fragments, mut stale) = {
+    let (mut fragments, mut stale) = {
         let layout = s.layout.lock();
         match layout.fragments(req.par_id, &rows) {
             Some(x) => x,
@@ -1028,17 +1039,24 @@ pub(super) fn handle_result(
             }
         }
     };
-    // a placement that lands off its page is a bad guess (a borrowed anchor on another page,
-    // a unit grown past the page bottom, rows extrapolated above the top): drop it so the unit
-    // waits for the pass instead of drawing its rows, pictures and all, at the page edge or
-    // past it (two graphs, a plot pinned to the page top)
-    if !fragments.is_empty() && !s.layout.lock().fragments_on_page(&fragments) {
+    // A newly typed paragraph has no committed rows to erase. Retain its live box
+    // when its guessed position runs off-page, so hosts can re-anchor it as soon as
+    // a shipped page supplies real placements. Existing units still keep their old
+    // drawing rather than accepting an invalid placement.
+    let (fresh, on_page) = {
+        let layout = s.layout.lock();
+        (
+            layout.unit(req.par_id).is_none_or(|u| u.rows() == 0),
+            layout.fragments_on_page(&fragments),
+        )
+    };
+    let pending_placement = fresh && (!on_page || fragments.is_empty());
+    if pending_placement {
+        fragments.clear();
+    } else if !fragments.is_empty() && !on_page {
         demote_span(s, &req, "the placement would fall off its page");
         return;
-    }
-    // a box the host cannot place (no placement for the unit, no neighbour to place it
-    // against) is not a live result: the unit waits for the pass
-    if fragments.is_empty() && !dl.lines.is_empty() {
+    } else if fragments.is_empty() && !dl.lines.is_empty() {
         demote_span(s, &req, "no placement for the unit's rows");
         return;
     }
@@ -1073,6 +1091,9 @@ pub(super) fn handle_result(
         stale = true;
     }
     let mut reasons: Vec<String> = dl.flags_map().keys().cloned().collect();
+    if pending_placement {
+        reasons.push("placement pending".into());
+    }
     if dl.inserts > 0 {
         // footnote/margin text is placed by the page builder: refreshed by the next layout
         reasons.push("inserts".into());
