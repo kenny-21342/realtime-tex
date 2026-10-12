@@ -75,7 +75,10 @@ impl Session {
             });
         let cache_vouched = pictures_only && pics_n > 0 && pics_cached == pics_n;
         let mut pics_required = false;
-        match layout.unit(span.id) {
+        match layout
+            .unit(span.id)
+            .filter(|u| !(shape == UnitShape::Par && u.kind() == "par" && u.rows() == 0))
+        {
             Some(eu) => {
                 if needs_probe {
                     let verdict = self

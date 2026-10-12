@@ -11,9 +11,17 @@ struct Plan {
     base: u64,
     changed: BTreeSet<ParaId>,
     first_page: i64,
+    rows: BTreeMap<ParaId, i64>,
+    following: BTreeSet<ParaId>,
 }
 
-fn plain_change(old: &str, new: &str) -> bool {
+fn commands(s: &str) -> Vec<String> {
+    static CS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\\(?:[A-Za-z@]+|.)").unwrap());
+    CS.find_iter(s).map(|m| m.as_str().to_string()).collect()
+}
+
+fn plain_file_change(old: &str, new: &str) -> bool {
     let a: Vec<char> = old.chars().collect();
     let b: Vec<char> = new.chars().collect();
     let first = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
@@ -23,28 +31,25 @@ fn plain_change(old: &str, new: &str) -> bool {
         .zip(b[first..].iter().rev())
         .take_while(|(a, b)| a == b)
         .count();
-    let plain = |c: &char| !c.is_control() && !"\\{}$%#&_~^".contains(*c);
-    if !a[first..a.len() - last].iter().all(plain) || !b[first..b.len() - last].iter().all(plain) {
-        return false;
-    }
-    // Changing the letters of a control sequence is not a text edit, even if the diff
-    // itself contains no backslash. Conditional/stateful sources are excluded too.
-    static CS: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"\\(?:[A-Za-z@]+|.)").unwrap());
-    let commands = |s: &str| {
-        CS.find_iter(s)
-            .map(|m| m.as_str().to_string())
-            .collect::<Vec<_>>()
-    };
-    let ac = commands(old);
-    ac == commands(new)
-        && !ac.iter().any(|c| {
-            c.starts_with("\\if")
-                || matches!(
-                    c.as_str(),
-                    "\\csname" | "\\def" | "\\let" | "\\includegraphics"
-                )
-        })
+    let plain = |c: &char| (c.is_whitespace() || !c.is_control()) && !"\\{}$%#&_~^".contains(*c);
+    a[first..a.len() - last].iter().all(plain)
+        && b[first..b.len() - last].iter().all(plain)
+        && commands(old) == commands(new)
+}
+
+fn local_commands(text: &str) -> bool {
+    !commands(text).iter().any(|c| {
+        c.starts_with("\\if")
+            || matches!(
+                c.as_str(),
+                "\\csname" | "\\def" | "\\let" | "\\includegraphics"
+            )
+    })
+}
+
+#[cfg(test)]
+fn plain_change(old: &str, new: &str) -> bool {
+    plain_file_change(old, new) && local_commands(old) && local_commands(new)
 }
 
 fn plan(s: &Shared, snapshot: &[SnapshotSpan]) -> Option<Plan> {
@@ -52,47 +57,124 @@ fn plan(s: &Shared, snapshot: &[SnapshotSpan]) -> Option<Plan> {
         return None;
     }
     let layout = s.layout.lock();
-    if layout.snapshot_spans.len() != snapshot.len() {
+    // Compare source within each file, rather than zipping span lists: a new paragraph
+    // introduces an id and moves the line ranges of every following span. Joining with
+    // paragraph separators preserves the command vocabulary and admits text-only splits.
+    let by_file = |spans: &[SnapshotSpan]| {
+        let mut files: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for span in spans {
+            files
+                .entry(span.file.clone())
+                .or_default()
+                .push(span.text.clone());
+        }
+        files
+            .into_iter()
+            .map(|(file, text)| (file, text.join("\n\n")))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let old_files = by_file(&layout.snapshot_spans);
+    let new_files = by_file(snapshot);
+    if old_files.len() != new_files.len()
+        || old_files.iter().any(|(file, old)| {
+            new_files
+                .get(file)
+                .is_none_or(|new| !plain_file_change(old, new))
+        })
+    {
+        return None;
+    }
+    // Removed units, preamble/setup changes and changed structural units still need an
+    // ordinary layout. The retained ids are also the anchors for the new plain paragraphs.
+    let ids = snapshot
+        .iter()
+        .map(|new| (new.id, new.file.as_str()))
+        .collect::<HashMap<_, _>>();
+    if layout
+        .snapshot_spans
+        .iter()
+        .any(|old| ids.get(&old.id).is_none_or(|f| *f != old.file))
+    {
         return None;
     }
     let policy = s.policy.lock();
     let validated = s.preview_validated.lock();
+    let live = s.live.lock();
     let generation = s.engine_generation.load(Ordering::SeqCst);
     let mut changed = BTreeSet::new();
+    let mut rows = BTreeMap::new();
+    let mut additions = false;
     let mut first_page = i64::MAX;
-    for (old, new) in layout.snapshot_spans.iter().zip(snapshot) {
-        if old.id != new.id
-            || old.file != new.file
-            || old.first_line != new.first_line
-            || old.last_line != new.last_line
-        {
-            return None;
-        }
-        if old.text == new.text {
+    for new in snapshot {
+        let old = layout.snapshot_span(new.id);
+        additions |= old.is_none() || layout.unit(new.id).is_none_or(|u| u.rows() == 0);
+        if old.is_some_and(|old| old.file == new.file && old.text == new.text) {
             continue;
         }
-        if new.background_only || !plain_change(&old.text, &new.text) {
-            return None;
-        }
-        let unit = layout.unit(new.id)?;
-        if unit.kind() != "par"
-            || !unit.advanced().is_empty()
-            || !classify_source_with(&new.text, &policy, false).1.is_empty()
+        let (shape, reasons) = classify_source_with(&new.text, &policy, false);
+        if new.background_only
+            || shape != UnitShape::Par
+            || !reasons.is_empty()
+            || !local_commands(&new.text)
+            || old.is_some_and(|o| o.background_only || !local_commands(&o.text))
         {
             return None;
         }
-        let (revision, gen) = validated.get(&new.id)?;
+        let unit = if let Some(unit) = layout.unit(new.id).filter(|u| u.rows() > 0) {
+            if unit.kind() != "par" || !unit.advanced().is_empty() {
+                return None;
+            }
+            unit
+        } else {
+            let (parent, _, _) = live.get(new.id)?.derived?;
+            let unit = layout.unit(parent)?;
+            if unit.kind() != "par" {
+                return None;
+            }
+            unit
+        };
+        let (revision, gen, count) = validated.get(&new.id)?;
         if *revision < new.last_revision || *gen != generation {
             return None;
         }
         let page = unit.captured.placements.iter().map(|p| p.page).min()?;
         first_page = first_page.min(page.saturating_sub(1).max(1));
         changed.insert(new.id);
+        rows.insert(new.id, *count);
+    }
+    // A new paragraph can push the following drawing onto another page. Keep the
+    // run until that next unchanged unit is visible too, rather than dropping the
+    // picture between two provisional pages while typing continuously.
+    let mut following = BTreeSet::new();
+    for (i, span) in snapshot
+        .iter()
+        .enumerate()
+        .filter(|(_, sp)| additions && changed.contains(&sp.id))
+    {
+        if let Some(unit) = snapshot[i + 1..]
+            .iter()
+            .take_while(|sp| sp.file == span.file)
+            .filter(|sp| !changed.contains(&sp.id))
+            .filter_map(|sp| layout.unit(sp.id).map(|u| (sp, u)))
+            .find(|(sp, u)| {
+                u.rows() > 0
+                    && (!sp.background_only
+                        || u.kind() == "heading"
+                        || (u.kind() == "env"
+                            && u.name()
+                                .is_some_and(|n| crate::eligibility::FLOAT_ENVS.contains(&n))))
+            })
+        {
+            following.insert(unit.0.id);
+            rows.entry(unit.0.id).or_insert(unit.1.rows());
+        }
     }
     Some(Plan {
         base: layout.layout_version,
         changed,
         first_page,
+        rows,
+        following,
     })
 }
 
@@ -106,6 +188,7 @@ pub(super) struct PreviewRun<'a> {
     pub affected_sent: Rc<Cell<bool>>,
     invalid: bool,
     checked_revision: Revision,
+    completed: BTreeSet<ParaId>,
 }
 
 impl<'a> PreviewRun<'a> {
@@ -121,6 +204,7 @@ impl<'a> PreviewRun<'a> {
             affected_sent: Rc::new(Cell::new(false)),
             invalid: false,
             checked_revision: revision,
+            completed: BTreeSet::new(),
         })
     }
 
@@ -156,7 +240,7 @@ impl<'a> PreviewRun<'a> {
                     .preview_validated
                     .lock()
                     .values()
-                    .any(|(r, _)| *r >= current)
+                    .any(|(r, _, _)| *r >= current)
             {
                 let (_, spans, _) = snapshot(self.s);
                 self.checked_revision = current;
@@ -194,10 +278,27 @@ impl<'a> PreviewRun<'a> {
             return true;
         }
         let placements = page_placements(&cap, self.spans);
-        let affected = placements
-            .iter()
-            .any(|p| self.plan.changed.contains(&p.par_id));
-        if affected {
+        for id in self.plan.rows.keys() {
+            let units = cap
+                .units
+                .iter()
+                .filter(|u| crate::layout::span_for_unit(u, self.spans) == Some(*id))
+                .collect::<Vec<_>>();
+            if !units.is_empty()
+                && units.iter().all(|u| {
+                    if self.plan.following.contains(id) {
+                        cap.closed.contains(&u.uid)
+                    } else {
+                        cap.complete.contains(&u.uid)
+                    }
+                })
+                && units.iter().map(|u| u.rows).sum::<i64>() >= self.plan.rows[id]
+            {
+                self.completed.insert(*id);
+            }
+        }
+        let visible = self.plan.rows.keys().all(|id| self.completed.contains(id));
+        if visible {
             self.affected_sent.set(true);
         }
         let page = PageUpdate {
@@ -223,7 +324,7 @@ impl<'a> PreviewRun<'a> {
                 placements,
             })
             .ok();
-        if affected && current > self.revision {
+        if visible && current > self.revision {
             self.stop.set(true);
             return false;
         }
@@ -292,7 +393,7 @@ mod tests {
         assert!(plain_change("\\textbf{word}", "\\textbf{words}"));
         assert!(!plain_change("\\textbf{word}", "\\textit{word}"));
         assert!(!plain_change("word", "word\\par"));
-        assert!(!plain_change("word", "word\n\nnew"));
+        assert!(plain_change("word", "word\n\nnew"));
         assert!(!plain_change("\\ifnum1>0 word\\fi", "\\ifnum2>0 word\\fi"));
     }
 }

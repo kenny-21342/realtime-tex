@@ -114,7 +114,7 @@ Events arrive in order on one queue. Every event that comes from the engine or a
 | `status` | `ok` draw it. `ok_degraded` draw it, but something in it could not be represented: see `reasons`, and expect a pass. `error` TeX reported an error: show `diagnostics`, don't trust the display list. `removed` the span no longer exists (merged or deleted): clear it. |
 | `dl` | the unit's display list: rows of glyphs, rules and images, relative to the unit's box. |
 | `native` | optional native picture drawing in `dl` coordinates, including rotated glyph transforms. Draw each row with its indexed operations, translating the base matrix by `fragments` minus the row's `(x, y)`. If the list has literals and `native` is absent, retain the unit's previous drawing until the full compile; do not replace it with labels alone. |
-| `fragments` | where to draw it: one entry per page the unit spans, with the page number, the rows it holds (`first_line..last_line`) and each row's `x` and `baseline` on that page. |
+| `fragments` | may be empty for a new unit whose guessed position is off-page (`reasons` includes `placement pending`). Retain the live box for re-anchoring when `PagePreview` or a layout supplies its placements; do not draw it off-page. Otherwise, where to draw it: one entry per page the unit spans, with the page number, the rows it holds (`first_line..last_line`) and each row's `x` and `baseline` on that page. |
 | `pagination_stale` | the unit's height or row count changed, so the material after it is out of place until the next layout, which is already scheduled. |
 | `context_stale` | something before the unit changed since the last pass (or the unit borrowed a neighbour's context). The result is the best available; the next layout confirms it. |
 | `fragments[].approximate` | the rows had no position in the last layout (a new paragraph, an extra line), so the position was estimated. |
@@ -146,7 +146,11 @@ contains it. Keep the newer ones and move them to the new `placements`.
 
 These additive events do not advance the authoritative layout version or imply convergence.
 They are enabled for warm runs over validated plain-text paragraph edits, with an error-free
-base layout and no held pictures. Structural/stateful edits use ordinary full layouts.
+base layout and no held pictures. Validated new plain-text paragraphs, splits and shifted source
+line ranges are accepted too; new units borrow a neighbouring context. Structural/stateful edits
+and removed units use ordinary full layouts. A superseded run delivers the changed units' complete
+rows and the next unchanged unit before yielding, so a following drawing is not lost when it moves
+to another page.
 
 | Field (`PagePreview`) | Meaning |
 |---|---|

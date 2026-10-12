@@ -52,6 +52,11 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
     families. Never treat previews as converged or borrow old PDF pixels for them. Error
     status is read at shipout (do not install `show_error_hook`, which loses source locations).
     `tests/page_previews.rs` checks early delivery, supersession, clean PDF equality and rollback.
+    New paragraphs and text-only splits are supported by id/file matching instead of zipped
+    span lists. New off-page live boxes carry empty placements until preview re-anchoring; never
+    paint the guessed off-page position. The capture's private complete/closed unit records plus
+    live row counts keep all changed rows and the following drawing visible before cancellation.
+    `tests/new_paragraphs.rs` covers early progress, overflow, drawing retention and clean PDFs.
     A late-page edit still waits for its prefix; no claim of constant-time whole-document layout.
 
 ## Running in a Claude Code cloud session

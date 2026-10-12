@@ -11,11 +11,17 @@ struct Record {
     units: Vec<CapturedUnit>,
     #[serde(default)]
     invalid: bool,
+    #[serde(default)]
+    complete: Vec<i64>,
+    #[serde(default)]
+    closed: Vec<i64>,
 }
 
 pub(crate) struct PageCapture {
     pub dl: DisplayList,
     pub units: Vec<CapturedUnit>,
+    pub complete: Vec<i64>,
+    pub closed: Vec<i64>,
 }
 
 pub(crate) enum PreviewUpdate {
@@ -80,6 +86,8 @@ impl PagePreviewReader {
                 Ok(PreviewUpdate::Page(Box::new(PageCapture {
                     dl,
                     units: record.units,
+                    complete: record.complete,
+                    closed: record.closed,
                 })))
             })();
             match update {

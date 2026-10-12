@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- New plain-text paragraphs and paragraph splits can use live-validated page previews without
+  waiting for a full document pass. Shifted source line ranges no longer disable progress.
+  Live boxes for new paragraphs that outgrow their guessed page position are retained with
+  empty placements until a page supplies their real positions. Superseded runs deliver all
+  changed rows and the next unchanged unit before yielding, keeping following drawings visible.
+  Preamble/structural changes and removed units continue through ordinary full layouts.
+
 ## 0.0.8 (2026-10-12)
 
 - **Preview rebuilt pages before the document finishes.** A warm background run can publish
