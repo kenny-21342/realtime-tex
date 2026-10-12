@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Preview rebuilt pages before the document finishes.** A warm background run can publish
+  `PagePreview` as each affected page ships for validated plain-text paragraph edits. Hosts
+  can display complete exact/native pages and their new placements while the suffix is still
+  compiling. A superseded run yields after showing the affected page; its partial auxiliary
+  files never seed the next run. Errors reset provisional pages. The completed layout and
+  export retain the usual convergence and fidelity checks. Late pages still wait for TeX to
+  process the preceding document; tables, floats, structural edits and unsupported drawing
+  continue through full layouts.
+
+- **Page updates while typing continuously.** Body reflow briefly coalesces edits (25 ms quiet
+  time, capped at 100 ms) and starts full layouts at most once per debounce interval (300 ms by
+  default), including when a paragraph gains or loses lines and moves later text onto another
+  page. A pass that took longer than the interval catches up immediately when its sources are
+  stale. Preamble requests retain their usual debounce, capped at three intervals. A superseded
+  run delivers its completed capture as `Stale` and skips further auxiliary tools and convergence
+  passes for that snapshot.
+  Once typing pauses, the latest text still gets the usual clean convergence checks. Exports
+  and held-picture runs continue to finish normally.
+
 ## 0.0.7 (2026-10-11)
 
 - **Draw pictures in live label edits.** The live server shares capture's readable pgf/pict2e

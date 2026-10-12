@@ -1,7 +1,7 @@
 //! The public session API: documents, edits, fast-path compiles, background layouts, events.
 
 use crate::background::{
-    run_pass_with, run_pass_with_runner, snapshot_dir, write_snapshot, BibTool, WarmEngine,
+    run_pass_with, run_pass_with_runner_until, snapshot_dir, write_snapshot, BibTool, WarmEngine,
 };
 use crate::document::{Edit, EditOutcome, FileBuf, IdAllocator, ParaId, Revision, Span, SpanKind};
 use crate::eligibility::{
@@ -27,6 +27,7 @@ mod engine_loop;
 mod hold;
 mod live;
 mod passes;
+mod preview;
 mod route;
 
 pub use diag::parse_log;
@@ -236,6 +237,19 @@ pub struct ParagraphPlacement {
 // and boxing the field would change the public type hosts match on for no measurable gain
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
+    /// Provisional pages built during a safe text-reflow pass. They do not replace the
+    /// authoritative layout or its engine contexts; clients may ignore these events.
+    PagePreview {
+        run_id: u64,
+        base_layout_version: u64,
+        source_revision: Revision,
+        page: PageUpdate,
+        placements: Vec<ParagraphPlacement>,
+    },
+    PagePreviewReset {
+        run_id: u64,
+        base_layout_version: u64,
+    },
     ParagraphUpdate {
         par_id: ParaId,
         edit_id: u64,
@@ -369,6 +383,10 @@ struct Shared {
     source_revision: AtomicU64,
     /// The longest a background lualatex run that finished took (ms; `pass_timeout`).
     slowest_pass_ms: AtomicU64,
+    preview_run: AtomicU64,
+    preview_base_ok: AtomicBool,
+    /// Successful live results validating a span's latest source under this generation.
+    preview_validated: Mutex<HashMap<ParaId, (Revision, u64)>>,
     preamble_revision: AtomicU64,
     /// Per file: last revision at which a background-only span or the preamble changed.
     bg_change: Mutex<HashMap<String, Vec<(Revision, i64)>>>, // (revision, first line of the changed span)
@@ -418,8 +436,15 @@ struct Shared {
     hold: Mutex<hold::HoldState>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BackgroundPriority {
+    Debounced,
+    Reflow,
+    CatchUp,
+}
+
 enum BgCmd {
-    Pass,
+    Pass(BackgroundPriority),
     Export(u64, PathBuf),
     Quit,
 }
@@ -487,6 +512,9 @@ impl Session {
             ids: Mutex::new(ids),
             source_revision: AtomicU64::new(1),
             slowest_pass_ms: AtomicU64::new(0),
+            preview_run: AtomicU64::new(0),
+            preview_base_ok: AtomicBool::new(false),
+            preview_validated: Mutex::new(HashMap::new()),
             preamble_revision: AtomicU64::new(1),
             bg_change: Mutex::new(HashMap::new()),
             layout: Mutex::new(LayoutStore::default()),
@@ -533,7 +561,11 @@ impl Session {
                     .spawn(move || background_thread(s))?,
             );
         }
-        shared.bg_signal.0.send(BgCmd::Pass).ok();
+        shared
+            .bg_signal
+            .0
+            .send(BgCmd::Pass(BackgroundPriority::CatchUp))
+            .ok();
         shared.pending_signal.0.send(()).ok(); // eager server start
         Ok(Session {
             shared,
@@ -642,6 +674,7 @@ impl Session {
             .map(|f| f.text.len())
             .unwrap_or(0);
         if len == 0 && !self.shared.files.lock().contains_key(rel_path) {
+            let mut files = self.shared.files.lock();
             let rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
             let fb = FileBuf::with_block_envs(
                 text,
@@ -655,8 +688,9 @@ impl Session {
                     .cloned()
                     .collect(),
             );
-            self.shared.files.lock().insert(rel_path.to_string(), fb);
-            self.schedule_background();
+            files.insert(rel_path.to_string(), fb);
+            drop(files);
+            self.schedule_background(BackgroundPriority::Debounced);
             let edit_id = self.shared.edit_counter.fetch_add(1, Ordering::SeqCst) + 1;
             return Ok(EditResult {
                 edit_id,
@@ -682,7 +716,7 @@ impl Session {
         let rel_path = key.as_str();
         let t_start = Instant::now();
         let edit_id = self.shared.edit_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let rev;
         let is_setup = |text: &str| {
             crate::eligibility::setup_statements(&crate::eligibility::strip_comments(text))
                 .is_some()
@@ -692,6 +726,9 @@ impl Session {
             let fb = files
                 .get_mut(rel_path)
                 .ok_or_else(|| anyhow!("unknown file {rel_path}"))?;
+            // A snapshot takes this same lock: its revision must describe the buffers it
+            // actually copies, rather than an edit still waiting to acquire the lock.
+            rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
             // a setup span (definitions, lengths after \begin{document}) before or after the
             // edit: the server's preamble changes
             let was_setup = fb.spans.iter().any(|sp| {
@@ -751,7 +788,7 @@ impl Session {
             self.shared.engine_generation.fetch_add(1, Ordering::SeqCst);
             self.shared.pending.lock().clear();
             self.shared.pending_signal.0.send(()).ok();
-            self.schedule_background();
+            self.schedule_background(BackgroundPriority::Debounced);
             return Ok(EditResult {
                 edit_id,
                 source_revision: rev,
@@ -852,7 +889,7 @@ impl Session {
         let Some((primary_id, primary_live, primary_reasons)) = primary else {
             // nothing routable (e.g. everything deleted): background only
             self.note_bg_change(rel_path, rev, &outcome);
-            self.schedule_background();
+            self.schedule_background(BackgroundPriority::Reflow);
             self.shared
                 .events
                 .send(Event::BackgroundScheduled {
@@ -877,7 +914,7 @@ impl Session {
         // the fast path could not take
         if any_background || !outcome.added.is_empty() || !outcome.removed.is_empty() {
             self.note_bg_change(rel_path, rev, &outcome);
-            self.schedule_background();
+            self.schedule_background(BackgroundPriority::Reflow);
         }
         let host_us = [
             t_seg.as_micros() as u64,
@@ -968,7 +1005,7 @@ impl Session {
     }
 
     pub fn request_layout(&self) {
-        self.schedule_background();
+        self.schedule_background(BackgroundPriority::CatchUp);
     }
 
     /// Defer background passes (they run when resumed). The fast path keeps working.
@@ -980,15 +1017,19 @@ impl Session {
                 .bg_pending_while_paused
                 .swap(false, Ordering::SeqCst)
         {
-            self.shared.bg_signal.0.send(BgCmd::Pass).ok();
+            self.shared
+                .bg_signal
+                .0
+                .send(BgCmd::Pass(BackgroundPriority::CatchUp))
+                .ok();
         }
     }
 
-    fn schedule_background(&self) {
+    fn schedule_background(&self, priority: BackgroundPriority) {
         *self.shared.convergence.lock() = Some(Convergence::Stale {
             pending_since: self.shared.source_revision.load(Ordering::SeqCst),
         });
-        self.shared.bg_signal.0.send(BgCmd::Pass).ok();
+        self.shared.bg_signal.0.send(BgCmd::Pass(priority)).ok();
     }
 
     /// Load from disk every file the tracked files now `\input` that is not tracked yet.

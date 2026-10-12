@@ -260,10 +260,15 @@ fn make_event(e: Event) -> RtexEvent {
         Event::EngineState { .. } => (4, vec![]),
         Event::BackgroundScheduled { .. } => (5, vec![]),
         Event::PdfExported { .. } => (6, vec![]),
+        Event::PagePreview { page, .. } => (7, vec![page.dl.to_binary()]),
+        Event::PagePreviewReset { .. } => (8, vec![]),
     };
     // JSON without the display-list payloads (replaced by their byte sizes)
     let mut v = serde_json::to_value(&e).unwrap();
     if let Some(obj) = v.as_object_mut() {
+        if matches!(e, Event::PagePreview { .. }) {
+            obj["page"]["dl"] = serde_json::json!({"bytes": dls[0].len()});
+        }
         if let Some(dl) = obj.get_mut("dl") {
             *dl = serde_json::json!({"bytes": dls.first().map(|b| b.len()).unwrap_or(0)});
         }

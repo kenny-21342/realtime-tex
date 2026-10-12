@@ -39,6 +39,20 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
 5. Session: pass timeout (`pass_timeout_ms`), relative fast-path budget (`fast_budget_factor` on top of
    upstream's 50 ms floor), warm start of the background build, diagnostics for fatal passes, page `rotate`
    and `color_base` in the display list.
+9. Layout latency: body reflow coalesces for 25 ms (100 ms cap), with starts spaced by the
+   configured debounce interval; stale passes catch up as soon as that interval has elapsed.
+   Preamble requests retain the quiet debounce with a three-interval cap. Superseded runs skip
+   further convergence work after a completed capture (`Stale`). Held
+   pictures and exports still finish normally. `tests/layout_latency.rs` checks paragraph reflow
+   makes page progress while typing and the settled PDF equals an independent clean build.
+
+10. Large-document reflow: `session/preview.rs` and `capture/progress.rs` publish optional
+    `PagePreview`/`PagePreviewReset` from shipout for validated plain-text edits. Runs yield
+    after an affected page when superseded; `bg/completed-aux` retains only completed aux
+    families. Never treat previews as converged or borrow old PDF pixels for them. Error
+    status is read at shipout (do not install `show_error_hook`, which loses source locations).
+    `tests/page_previews.rs` checks early delivery, supersession, clean PDF equality and rollback.
+    A late-page edit still waits for its prefix; no claim of constant-time whole-document layout.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by

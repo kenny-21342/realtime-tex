@@ -758,7 +758,14 @@ pub(super) fn demote_span(s: &Shared, req: &FastRequest, why: &str) {
             })
             .ok();
     }
-    s.bg_signal.0.send(BgCmd::Pass).ok();
+    s.bg_signal
+        .0
+        .send(BgCmd::Pass(if req.warmup {
+            BackgroundPriority::Debounced
+        } else {
+            BackgroundPriority::Reflow
+        }))
+        .ok();
 }
 
 pub(super) fn engine_failed(
@@ -794,7 +801,10 @@ pub(super) fn engine_failed(
     s.engine_generation.fetch_add(1, Ordering::SeqCst);
     // the paragraph goes to the background path, and stays there until the preamble changes:
     // retrying a unit that hung or crashed the engine would kill the server on every keystroke
-    s.bg_signal.0.send(BgCmd::Pass).ok();
+    s.bg_signal
+        .0
+        .send(BgCmd::Pass(BackgroundPriority::Debounced))
+        .ok();
     if !req.warmup {
         s.live.lock().unit(req.par_id).over_budget = Some((QUARANTINED, 0));
         s.events
@@ -971,6 +981,19 @@ pub(super) fn handle_result(
     if !cr.images.is_empty() {
         dl.images = cr.images.clone();
     }
+    // Valid text can outgrow the cached page. It still validates a page-preview pass even
+    // when the old placement below would be off-page and the live overlay is withheld.
+    if dl.inserts == 0
+        && dl.flags_map().is_empty()
+        && s.layout
+            .lock()
+            .unit(req.par_id)
+            .is_some_and(|u| u.advanced() == cr.counters)
+    {
+        s.preview_validated
+            .lock()
+            .insert(req.par_id, (req.versions.source_revision, wanted_gen));
+    }
     let rows: Vec<(i64, i64)> = dl.lines.iter().map(|l| (l.x, l.y)).collect();
     let (fragments, mut stale) = {
         let layout = s.layout.lock();
@@ -1073,7 +1096,10 @@ pub(super) fn handle_result(
         prev != cr.counters
     };
     if stale || counters_changed || !reasons.is_empty() {
-        s.bg_signal.0.send(BgCmd::Pass).ok();
+        s.bg_signal
+            .0
+            .send(BgCmd::Pass(BackgroundPriority::Reflow))
+            .ok();
     }
     // A unit can contain an edited picture and unchanged cached ones. Expand the latter
     // exactly as a background page does, and send that list only when all drawing resolves.

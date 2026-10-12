@@ -262,3 +262,12 @@ content. `rtex serve` sends display lists in this form.
 | `["m", "on"\|"off", x]` | | inline math boundary |
 | `["i", index, x, y_top, w, h]` | | image |
 | `["M", "save"\|"set"\|"restore", x, y, data]` | | transformation |
+
+## Progressive page capture
+
+`PagePreview.page.dl` uses the same page coordinates, native operations and resource tables as
+an ordinary page list. It is captured at shipout, before the final PDF/resource pass finishes.
+A host must resolve every referenced font/image and require complete native drawing for degraded
+pages before displaying it. If any resource is unavailable, keep the previously displayed page
+until `LayoutUpdate`; a previous PDF cannot supply pixels at the new positions. Preview events
+and rollback rules are described in [embedding.md](embedding.md#pagepreview-and-pagepreviewreset-optional-progress-while-a-pass-runs).

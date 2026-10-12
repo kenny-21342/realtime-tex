@@ -325,13 +325,16 @@ pub fn run_pass_with(
 /// standby engine may already hold open from its preamble (`.idx` from `\makeindex`, `.glo`
 /// from `\makeglossaries`): a copy would land in a file being written.
 pub fn copy_aux_family(from: &Path, to: &Path) -> Result<()> {
-    fn go(root: &Path, dir: &Path, to: &Path) -> Result<()> {
+    fn go(root: &Path, dir: &Path, to: &Path, target: &Path) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if path.is_dir() {
+                if crate::paths::canonical(&path).is_ok_and(|p| p == target) {
+                    continue;
+                }
                 if name != "pic-cache" && !name.starts_with("pass-") {
-                    go(root, &path, to)?;
+                    go(root, &path, to, target)?;
                 }
                 continue;
             }
@@ -373,7 +376,7 @@ pub fn copy_aux_family(from: &Path, to: &Path) -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(to)?;
-    go(from, from, to)
+    go(from, from, to, &crate::paths::canonical(to)?)
 }
 
 /// Where and how a sequence of passes runs.
@@ -395,6 +398,18 @@ pub fn run_pass_with_runner(
     plan: PassPlan,
     runner: &mut dyn FnMut(u32) -> Result<CaptureResult>,
     on_pass: &mut dyn FnMut(&CaptureResult, u32),
+) -> Result<PassOutcome> {
+    run_pass_with_runner_until(plan, runner, on_pass, &|| true)
+}
+
+/// Stop between completed passes when a newer source snapshot supersedes this run. The
+/// completed capture is still usable, but never claims aux convergence. Exports and offline
+/// verification use the unbounded wrapper above; held-picture runs also finish normally.
+pub(crate) fn run_pass_with_runner_until(
+    plan: PassPlan,
+    runner: &mut dyn FnMut(u32) -> Result<CaptureResult>,
+    on_pass: &mut dyn FnMut(&CaptureResult, u32),
+    continue_run: &dyn Fn() -> bool,
 ) -> Result<PassOutcome> {
     let PassPlan {
         tl,
@@ -419,6 +434,12 @@ pub fn run_pass_with_runner(
     while passes < max_passes {
         passes += 1;
         let cap = runner(passes)?;
+        if !continue_run() {
+            // Do not spend time on biber/index/glossary tools or convergence passes for text
+            // already superseded. The session publishes this snapshot as Stale and catches up.
+            last = Some(cap);
+            break;
+        }
         let out_dir = cap.out_dir.clone();
         let out_dir = out_dir.as_path();
         let bcf = out_dir.join(format!("{jobname}.bcf"));
@@ -955,29 +976,64 @@ impl WarmEngine {
 
     /// `run` that `stop` may end early (`capture::StopCheck`).
     pub fn run_until(
+        self,
+        project: &Path,
+        files: &BTreeMap<String, String>,
+        main: &str,
+        stop: crate::capture::StopCheck,
+    ) -> Result<CaptureResult> {
+        self.run_until_with_previews(project, files, main, stop, None)
+    }
+
+    pub(crate) fn run_until_with_previews(
         mut self,
         project: &Path,
         files: &BTreeMap<String, String>,
         main: &str,
         stop: crate::capture::StopCheck,
+        mut previews: Option<&mut dyn FnMut(crate::capture::PreviewUpdate) -> bool>,
     ) -> Result<CaptureResult> {
         let t0 = std::time::Instant::now();
         let h = write_body_snapshot(project, files, main, &self.src_dir)?;
         if h != self.preamble_hash {
             anyhow::bail!("standby preamble differs from the snapshot");
         }
+        let mut reader = if previews.is_some() {
+            Some(crate::capture::PagePreviewReader::new(
+                &self.out_dir,
+                &self.jobname,
+            )?)
+        } else {
+            None
+        };
         {
             use std::io::Write;
             let mut stdin = self
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("standby stdin already closed"))?;
-            stdin.write_all(b"GO\n").context("releasing standby")?;
+            stdin
+                .write_all(if previews.is_some() {
+                    b"GO_PREVIEWS\n"
+                } else {
+                    b"GO\n"
+                })
+                .context("releasing standby")?;
             stdin.flush().ok();
             drop(stdin);
         }
         // stdout is drained while waiting (a full pipe would block the engine)
-        let (status, stdout) = crate::capture::wait_child(&mut self.child, t0, stop)?;
+        let enabled = reader.is_some();
+        let mut poll = || {
+            if let (Some(reader), Some(callback)) = (reader.as_mut(), previews.as_mut()) {
+                reader.poll(*callback);
+            }
+        };
+        let (status, stdout) = if enabled {
+            crate::capture::wait_child_with_progress(&mut self.child, t0, stop, Some(&mut poll))?
+        } else {
+            crate::capture::wait_child(&mut self.child, t0, stop)?
+        };
         collect_capture(
             &self.out_dir,
             &self.jobname,
@@ -1007,6 +1063,67 @@ impl Drop for WarmEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auxiliary_backup_inside_the_output_directory_does_not_recurse() {
+        let dir = std::env::temp_dir().join(format!("rtex-nested-aux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.aux"), "complete").unwrap();
+        let backup = dir.join("completed-aux");
+        copy_aux_family(&dir, &backup).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.join("main.aux")).unwrap(),
+            "complete"
+        );
+        assert!(!backup.join("completed-aux").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn superseded_run_returns_a_completed_capture_without_aux_tools_or_more_passes() {
+        let dir = std::env::temp_dir().join(format!("rtex-superseded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.bcf"), "needs biber").unwrap();
+        std::fs::write(dir.join("main.log"), "Rerun to get cross-references right.").unwrap();
+        let tl = TexLive {
+            bin_dir: None,
+            lualatex: PathBuf::from("unused"),
+            rtex_texdir: dir.clone(),
+        };
+        let mut calls = 0;
+        let mut runner = |_| {
+            calls += 1;
+            Ok(CaptureResult {
+                out_dir: dir.clone(),
+                jobname: "main".into(),
+                json: Default::default(),
+                pdf: dir.join("main.pdf"),
+                log: dir.join("main.log"),
+                wall: std::time::Duration::ZERO,
+                exit_ok: true,
+                pic_fragments: BTreeMap::new(),
+            })
+        };
+        let result = run_pass_with_runner_until(
+            PassPlan {
+                tl: &tl,
+                snapshot_dir: &dir,
+                main: "main.tex",
+                aux_dir: &dir,
+                max_passes: 5,
+                bib: BibTool::Biber,
+            },
+            &mut runner,
+            &mut |_, _| panic!("obsolete capture must not start another pass"),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.passes, 1);
+        assert!(!result.aux_stable);
+        assert!(!result.bib_ran);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn snapshot_copies_nested_folders() {

@@ -68,7 +68,7 @@ Other calls:
 
 | Call | Does |
 |---|---|
-| `request_layout()` | start a background pass now instead of after the debounce |
+| `request_layout()` | request a background pass without a quiet wait, subject to the minimum interval between starts |
 | `pause_background(true/false)` | hold background passes, for example while the user is typing fast on battery; live updates continue |
 | `export_pdf(path)` | build a clean PDF (no capture package), report it with `PdfExported` |
 | `spans(path)` | the current split of a file into units: ids, byte ranges, kinds |
@@ -85,7 +85,7 @@ briefly. The live engine and the background passes run on their own threads.
 | `project_root` | `project_root` | `--project` | required | project directory |
 | `main_file` | `main_file` | `--main` | `main.tex` | main file, relative to the root |
 | `build_dir` | `build_dir` | `--build` | `<root>/build/rtex` | where passes, logs and PDFs go |
-| `debounce` | `debounce_ms` | | 300 ms | quiet time before a background pass starts |
+| `debounce` | `debounce_ms` | | 300 ms | quiet time for preamble requests; minimum interval between starts for body reflow and catch-up requests |
 | `max_passes` | `max_passes` | | 5 | passes per layout before giving up (`PassLimitReached`) |
 | `fast_budget` | `fast_budget_ms` | `--fast-budget-ms` | 50 ms | a unit slower than this three times in a row waits for the pass |
 | `fast_budget_factor` | `fast_budget_factor` | `--fast-budget-factor` | 4 | the budget is also at least this many times the session's median live compile (0: `fast_budget` alone) |
@@ -141,6 +141,36 @@ and its left edge at `f.xs[j]`; then draw its items.
 When a layout arrives, drop live results for units whose last edit is older than the layout's
 snapshot. In practice: if `source_revision` hasn't moved since the edit, the layout already
 contains it. Keep the newer ones and move them to the new `placements`.
+
+### `PagePreview` and `PagePreviewReset`: optional progress while a pass runs
+
+These additive events do not advance the authoritative layout version or imply convergence.
+They are enabled for warm runs over validated plain-text paragraph edits, with an error-free
+base layout and no held pictures. Structural/stateful edits use ordinary full layouts.
+
+| Field (`PagePreview`) | Meaning |
+|---|---|
+| `run_id` | increasing preview-run identifier; reject late events from older or reset runs |
+| `base_layout_version` | committed layout this preview builds on; ignore if it differs from the host's layout version |
+| `source_revision` | source snapshot compiled into this page |
+| `page` | one `PageUpdate`, including `dl`, `exact` and optional `native`; draw only when all fonts/images are available, without borrowing pixels from an older PDF |
+| `placements` | placements on this page, with global unit row indices; replace placements on this page and retain those on other pages |
+
+Save the committed pages and placements before accepting the first preview. Re-anchor newer
+live overlays, but retain the coherent page when their row count differs from its placements;
+a growing overlay must not cover following text or pictures. Suppress overlays already included
+in the preview's revision. Cursor and source mapping must use the displayed placements.
+
+`PagePreviewReset { run_id, base_layout_version }` restores the committed pages and placements
+and rejects subsequent delayed previews from that run. Keep newer live results for re-anchoring.
+Before applying any completed `LayoutUpdate`, restore the committed baseline: its page delta
+is relative to that baseline, so an omitted page must not retain a provisional change. Hosts
+may ignore both event kinds and continue using ordinary layouts. C ABI event kinds are 7 and 8;
+`PagePreview` exposes one binary display list through the normal event-DL accessors.
+
+The first affected page can arrive long before the suffix finishes. A late-page edit still
+requires TeX to process its prefix. Neither these events nor a pending page count are a final
+PDF; exports continue to wait for the full convergence result.
 
 ### The others
 

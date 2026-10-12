@@ -155,6 +155,18 @@ thing. A new float waits for the background pass, since only the pass knows wher
 
 ## Making background passes fast
 
+**Continuous typing.** A paragraph gaining or losing lines, tables, floats and page breaks
+request a full-page layout. Body requests briefly coalesce edits (25 ms quiet time, at most
+100 ms), with starts spaced by at least the debounce interval (300 ms by default) to avoid
+excessive recompilation. Both short waits shrink if the configured interval is shorter.
+Preamble requests use the normal quiet interval, capped at three intervals. The scheduling
+wait is separate from the time LuaLaTeX needs for a pass. If the sources change during a pass,
+rtex publishes its completed capture as `Stale` and catches up with the latest snapshot,
+without more auxiliary tools or convergence passes on the old text. A pass that took longer
+than the interval catches up immediately; shorter passes wait only for the next allowed start.
+The latest snapshot gets the normal convergence checks once typing pauses. Exports and
+held-picture runs always finish their normal passes.
+
 **A standby engine.** Loading the format and the preamble is most of the cost of a short LuaLaTeX
 run. While you type, rtex keeps a second LuaLaTeX ready with the preamble already loaded,
 blocked until rtex hands it the body. A pass after the first one then costs about a quarter of
