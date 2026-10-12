@@ -1,7 +1,7 @@
 //! The public session API: documents, edits, fast-path compiles, background layouts, events.
 
 use crate::background::{
-    run_pass_with, run_pass_with_runner, snapshot_dir, write_snapshot, BibTool, WarmEngine,
+    run_pass_with, run_pass_with_runner_until, snapshot_dir, write_snapshot, BibTool, WarmEngine,
 };
 use crate::document::{Edit, EditOutcome, FileBuf, IdAllocator, ParaId, Revision, Span, SpanKind};
 use crate::eligibility::{

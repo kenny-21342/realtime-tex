@@ -34,6 +34,12 @@ If not, the unit waits for the pass and you are told why.
 
 ## Updates after the background pass
 
+A live paragraph that gains or loses lines updates its text immediately, but moving later
+paragraphs and page breaks requires a full layout. Background requests wait for a quiet
+debounce interval, capped at three intervals (900 ms by default), so page layouts also make
+progress during continuous typing. The pass takes additional time; its layout is marked
+`Stale` if you have typed since its snapshot, and the latest text is compiled next.
+
 | You edit | Why it waits |
 |---|---|
 | The preamble (packages, settings, macro definitions) | The live engine restarts with the new preamble (about 1–2 s). |

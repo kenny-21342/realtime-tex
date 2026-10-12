@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Page updates while typing continuously.** Background layouts start after at most three
+  debounce intervals (900 ms with the default setting), including when a paragraph gains or
+  loses lines and moves later text onto another page. A superseded run delivers its completed
+  capture as `Stale` and skips further auxiliary tools and convergence passes for that snapshot.
+  Once typing pauses, the latest text still gets the usual clean convergence checks. Exports
+  and held-picture runs continue to finish normally.
+
 ## 0.0.7 (2026-10-11)
 
 - **Draw pictures in live label edits.** The live server shares capture's readable pgf/pict2e

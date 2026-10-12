@@ -18,14 +18,24 @@ pub(super) fn background_thread(s: Arc<Shared>) {
                     s.bg_pending_while_paused.store(true, Ordering::SeqCst);
                     continue;
                 }
-                // the first pass runs at once; later ones are debounced (drain Pass commands until quiet)
+                // The first pass runs at once; later ones coalesce Pass commands until quiet
+                // or the bounded wait expires.
                 let debounce = if s.layout.lock().layout_version == 0 {
                     Duration::from_millis(1)
                 } else {
                     s.cfg.debounce
                 };
+                // Coalesce short bursts, but do not wait forever while typing continuously.
+                // After at most three debounce intervals, start a snapshot of the latest text.
+                let waiting = Instant::now();
+                // Even a zero debounce drains already queued requests without waiting.
+                let max_wait = debounce.saturating_mul(3).max(Duration::from_millis(1));
                 loop {
-                    match s.bg_signal.1.recv_timeout(debounce) {
+                    let remaining = max_wait.saturating_sub(waiting.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match s.bg_signal.1.recv_timeout(debounce.min(remaining)) {
                         Ok(BgCmd::Pass) => continue,
                         Ok(BgCmd::Quit) => return,
                         Ok(BgCmd::Export(job, out)) => {
@@ -37,6 +47,10 @@ pub(super) fn background_thread(s: Arc<Shared>) {
                 }
                 if s.shutdown.load(Ordering::SeqCst) {
                     break;
+                }
+                if s.bg_paused.load(Ordering::SeqCst) {
+                    s.bg_pending_while_paused.store(true, Ordering::SeqCst);
+                    continue;
                 }
                 run_background_pass(&s);
                 prepare_standby(&s);
@@ -571,7 +585,7 @@ fn run_pass(
                 finished(&cap);
                 Ok(cap)
             };
-        run_pass_with_runner(
+        run_pass_with_runner_until(
             crate::background::PassPlan {
                 tl: &s.tl,
                 snapshot_dir: &standby_dir(s, 0),
@@ -582,6 +596,7 @@ fn run_pass(
             },
             &mut runner,
             &mut on_pass,
+            &|| holding || s.source_revision.load(Ordering::SeqCst) == rev,
         )
     } else {
         // plain passes: a fresh lualatex per pass in pass-0 (sequential, so one directory)
@@ -602,7 +617,7 @@ fn run_pass(
             finished(&cap);
             Ok(cap)
         };
-        run_pass_with_runner(
+        run_pass_with_runner_until(
             crate::background::PassPlan {
                 tl: &s.tl,
                 snapshot_dir: &snap_dir,
@@ -613,6 +628,7 @@ fn run_pass(
             },
             &mut runner,
             &mut on_pass,
+            &|| holding || s.source_revision.load(Ordering::SeqCst) == rev,
         )
     };
     let outcome = match result {

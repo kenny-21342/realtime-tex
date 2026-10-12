@@ -39,6 +39,10 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
 5. Session: pass timeout (`pass_timeout_ms`), relative fast-path budget (`fast_budget_factor` on top of
    upstream's 50 ms floor), warm start of the background build, diagnostics for fatal passes, page `rotate`
    and `color_base` in the display list.
+9. Layout latency: background debounce is bounded to three intervals during continuous typing;
+   superseded runs skip further convergence work after a completed capture (`Stale`). Held
+   pictures and exports still finish normally. `tests/layout_latency.rs` checks paragraph reflow
+   makes page progress while typing and the settled PDF equals an independent clean build.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by

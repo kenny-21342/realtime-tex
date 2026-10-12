@@ -396,6 +396,18 @@ pub fn run_pass_with_runner(
     runner: &mut dyn FnMut(u32) -> Result<CaptureResult>,
     on_pass: &mut dyn FnMut(&CaptureResult, u32),
 ) -> Result<PassOutcome> {
+    run_pass_with_runner_until(plan, runner, on_pass, &|| true)
+}
+
+/// Stop between completed passes when a newer source snapshot supersedes this run. The
+/// completed capture is still usable, but never claims aux convergence. Exports and offline
+/// verification use the unbounded wrapper above; held-picture runs also finish normally.
+pub(crate) fn run_pass_with_runner_until(
+    plan: PassPlan,
+    runner: &mut dyn FnMut(u32) -> Result<CaptureResult>,
+    on_pass: &mut dyn FnMut(&CaptureResult, u32),
+    continue_run: &dyn Fn() -> bool,
+) -> Result<PassOutcome> {
     let PassPlan {
         tl,
         snapshot_dir,
@@ -419,6 +431,12 @@ pub fn run_pass_with_runner(
     while passes < max_passes {
         passes += 1;
         let cap = runner(passes)?;
+        if !continue_run() {
+            // Do not spend time on biber/index/glossary tools or convergence passes for text
+            // already superseded. The session publishes this snapshot as Stale and catches up.
+            last = Some(cap);
+            break;
+        }
         let out_dir = cap.out_dir.clone();
         let out_dir = out_dir.as_path();
         let bcf = out_dir.join(format!("{jobname}.bcf"));
@@ -1007,6 +1025,52 @@ impl Drop for WarmEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superseded_run_returns_a_completed_capture_without_aux_tools_or_more_passes() {
+        let dir = std::env::temp_dir().join(format!("rtex-superseded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.bcf"), "needs biber").unwrap();
+        std::fs::write(dir.join("main.log"), "Rerun to get cross-references right.").unwrap();
+        let tl = TexLive {
+            bin_dir: None,
+            lualatex: PathBuf::from("unused"),
+            rtex_texdir: dir.clone(),
+        };
+        let mut calls = 0;
+        let mut runner = |_| {
+            calls += 1;
+            Ok(CaptureResult {
+                out_dir: dir.clone(),
+                jobname: "main".into(),
+                json: Default::default(),
+                pdf: dir.join("main.pdf"),
+                log: dir.join("main.log"),
+                wall: std::time::Duration::ZERO,
+                exit_ok: true,
+                pic_fragments: BTreeMap::new(),
+            })
+        };
+        let result = run_pass_with_runner_until(
+            PassPlan {
+                tl: &tl,
+                snapshot_dir: &dir,
+                main: "main.tex",
+                aux_dir: &dir,
+                max_passes: 5,
+                bib: BibTool::Biber,
+            },
+            &mut runner,
+            &mut |_, _| panic!("obsolete capture must not start another pass"),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.passes, 1);
+        assert!(!result.aux_stable);
+        assert!(!result.bib_ran);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn snapshot_copies_nested_folders() {
