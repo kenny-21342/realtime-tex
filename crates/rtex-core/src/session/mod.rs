@@ -376,6 +376,9 @@ struct EngineLink {
     probe_us: u64,
 }
 
+type PreviewValidationHistory =
+    HashMap<ParaId, std::collections::VecDeque<(Revision, u64, i64, u64)>>;
+
 struct Shared {
     link: Mutex<EngineLink>,
     files: Mutex<BTreeMap<String, FileBuf>>,
@@ -386,7 +389,7 @@ struct Shared {
     preview_run: AtomicU64,
     preview_base_ok: AtomicBool,
     /// Successful live results validating a span's latest source under this generation.
-    preview_validated: Mutex<HashMap<ParaId, (Revision, u64, i64, u64)>>,
+    preview_validated: Mutex<PreviewValidationHistory>,
     preamble_revision: AtomicU64,
     /// Per file: last revision at which a background-only span or the preamble changed.
     bg_change: Mutex<HashMap<String, Vec<(Revision, i64)>>>, // (revision, first line of the changed span)

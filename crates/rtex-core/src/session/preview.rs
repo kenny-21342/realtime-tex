@@ -133,10 +133,12 @@ fn plan(s: &Shared, snapshot: &[SnapshotSpan], require_validation: bool) -> Opti
             }
             unit
         };
-        let validation = validated.get(&new.id).filter(|(revision, gen, _, hash)| {
-            *revision >= new.last_revision
-                && *gen == generation
-                && *hash == crate::document::hash_str(&new.text)
+        let validation = validated.get(&new.id).and_then(|history| {
+            history.iter().rev().find(|(revision, gen, _, hash)| {
+                *revision >= new.last_revision
+                    && *gen == generation
+                    && *hash == crate::document::hash_str(&new.text)
+            })
         });
         if require_validation && validation.is_none() {
             return None;
@@ -295,7 +297,7 @@ impl<'a> PreviewRun<'a> {
                     .preview_validated
                     .lock()
                     .values()
-                    .any(|(r, _, _, _)| *r >= current)
+                    .any(|history| history.iter().any(|(r, _, _, _)| *r >= current))
             {
                 let (_, spans, _) = snapshot(self.s);
                 self.checked_revision = current;

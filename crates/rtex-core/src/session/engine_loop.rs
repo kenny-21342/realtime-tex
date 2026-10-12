@@ -991,15 +991,19 @@ pub(super) fn handle_result(
             .map(|u| u.advanced() == cr.counters)
             .unwrap_or_else(|| req.seq < 0 && cr.counters.is_empty())
     {
-        s.preview_validated.lock().insert(
-            req.par_id,
-            (
-                req.versions.source_revision,
-                wanted_gen,
-                dl.lines.len() as i64,
-                crate::document::hash_str(&req.source),
-            ),
-        );
+        let mut records = s.preview_validated.lock();
+        let history = records.entry(req.par_id).or_default();
+        // Keep exact validated snapshots while later keystrokes arrive. Replacing the
+        // only record would repeatedly invalidate a background snapshot during typing.
+        history.push_back((
+            req.versions.source_revision,
+            wanted_gen,
+            dl.lines.len() as i64,
+            crate::document::hash_str(&req.source),
+        ));
+        while history.len() > 64 {
+            history.pop_front();
+        }
     }
     let rows: Vec<(i64, i64)> = dl.lines.iter().map(|l| (l.x, l.y)).collect();
     let (mut fragments, mut stale) = {
