@@ -2,10 +2,13 @@
 
 ## Unreleased
 
-- **Page updates while typing continuously.** Background layouts start after at most three
-  debounce intervals (900 ms with the default setting), including when a paragraph gains or
-  loses lines and moves later text onto another page. A superseded run delivers its completed
-  capture as `Stale` and skips further auxiliary tools and convergence passes for that snapshot.
+- **Page updates while typing continuously.** Body reflow briefly coalesces edits (25 ms quiet
+  time, capped at 100 ms) and starts full layouts at most once per debounce interval (300 ms by
+  default), including when a paragraph gains or loses lines and moves later text onto another
+  page. A pass that took longer than the interval catches up immediately when its sources are
+  stale. Preamble requests retain their usual debounce, capped at three intervals. A superseded
+  run delivers its completed capture as `Stale` and skips further auxiliary tools and convergence
+  passes for that snapshot.
   Once typing pauses, the latest text still gets the usual clean convergence checks. Exports
   and held-picture runs continue to finish normally.
 

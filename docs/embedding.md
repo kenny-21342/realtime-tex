@@ -68,7 +68,7 @@ Other calls:
 
 | Call | Does |
 |---|---|
-| `request_layout()` | start a background pass now instead of after the debounce |
+| `request_layout()` | request a background pass without a quiet wait, subject to the minimum interval between starts |
 | `pause_background(true/false)` | hold background passes, for example while the user is typing fast on battery; live updates continue |
 | `export_pdf(path)` | build a clean PDF (no capture package), report it with `PdfExported` |
 | `spans(path)` | the current split of a file into units: ids, byte ranges, kinds |
@@ -85,7 +85,7 @@ briefly. The live engine and the background passes run on their own threads.
 | `project_root` | `project_root` | `--project` | required | project directory |
 | `main_file` | `main_file` | `--main` | `main.tex` | main file, relative to the root |
 | `build_dir` | `build_dir` | `--build` | `<root>/build/rtex` | where passes, logs and PDFs go |
-| `debounce` | `debounce_ms` | | 300 ms | quiet time before a background pass starts |
+| `debounce` | `debounce_ms` | | 300 ms | quiet time for preamble requests; minimum interval between starts for body reflow and catch-up requests |
 | `max_passes` | `max_passes` | | 5 | passes per layout before giving up (`PassLimitReached`) |
 | `fast_budget` | `fast_budget_ms` | `--fast-budget-ms` | 50 ms | a unit slower than this three times in a row waits for the pass |
 | `fast_budget_factor` | `fast_budget_factor` | `--fast-budget-factor` | 4 | the budget is also at least this many times the session's median live compile (0: `fast_budget` alone) |

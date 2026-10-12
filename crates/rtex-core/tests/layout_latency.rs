@@ -22,13 +22,27 @@ fn settled(s: &Session) -> (u64, i64) {
 
 #[test]
 fn reflowing_paragraphs_publish_pages_before_typing_stops() {
+    continuous_reflow("paragraph", "Anchor words here.", true);
+}
+
+#[test]
+fn body_edits_on_the_background_path_publish_pages_before_typing_stops() {
+    continuous_reflow(
+        "block-with-trailing-text",
+        "Anchor \\begin{center}boxed\\end{center} words here.",
+        false,
+    );
+}
+
+fn continuous_reflow(name: &str, paragraph: &str, live: bool) {
     if rtex_core::texlive::TexLive::discover().is_err() {
         return;
     }
-    let root = std::env::temp_dir().join(format!("rtex-reflow-latency-{}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("rtex-reflow-latency-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let text = "\\documentclass{article}\n\\usepackage[paperwidth=180pt,paperheight=160pt,margin=20pt]{geometry}\n\\pdfvariable suppressoptionalinfo 767\n\\begin{document}\nAnchor words here.\n\nFollowing paragraph.\n\\end{document}\n";
+    let text = format!("\\documentclass{{article}}\n\\usepackage[paperwidth=180pt,paperheight=160pt,margin=20pt]{{geometry}}\n\\pdfvariable suppressoptionalinfo 767\n\\begin{{document}}\n{paragraph}\n\nFollowing paragraph.\n\\end{{document}}\n");
     std::fs::write(root.join("main.tex"), text).unwrap();
     let mut cfg = SessionConfig::new(&root, "main.tex");
     cfg.build_dir = root.join("build");
@@ -42,16 +56,20 @@ fn reflowing_paragraphs_publish_pages_before_typing_stops() {
     let mut last_settled = None;
     for _ in 0..60 {
         let doc = s.document_text("main.tex").unwrap();
-        let at = doc.find("\n\nFollowing").unwrap();
-        s.apply_edit(
-            "main.tex",
-            Edit {
-                start_byte: at,
-                end_byte: at,
-                text: " more".into(),
-            },
-        )
-        .unwrap();
+        let at = doc.find("Anchor").unwrap() + "Anchor".len();
+        let result = s
+            .apply_edit(
+                "main.tex",
+                Edit {
+                    start_byte: at,
+                    end_byte: at,
+                    text: " more".into(),
+                },
+            )
+            .unwrap();
+        if !live {
+            assert_eq!(result.routed, "background", "exercise direct body fallback");
+        }
         let until = Instant::now() + Duration::from_millis(100);
         while Instant::now() < until {
             for e in s.poll(until.saturating_duration_since(Instant::now())) {
@@ -76,7 +94,9 @@ fn reflowing_paragraphs_publish_pages_before_typing_stops() {
             }
         }
     }
-    assert!(reflow, "the edits must change the paragraph's line count");
+    if live {
+        assert!(reflow, "the edits must change the paragraph's line count");
+    }
     assert!(
         page_progress,
         "a full-page update must arrive during continuous typing"

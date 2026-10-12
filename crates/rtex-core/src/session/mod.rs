@@ -418,8 +418,15 @@ struct Shared {
     hold: Mutex<hold::HoldState>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BackgroundPriority {
+    Debounced,
+    Reflow,
+    CatchUp,
+}
+
 enum BgCmd {
-    Pass,
+    Pass(BackgroundPriority),
     Export(u64, PathBuf),
     Quit,
 }
@@ -533,7 +540,11 @@ impl Session {
                     .spawn(move || background_thread(s))?,
             );
         }
-        shared.bg_signal.0.send(BgCmd::Pass).ok();
+        shared
+            .bg_signal
+            .0
+            .send(BgCmd::Pass(BackgroundPriority::CatchUp))
+            .ok();
         shared.pending_signal.0.send(()).ok(); // eager server start
         Ok(Session {
             shared,
@@ -656,7 +667,7 @@ impl Session {
                     .collect(),
             );
             self.shared.files.lock().insert(rel_path.to_string(), fb);
-            self.schedule_background();
+            self.schedule_background(BackgroundPriority::Debounced);
             let edit_id = self.shared.edit_counter.fetch_add(1, Ordering::SeqCst) + 1;
             return Ok(EditResult {
                 edit_id,
@@ -751,7 +762,7 @@ impl Session {
             self.shared.engine_generation.fetch_add(1, Ordering::SeqCst);
             self.shared.pending.lock().clear();
             self.shared.pending_signal.0.send(()).ok();
-            self.schedule_background();
+            self.schedule_background(BackgroundPriority::Debounced);
             return Ok(EditResult {
                 edit_id,
                 source_revision: rev,
@@ -852,7 +863,7 @@ impl Session {
         let Some((primary_id, primary_live, primary_reasons)) = primary else {
             // nothing routable (e.g. everything deleted): background only
             self.note_bg_change(rel_path, rev, &outcome);
-            self.schedule_background();
+            self.schedule_background(BackgroundPriority::Reflow);
             self.shared
                 .events
                 .send(Event::BackgroundScheduled {
@@ -877,7 +888,7 @@ impl Session {
         // the fast path could not take
         if any_background || !outcome.added.is_empty() || !outcome.removed.is_empty() {
             self.note_bg_change(rel_path, rev, &outcome);
-            self.schedule_background();
+            self.schedule_background(BackgroundPriority::Reflow);
         }
         let host_us = [
             t_seg.as_micros() as u64,
@@ -968,7 +979,7 @@ impl Session {
     }
 
     pub fn request_layout(&self) {
-        self.schedule_background();
+        self.schedule_background(BackgroundPriority::CatchUp);
     }
 
     /// Defer background passes (they run when resumed). The fast path keeps working.
@@ -980,15 +991,19 @@ impl Session {
                 .bg_pending_while_paused
                 .swap(false, Ordering::SeqCst)
         {
-            self.shared.bg_signal.0.send(BgCmd::Pass).ok();
+            self.shared
+                .bg_signal
+                .0
+                .send(BgCmd::Pass(BackgroundPriority::CatchUp))
+                .ok();
         }
     }
 
-    fn schedule_background(&self) {
+    fn schedule_background(&self, priority: BackgroundPriority) {
         *self.shared.convergence.lock() = Some(Convergence::Stale {
             pending_since: self.shared.source_revision.load(Ordering::SeqCst),
         });
-        self.shared.bg_signal.0.send(BgCmd::Pass).ok();
+        self.shared.bg_signal.0.send(BgCmd::Pass(priority)).ok();
     }
 
     /// Load from disk every file the tracked files now `\input` that is not tracked yet.

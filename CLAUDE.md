@@ -39,8 +39,10 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
 5. Session: pass timeout (`pass_timeout_ms`), relative fast-path budget (`fast_budget_factor` on top of
    upstream's 50 ms floor), warm start of the background build, diagnostics for fatal passes, page `rotate`
    and `color_base` in the display list.
-9. Layout latency: background debounce is bounded to three intervals during continuous typing;
-   superseded runs skip further convergence work after a completed capture (`Stale`). Held
+9. Layout latency: body reflow coalesces for 25 ms (100 ms cap), with starts spaced by the
+   configured debounce interval; stale passes catch up as soon as that interval has elapsed.
+   Preamble requests retain the quiet debounce with a three-interval cap. Superseded runs skip
+   further convergence work after a completed capture (`Stale`). Held
    pictures and exports still finish normally. `tests/layout_latency.rs` checks paragraph reflow
    makes page progress while typing and the settled PDF equals an independent clean build.
 

@@ -3,40 +3,76 @@
 
 use super::*;
 
+/// A short body-edit wait, with a minimum interval between starts to avoid a compile storm.
+/// A pass longer than that interval can catch up immediately when its sources became stale.
+struct BackgroundWait {
+    started: Instant,
+    previous_start: Option<Instant>,
+    debounce: Duration,
+    priority: BackgroundPriority,
+}
+
+impl BackgroundWait {
+    fn timeout(&self, now: Instant) -> Option<Duration> {
+        let (quiet, cap) = match self.priority {
+            BackgroundPriority::Debounced => (self.debounce, self.debounce.saturating_mul(3)),
+            BackgroundPriority::Reflow => (
+                self.debounce.min(Duration::from_millis(25)),
+                self.debounce.min(Duration::from_millis(100)),
+            ),
+            BackgroundPriority::CatchUp => (Duration::ZERO, Duration::ZERO),
+        };
+        // Leave a small window to drain queued commands, including with a zero debounce.
+        let remaining = cap
+            .max(Duration::from_millis(1))
+            .saturating_sub(now.saturating_duration_since(self.started));
+        let throttle = if self.priority > BackgroundPriority::Debounced {
+            self.previous_start
+                .map(|start| {
+                    self.debounce
+                        .saturating_sub(now.saturating_duration_since(start))
+                })
+                .unwrap_or_default()
+        } else {
+            Duration::ZERO
+        };
+        if remaining.is_zero() && throttle.is_zero() {
+            None
+        } else {
+            Some(quiet.min(remaining).max(throttle))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Background thread: debounced full passes with capture, layout installation, exports.
 // ---------------------------------------------------------------------------------------------
 pub(super) fn background_thread(s: Arc<Shared>) {
     warm_start(&s);
     prepare_standby(&s);
+    let mut previous_start = None;
     while let Ok(cmd) = s.bg_signal.1.recv() {
         match cmd {
             BgCmd::Quit => break,
             BgCmd::Export(job, out) => run_export(&s, job, out),
-            BgCmd::Pass => {
+            BgCmd::Pass(priority) => {
                 if s.bg_paused.load(Ordering::SeqCst) {
                     s.bg_pending_while_paused.store(true, Ordering::SeqCst);
                     continue;
                 }
-                // The first pass runs at once; later ones coalesce Pass commands until quiet
-                // or the bounded wait expires.
-                let debounce = if s.layout.lock().layout_version == 0 {
-                    Duration::from_millis(1)
-                } else {
-                    s.cfg.debounce
+                let mut wait = BackgroundWait {
+                    started: Instant::now(),
+                    previous_start,
+                    debounce: s.cfg.debounce,
+                    priority: if s.layout.lock().layout_version == 0 {
+                        BackgroundPriority::CatchUp
+                    } else {
+                        priority
+                    },
                 };
-                // Coalesce short bursts, but do not wait forever while typing continuously.
-                // After at most three debounce intervals, start a snapshot of the latest text.
-                let waiting = Instant::now();
-                // Even a zero debounce drains already queued requests without waiting.
-                let max_wait = debounce.saturating_mul(3).max(Duration::from_millis(1));
-                loop {
-                    let remaining = max_wait.saturating_sub(waiting.elapsed());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    match s.bg_signal.1.recv_timeout(debounce.min(remaining)) {
-                        Ok(BgCmd::Pass) => continue,
+                while let Some(timeout) = wait.timeout(Instant::now()) {
+                    match s.bg_signal.1.recv_timeout(timeout) {
+                        Ok(BgCmd::Pass(priority)) => wait.priority = wait.priority.max(priority),
                         Ok(BgCmd::Quit) => return,
                         Ok(BgCmd::Export(job, out)) => {
                             run_export(&s, job, out);
@@ -52,6 +88,12 @@ pub(super) fn background_thread(s: Arc<Shared>) {
                     s.bg_pending_while_paused.store(true, Ordering::SeqCst);
                     continue;
                 }
+                log::debug!(
+                    "background layout {:?}: waited {} ms",
+                    wait.priority,
+                    wait.started.elapsed().as_millis()
+                );
+                previous_start = Some(Instant::now());
                 run_background_pass(&s);
                 prepare_standby(&s);
             }
@@ -1136,7 +1178,10 @@ fn deliver_layout_inner(
         })
         .ok();
     if matches!(convergence, Convergence::Stale { .. }) {
-        s.bg_signal.0.send(BgCmd::Pass).ok();
+        s.bg_signal
+            .0
+            .send(BgCmd::Pass(BackgroundPriority::CatchUp))
+            .ok();
     }
     compile
 }
@@ -1280,7 +1325,10 @@ fn publish_unchanged_layout(
         })
         .ok();
     if matches!(convergence, Convergence::Stale { .. }) {
-        s.bg_signal.0.send(BgCmd::Pass).ok();
+        s.bg_signal
+            .0
+            .send(BgCmd::Pass(BackgroundPriority::CatchUp))
+            .ok();
     }
 }
 
@@ -1353,5 +1401,58 @@ pub(super) fn run_export(s: &Shared, job: u64, out: PathBuf) {
                 })
                 .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    fn wait(now: Instant, priority: BackgroundPriority) -> BackgroundWait {
+        BackgroundWait {
+            started: now,
+            previous_start: None,
+            debounce: Duration::from_millis(300),
+            priority,
+        }
+    }
+
+    #[test]
+    fn reflow_coalesces_briefly_but_has_a_short_deadline() {
+        let now = Instant::now();
+        let w = wait(now, BackgroundPriority::Reflow);
+        assert_eq!(w.timeout(now), Some(Duration::from_millis(25)));
+        assert_eq!(
+            w.timeout(now + Duration::from_millis(90)),
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(w.timeout(now + Duration::from_millis(100)), None);
+    }
+
+    #[test]
+    fn urgent_requests_limit_start_frequency_but_long_passes_catch_up_immediately() {
+        let now = Instant::now();
+        let mut w = wait(now, BackgroundPriority::CatchUp);
+        w.previous_start = Some(now - Duration::from_millis(200));
+        assert_eq!(w.timeout(now), Some(Duration::from_millis(100)));
+        assert_eq!(w.timeout(now + Duration::from_millis(100)), None);
+        w.previous_start = Some(now - Duration::from_secs(2));
+        assert_eq!(w.timeout(now), Some(Duration::ZERO));
+        w.debounce = Duration::ZERO;
+        w.previous_start = Some(now);
+        assert_eq!(w.timeout(now), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_reflow_request_accelerates_an_existing_debounced_wait() {
+        let now = Instant::now();
+        let mut w = wait(now, BackgroundPriority::Debounced);
+        assert_eq!(w.timeout(now), Some(Duration::from_millis(300)));
+        assert_eq!(w.timeout(now + Duration::from_millis(900)), None);
+        w.priority = w.priority.max(BackgroundPriority::Reflow);
+        assert_eq!(w.timeout(now + Duration::from_millis(120)), None);
+        // Later normal requests never undo an urgency upgrade.
+        w.priority = w.priority.max(BackgroundPriority::Debounced);
+        assert_eq!(w.priority, BackgroundPriority::Reflow);
     }
 }

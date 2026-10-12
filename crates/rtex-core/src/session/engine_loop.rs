@@ -758,7 +758,10 @@ pub(super) fn demote_span(s: &Shared, req: &FastRequest, why: &str) {
             })
             .ok();
     }
-    s.bg_signal.0.send(BgCmd::Pass).ok();
+    s.bg_signal
+        .0
+        .send(BgCmd::Pass(BackgroundPriority::Debounced))
+        .ok();
 }
 
 pub(super) fn engine_failed(
@@ -794,7 +797,10 @@ pub(super) fn engine_failed(
     s.engine_generation.fetch_add(1, Ordering::SeqCst);
     // the paragraph goes to the background path, and stays there until the preamble changes:
     // retrying a unit that hung or crashed the engine would kill the server on every keystroke
-    s.bg_signal.0.send(BgCmd::Pass).ok();
+    s.bg_signal
+        .0
+        .send(BgCmd::Pass(BackgroundPriority::Debounced))
+        .ok();
     if !req.warmup {
         s.live.lock().unit(req.par_id).over_budget = Some((QUARANTINED, 0));
         s.events
@@ -1073,7 +1079,10 @@ pub(super) fn handle_result(
         prev != cr.counters
     };
     if stale || counters_changed || !reasons.is_empty() {
-        s.bg_signal.0.send(BgCmd::Pass).ok();
+        s.bg_signal
+            .0
+            .send(BgCmd::Pass(BackgroundPriority::Reflow))
+            .ok();
     }
     // A unit can contain an edited picture and unchanged cached ones. Expand the latter
     // exactly as a background page does, and send that list only when all drawing resolves.
