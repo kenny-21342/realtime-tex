@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.8 (2026-10-12)
+
 - **Preview rebuilt pages before the document finishes.** A warm background run can publish
   `PagePreview` as each affected page ships for validated plain-text paragraph edits. Hosts
   can display complete exact/native pages and their new placements while the suffix is still
