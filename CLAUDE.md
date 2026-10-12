@@ -46,6 +46,14 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
    pictures and exports still finish normally. `tests/layout_latency.rs` checks paragraph reflow
    makes page progress while typing and the settled PDF equals an independent clean build.
 
+10. Large-document reflow: `session/preview.rs` and `capture/progress.rs` publish optional
+    `PagePreview`/`PagePreviewReset` from shipout for validated plain-text edits. Runs yield
+    after an affected page when superseded; `bg/completed-aux` retains only completed aux
+    families. Never treat previews as converged or borrow old PDF pixels for them. Error
+    status is read at shipout (do not install `show_error_hook`, which loses source locations).
+    `tests/page_previews.rs` checks early delivery, supersession, clean PDF equality and rollback.
+    A late-page edit still waits for its prefix; no claim of constant-time whole-document layout.
+
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by
 `scripts/cloud-texlive.sh` into `/opt/texlive`. The environment's setup script is only the light `scripts/cloud-setup.sh`

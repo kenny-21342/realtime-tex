@@ -161,6 +161,30 @@ pub(super) fn last_pass_dir(s: &Shared) -> Option<PathBuf> {
     slot.clone()
 }
 
+fn completed_aux(s: &Shared) -> PathBuf {
+    s.cfg.build_dir.join("bg/completed-aux")
+}
+
+fn save_completed_aux(s: &Shared, from: &Path) {
+    let to = completed_aux(s);
+    if let Err(e) = std::fs::create_dir_all(&to)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| crate::background::copy_aux_family(from, &to))
+        .and_then(|_| std::fs::write(to.join(".ready"), []).map_err(anyhow::Error::from))
+    {
+        log::warn!("saving completed auxiliary files: {e:#}");
+    }
+}
+
+fn last_aux_dir(s: &Shared) -> Option<PathBuf> {
+    let stable = completed_aux(s);
+    if stable.join(".ready").exists() {
+        Some(stable)
+    } else {
+        last_pass_dir(s)
+    }
+}
+
 /// The slot (0 or 1) a new standby takes: the one that does not hold the last pass.
 /// A standby engine for `slot`: the session's project and sources, the slot's body snapshot
 /// and pass directories.
@@ -515,12 +539,19 @@ fn run_pass(
         hs.last_good.retain(|id, _| live_ids.contains(id));
     };
     // the aux family every pass of this run starts from
-    let aux_dir = last_pass_dir(s).unwrap_or_else(|| pass_dir(s, 0));
+    // Preview runs may stop halfway through an output directory. Seed only from completed
+    // auxiliary files, including bibliography/index tools run between completed passes.
+    if !completed_aux(s).join(".ready").exists() {
+        if let Some(from) = last_pass_dir(s) {
+            save_completed_aux(s, &from);
+        }
+    }
+    let aux_dir = last_aux_dir(s).unwrap_or_else(|| pass_dir(s, 0));
     // before a pass runs in its directory: the previous pass's aux family and the manifest
     let prepare_dir = |dir: &Path| {
         // the directory's capture is about to change: it no longer matches its sources hash
         let _ = std::fs::remove_file(dir.join(SOURCES_HASH_FILE));
-        if let Some(from) = last_pass_dir(s) {
+        if let Some(from) = last_aux_dir(s) {
             if let Err(e) = crate::background::copy_aux_family(&from, dir) {
                 log::warn!("aux family: {e:#}");
             }
@@ -528,11 +559,14 @@ fn run_pass(
         refresh_manifest(dir);
     };
     let finished = |cap: &crate::capture::CaptureResult| {
+        save_completed_aux(s, &cap.out_dir);
         *s.last_pass_dir.lock() = Some(cap.out_dir.clone());
     };
     let spans_for_provisional = spans.clone();
     let mut pass_started = Instant::now();
     let mut on_pass = |cap: &crate::capture::CaptureResult, pass: u32| {
+        // Includes auxiliary tool outputs generated after the runner returned its capture.
+        save_completed_aux(s, &cap.out_dir);
         // the host sees the provisional layout before the cache absorbs the pass's pictures
         // (a PDF round trip)
         if pass_started.elapsed() >= PROVISIONAL_LAYOUT_AFTER
@@ -615,7 +649,46 @@ fn run_pass(
                     *s.standby.lock() = Some(next);
                 }
                 let t_run = Instant::now();
-                let mut cap = w.run_until(&s.cfg.project_root, &texts, &s.cfg.main_file, &stop)?;
+                let mut preview = if !holding && completed_aux(s).join(".ready").exists() {
+                    preview::PreviewRun::new(s, &spans, rev)
+                } else {
+                    None
+                };
+                let abort = preview.as_ref().map(|p| p.stop.clone());
+                let affected = preview.as_ref().map(|p| p.affected_sent.clone());
+                let preview_stop = |ran| {
+                    if abort.as_ref().is_some_and(|a| a.get())
+                        || (affected.as_ref().is_some_and(|a| a.get())
+                            && s.source_revision.load(Ordering::SeqCst) > rev)
+                    {
+                        Some(preview::SUPERSEDED.to_string())
+                    } else {
+                        stop(ran)
+                    }
+                };
+                let enabled = preview.is_some();
+                let mut on_page = |update| {
+                    let fragments = pic_fragments.lock().unwrap();
+                    preview.as_mut().unwrap().update(update, &fragments)
+                };
+                let result = w.run_until_with_previews(
+                    &s.cfg.project_root,
+                    &texts,
+                    &s.cfg.main_file,
+                    &preview_stop,
+                    if enabled { Some(&mut on_page) } else { None },
+                );
+                if let Err(e) = &result {
+                    let superseded = e
+                        .downcast_ref::<crate::capture::Stopped>()
+                        .is_some_and(|e| e.0 == preview::SUPERSEDED);
+                    if !superseded {
+                        if let Some(p) = &preview {
+                            p.reset();
+                        }
+                    }
+                }
+                let mut cap = result?;
                 ran_to_end(&cap);
                 log::debug!(
                     "background pass: {} standby, waited/spawned {} ms, engine run {} ms",
@@ -676,6 +749,16 @@ fn run_pass(
     let outcome = match result {
         Ok(o) => o,
         Err(e) => {
+            if e.downcast_ref::<crate::capture::Stopped>()
+                .is_some_and(|e| e.0 == preview::SUPERSEDED)
+            {
+                log::debug!("background pass yielded after a page preview");
+                s.bg_signal
+                    .0
+                    .send(BgCmd::Pass(BackgroundPriority::CatchUp))
+                    .ok();
+                return true;
+            }
             // LaTeX stopped before the end of the document (no capture): its log still says
             // where; the error list is the log's, as for any pass
             let mut items = failed_pass_diagnostics(s, started);
@@ -709,6 +792,7 @@ fn run_pass(
         }
     };
     let outcome_cap = outcome.capture;
+    save_completed_aux(s, &outcome_cap.out_dir);
     if holding {
         // the held run counts when it is clean and took every held picture from the cache (a
         // picture it drew is recorded; its blanked body would show nothing)
@@ -967,6 +1051,10 @@ fn deliver_layout_inner(
     } else {
         CompileStatus::Ok
     };
+    s.preview_base_ok.store(
+        compile == CompileStatus::Ok && held.is_empty(),
+        Ordering::SeqCst,
+    );
     if compile == CompileStatus::Failed {
         s.events
             .send(Event::Diagnostics {

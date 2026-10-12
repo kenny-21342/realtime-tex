@@ -27,6 +27,7 @@ mod engine_loop;
 mod hold;
 mod live;
 mod passes;
+mod preview;
 mod route;
 
 pub use diag::parse_log;
@@ -236,6 +237,19 @@ pub struct ParagraphPlacement {
 // and boxing the field would change the public type hosts match on for no measurable gain
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
+    /// Provisional pages built during a safe text-reflow pass. They do not replace the
+    /// authoritative layout or its engine contexts; clients may ignore these events.
+    PagePreview {
+        run_id: u64,
+        base_layout_version: u64,
+        source_revision: Revision,
+        page: PageUpdate,
+        placements: Vec<ParagraphPlacement>,
+    },
+    PagePreviewReset {
+        run_id: u64,
+        base_layout_version: u64,
+    },
     ParagraphUpdate {
         par_id: ParaId,
         edit_id: u64,
@@ -369,6 +383,10 @@ struct Shared {
     source_revision: AtomicU64,
     /// The longest a background lualatex run that finished took (ms; `pass_timeout`).
     slowest_pass_ms: AtomicU64,
+    preview_run: AtomicU64,
+    preview_base_ok: AtomicBool,
+    /// Successful live results validating a span's latest source under this generation.
+    preview_validated: Mutex<HashMap<ParaId, (Revision, u64)>>,
     preamble_revision: AtomicU64,
     /// Per file: last revision at which a background-only span or the preamble changed.
     bg_change: Mutex<HashMap<String, Vec<(Revision, i64)>>>, // (revision, first line of the changed span)
@@ -494,6 +512,9 @@ impl Session {
             ids: Mutex::new(ids),
             source_revision: AtomicU64::new(1),
             slowest_pass_ms: AtomicU64::new(0),
+            preview_run: AtomicU64::new(0),
+            preview_base_ok: AtomicBool::new(false),
+            preview_validated: Mutex::new(HashMap::new()),
             preamble_revision: AtomicU64::new(1),
             bg_change: Mutex::new(HashMap::new()),
             layout: Mutex::new(LayoutStore::default()),
@@ -653,6 +674,7 @@ impl Session {
             .map(|f| f.text.len())
             .unwrap_or(0);
         if len == 0 && !self.shared.files.lock().contains_key(rel_path) {
+            let mut files = self.shared.files.lock();
             let rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
             let fb = FileBuf::with_block_envs(
                 text,
@@ -666,7 +688,8 @@ impl Session {
                     .cloned()
                     .collect(),
             );
-            self.shared.files.lock().insert(rel_path.to_string(), fb);
+            files.insert(rel_path.to_string(), fb);
+            drop(files);
             self.schedule_background(BackgroundPriority::Debounced);
             let edit_id = self.shared.edit_counter.fetch_add(1, Ordering::SeqCst) + 1;
             return Ok(EditResult {
@@ -693,7 +716,7 @@ impl Session {
         let rel_path = key.as_str();
         let t_start = Instant::now();
         let edit_id = self.shared.edit_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let rev;
         let is_setup = |text: &str| {
             crate::eligibility::setup_statements(&crate::eligibility::strip_comments(text))
                 .is_some()
@@ -703,6 +726,9 @@ impl Session {
             let fb = files
                 .get_mut(rel_path)
                 .ok_or_else(|| anyhow!("unknown file {rel_path}"))?;
+            // A snapshot takes this same lock: its revision must describe the buffers it
+            // actually copies, rather than an edit still waiting to acquire the lock.
+            rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
             // a setup span (definitions, lengths after \begin{document}) before or after the
             // edit: the server's preamble changes
             let was_setup = fb.spans.iter().any(|sp| {

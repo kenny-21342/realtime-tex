@@ -325,13 +325,16 @@ pub fn run_pass_with(
 /// standby engine may already hold open from its preamble (`.idx` from `\makeindex`, `.glo`
 /// from `\makeglossaries`): a copy would land in a file being written.
 pub fn copy_aux_family(from: &Path, to: &Path) -> Result<()> {
-    fn go(root: &Path, dir: &Path, to: &Path) -> Result<()> {
+    fn go(root: &Path, dir: &Path, to: &Path, target: &Path) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if path.is_dir() {
+                if crate::paths::canonical(&path).is_ok_and(|p| p == target) {
+                    continue;
+                }
                 if name != "pic-cache" && !name.starts_with("pass-") {
-                    go(root, &path, to)?;
+                    go(root, &path, to, target)?;
                 }
                 continue;
             }
@@ -373,7 +376,7 @@ pub fn copy_aux_family(from: &Path, to: &Path) -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(to)?;
-    go(from, from, to)
+    go(from, from, to, &crate::paths::canonical(to)?)
 }
 
 /// Where and how a sequence of passes runs.
@@ -973,29 +976,64 @@ impl WarmEngine {
 
     /// `run` that `stop` may end early (`capture::StopCheck`).
     pub fn run_until(
+        self,
+        project: &Path,
+        files: &BTreeMap<String, String>,
+        main: &str,
+        stop: crate::capture::StopCheck,
+    ) -> Result<CaptureResult> {
+        self.run_until_with_previews(project, files, main, stop, None)
+    }
+
+    pub(crate) fn run_until_with_previews(
         mut self,
         project: &Path,
         files: &BTreeMap<String, String>,
         main: &str,
         stop: crate::capture::StopCheck,
+        mut previews: Option<&mut dyn FnMut(crate::capture::PreviewUpdate) -> bool>,
     ) -> Result<CaptureResult> {
         let t0 = std::time::Instant::now();
         let h = write_body_snapshot(project, files, main, &self.src_dir)?;
         if h != self.preamble_hash {
             anyhow::bail!("standby preamble differs from the snapshot");
         }
+        let mut reader = if previews.is_some() {
+            Some(crate::capture::PagePreviewReader::new(
+                &self.out_dir,
+                &self.jobname,
+            )?)
+        } else {
+            None
+        };
         {
             use std::io::Write;
             let mut stdin = self
                 .stdin
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("standby stdin already closed"))?;
-            stdin.write_all(b"GO\n").context("releasing standby")?;
+            stdin
+                .write_all(if previews.is_some() {
+                    b"GO_PREVIEWS\n"
+                } else {
+                    b"GO\n"
+                })
+                .context("releasing standby")?;
             stdin.flush().ok();
             drop(stdin);
         }
         // stdout is drained while waiting (a full pipe would block the engine)
-        let (status, stdout) = crate::capture::wait_child(&mut self.child, t0, stop)?;
+        let enabled = reader.is_some();
+        let mut poll = || {
+            if let (Some(reader), Some(callback)) = (reader.as_mut(), previews.as_mut()) {
+                reader.poll(*callback);
+            }
+        };
+        let (status, stdout) = if enabled {
+            crate::capture::wait_child_with_progress(&mut self.child, t0, stop, Some(&mut poll))?
+        } else {
+            crate::capture::wait_child(&mut self.child, t0, stop)?
+        };
         collect_capture(
             &self.out_dir,
             &self.jobname,
@@ -1025,6 +1063,21 @@ impl Drop for WarmEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auxiliary_backup_inside_the_output_directory_does_not_recurse() {
+        let dir = std::env::temp_dir().join(format!("rtex-nested-aux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.aux"), "complete").unwrap();
+        let backup = dir.join("completed-aux");
+        copy_aux_family(&dir, &backup).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.join("main.aux")).unwrap(),
+            "complete"
+        );
+        assert!(!backup.join("completed-aux").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn superseded_run_returns_a_completed_capture_without_aux_tools_or_more_passes() {

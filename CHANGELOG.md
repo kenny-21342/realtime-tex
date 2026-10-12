@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Preview rebuilt pages before the document finishes.** A warm background run can publish
+  `PagePreview` as each affected page ships for validated plain-text paragraph edits. Hosts
+  can display complete exact/native pages and their new placements while the suffix is still
+  compiling. A superseded run yields after showing the affected page; its partial auxiliary
+  files never seed the next run. Errors reset provisional pages. The completed layout and
+  export retain the usual convergence and fidelity checks. Late pages still wait for TeX to
+  process the preceding document; tables, floats, structural edits and unsupported drawing
+  continue through full layouts.
+
 - **Page updates while typing continuously.** Body reflow briefly coalesces edits (25 ms quiet
   time, capped at 100 ms) and starts full layouts at most once per debounce interval (300 ms by
   default), including when a paragraph gains or loses lines and moves later text onto another

@@ -172,6 +172,8 @@ impl Observer {
 
     fn note(&mut self, e: &Event) {
         let line = match e {
+            Event::PagePreview { run_id, source_revision, page, .. } => format!("PagePreview run {run_id} rev {source_revision} page {}", page.page),
+            Event::PagePreviewReset { run_id, .. } => format!("PagePreviewReset run {run_id}"),
             Event::LayoutUpdate { versions, compile, convergence, passes, pages_changed, pages_total, wall_ms, .. } => format!(
                 "LayoutUpdate rev {} layout_v {} gen {} compile {:?} convergence {:?} passes {} pages_changed {} of {} wall {} ms",
                 versions.source_revision, versions.layout_version, versions.engine_generation, compile, convergence, passes, pages_changed.len(), pages_total, wall_ms

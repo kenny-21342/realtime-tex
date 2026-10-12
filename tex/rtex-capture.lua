@@ -582,6 +582,16 @@ function C.page_attr(s) C.next_page_attr = s end
 
 -- pre_shipout_filter: `b` is the page box as shipped.
 function C.shipout(b)
+  -- Reading the retained error status preserves LuaTeX's ordinary error printing and source
+  -- locations. Installing show_error_hook changes that printing, even for a no-op hook.
+  local err = status.lasterrorstring
+  if C.page_previews and not C.preview_invalid and err and err ~= "" and not err:match("^ignored:") then
+    C.preview_invalid = true
+    local dir = os.getenv("RTEX_CAPTURE_DIR") or os.getenv("TEXMF_OUTPUT_DIRECTORY") or "."
+    local f = assert(io.open(dir .. "/" .. C.jobname .. ".rtex-preview.jsonl", "a"))
+    f:write('{"invalid":true}\n')
+    f:close()
+  end
   C.page = C.page + 1
   local attr = C.next_page_attr or ""
   C.next_page_attr = nil
@@ -632,6 +642,27 @@ function C.shipout(b)
       pl[row] = { page = C.page, row = row, x = line.x, y = line.y, w = line.w, h = line.h, d = line.d,
                   par = line.par, line = line.i }
     end
+  end
+  -- Optional editing previews. The final capture below is still written normally, including
+  -- its final resource tables; offline verification and ordinary passes do not use this path.
+  if C.page_previews and not C.preview_invalid then
+    local dir = os.getenv("RTEX_CAPTURE_DIR") or os.getenv("TEXMF_OUTPUT_DIRECTORY") or "."
+    local pf = assert(io.open(dir .. "/" .. C.jobname .. ".rtex-preview-page" .. C.page .. ".json", "w"))
+    pf:write(json.encode(page))
+    pf:close()
+    local units = {}
+    for _, u in ipairs(C.units) do
+      local last = u.end_line or u.begin_line
+      for _, seq in ipairs(u.seqs) do
+        local p = C.paras[seq]
+        if p and p.file == u.file then last = math.max(last, p.end_line or last) end
+      end
+      units[#units + 1] = { uid = u.uid, kind = u.kind, nest = u.nest, file = u.file,
+                            begin_line = u.begin_line, end_line = last, rows = #u.placements }
+    end
+    local f = assert(io.open(dir .. "/" .. C.jobname .. ".rtex-preview.jsonl", "a"))
+    f:write(json.encode({ page = C.page, units = units }), "\n")
+    f:close()
   end
 end
 

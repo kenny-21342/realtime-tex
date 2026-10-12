@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+mod progress;
+pub(crate) use progress::{PageCapture, PagePreviewReader, PreviewUpdate};
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Nfss {
     pub enc: Option<String>,
@@ -402,6 +405,15 @@ pub fn wait_child(
     t0: Instant,
     stop: StopCheck,
 ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    wait_child_with_progress(child, t0, stop, None)
+}
+
+pub(crate) fn wait_child_with_progress(
+    child: &mut std::process::Child,
+    t0: Instant,
+    stop: StopCheck,
+    mut progress: Option<&mut dyn FnMut()>,
+) -> Result<(std::process::ExitStatus, Vec<u8>)> {
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(mut so) = child.stdout.take() {
         std::thread::spawn(move || {
@@ -413,13 +425,22 @@ pub fn wait_child(
         let _ = tx.send(Vec::new());
     }
     loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(out) => return Ok((child.wait().context("waiting for lualatex")?, out)),
+        let interval = if progress.is_some() { 10 } else { 100 };
+        match rx.recv_timeout(std::time::Duration::from_millis(interval)) {
+            Ok(out) => {
+                if let Some(poll) = progress.as_mut() {
+                    poll();
+                }
+                return Ok((child.wait().context("waiting for lualatex")?, out));
+            }
             // the reader is gone without its output: the engine's stdout closed
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Ok((child.wait().context("waiting for lualatex")?, Vec::new()))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Some(poll) = progress.as_mut() {
+            poll();
         }
         if let Some(reason) = stop(t0.elapsed()) {
             let _ = child.kill();

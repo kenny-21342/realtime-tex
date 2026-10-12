@@ -760,7 +760,11 @@ pub(super) fn demote_span(s: &Shared, req: &FastRequest, why: &str) {
     }
     s.bg_signal
         .0
-        .send(BgCmd::Pass(BackgroundPriority::Debounced))
+        .send(BgCmd::Pass(if req.warmup {
+            BackgroundPriority::Debounced
+        } else {
+            BackgroundPriority::Reflow
+        }))
         .ok();
 }
 
@@ -976,6 +980,19 @@ pub(super) fn handle_result(
     let mut dl = cr.dl.unwrap();
     if !cr.images.is_empty() {
         dl.images = cr.images.clone();
+    }
+    // Valid text can outgrow the cached page. It still validates a page-preview pass even
+    // when the old placement below would be off-page and the live overlay is withheld.
+    if dl.inserts == 0
+        && dl.flags_map().is_empty()
+        && s.layout
+            .lock()
+            .unit(req.par_id)
+            .is_some_and(|u| u.advanced() == cr.counters)
+    {
+        s.preview_validated
+            .lock()
+            .insert(req.par_id, (req.versions.source_revision, wanted_gen));
     }
     let rows: Vec<(i64, i64)> = dl.lines.iter().map(|l| (l.x, l.y)).collect();
     let (fragments, mut stale) = {

@@ -152,6 +152,47 @@ pub fn snapshot_spans_of(
         .collect()
 }
 
+/// Map a capture unit to the source span with the same rules for completed layouts and
+/// page previews (including the one-line read-ahead at paragraph and heading boundaries).
+pub(crate) fn span_for_unit(u: &CapturedUnit, snapshot: &[SnapshotSpan]) -> Option<ParaId> {
+    let file = u.file.clone().unwrap_or_else(|| "./main.tex".into());
+    let file = crate::paths::key(&file);
+    let file = file.trim_start_matches("./").to_string();
+    let mut span = None;
+    for s in snapshot {
+        if s.file == file && u.begin_line >= s.first_line && u.begin_line <= s.last_line {
+            span = Some(s.id);
+            break;
+        }
+    }
+    if span.is_none() {
+        // a unit that begins on a blank line between two spans: it belongs to the next
+        // span when it extends into it (the engine reported the paragraph a line early,
+        // seen after \newpage in standby passes), otherwise to the previous one (a macro
+        // at the end of its last line read ahead before producing the unit: hyperref's
+        // \maketitle wrapper)
+        let next = if u.kind == "par" {
+            snapshot
+                .iter()
+                .find(|s| {
+                    s.file == file
+                        && s.first_line > u.begin_line
+                        && u.end_line.unwrap_or(u.begin_line) >= s.first_line
+                })
+                .map(|s| s.id)
+        } else {
+            None
+        };
+        span = next.or_else(|| {
+            snapshot
+                .iter()
+                .find(|s| s.file == file && s.last_line + 1 == u.begin_line)
+                .map(|s| s.id)
+        });
+    }
+    span
+}
+
 #[derive(Debug, Default)]
 pub struct LayoutStore {
     pub layout_version: u64,
@@ -190,41 +231,7 @@ impl LayoutStore {
             cap.json.paragraphs.iter().map(|p| (p.seq, p)).collect();
         let mut per_span_count: HashMap<ParaId, usize> = HashMap::new();
         for u in &cap.json.units {
-            let file = u.file.clone().unwrap_or_else(|| "./main.tex".into());
-            let file = crate::paths::key(&file);
-            let file = file.trim_start_matches("./").to_string();
-            let mut span = None;
-            for s in &snapshot {
-                if s.file == file && u.begin_line >= s.first_line && u.begin_line <= s.last_line {
-                    span = Some(s.id);
-                    break;
-                }
-            }
-            if span.is_none() {
-                // a unit that begins on a blank line between two spans: it belongs to the next
-                // span when it extends into it (the engine reported the paragraph a line early,
-                // seen after \newpage in standby passes), otherwise to the previous one (a macro
-                // at the end of its last line read ahead before producing the unit: hyperref's
-                // \maketitle wrapper)
-                let next = if u.kind == "par" {
-                    snapshot
-                        .iter()
-                        .find(|s| {
-                            s.file == file
-                                && s.first_line > u.begin_line
-                                && u.end_line.unwrap_or(u.begin_line) >= s.first_line
-                        })
-                        .map(|s| s.id)
-                } else {
-                    None
-                };
-                span = next.or_else(|| {
-                    snapshot
-                        .iter()
-                        .find(|s| s.file == file && s.last_line + 1 == u.begin_line)
-                        .map(|s| s.id)
-                });
-            }
+            let span = span_for_unit(u, &snapshot);
             if let Some(id) = span {
                 *per_span_count.entry(id).or_default() += 1;
             }

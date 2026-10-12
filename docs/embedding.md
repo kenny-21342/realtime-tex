@@ -142,6 +142,36 @@ When a layout arrives, drop live results for units whose last edit is older than
 snapshot. In practice: if `source_revision` hasn't moved since the edit, the layout already
 contains it. Keep the newer ones and move them to the new `placements`.
 
+### `PagePreview` and `PagePreviewReset`: optional progress while a pass runs
+
+These additive events do not advance the authoritative layout version or imply convergence.
+They are enabled for warm runs over validated plain-text paragraph edits, with an error-free
+base layout and no held pictures. Structural/stateful edits use ordinary full layouts.
+
+| Field (`PagePreview`) | Meaning |
+|---|---|
+| `run_id` | increasing preview-run identifier; reject late events from older or reset runs |
+| `base_layout_version` | committed layout this preview builds on; ignore if it differs from the host's layout version |
+| `source_revision` | source snapshot compiled into this page |
+| `page` | one `PageUpdate`, including `dl`, `exact` and optional `native`; draw only when all fonts/images are available, without borrowing pixels from an older PDF |
+| `placements` | placements on this page, with global unit row indices; replace placements on this page and retain those on other pages |
+
+Save the committed pages and placements before accepting the first preview. Re-anchor newer
+live overlays, but retain the coherent page when their row count differs from its placements;
+a growing overlay must not cover following text or pictures. Suppress overlays already included
+in the preview's revision. Cursor and source mapping must use the displayed placements.
+
+`PagePreviewReset { run_id, base_layout_version }` restores the committed pages and placements
+and rejects subsequent delayed previews from that run. Keep newer live results for re-anchoring.
+Before applying any completed `LayoutUpdate`, restore the committed baseline: its page delta
+is relative to that baseline, so an omitted page must not retain a provisional change. Hosts
+may ignore both event kinds and continue using ordinary layouts. C ABI event kinds are 7 and 8;
+`PagePreview` exposes one binary display list through the normal event-DL accessors.
+
+The first affected page can arrive long before the suffix finishes. A late-page edit still
+requires TeX to process its prefix. Neither these events nor a pending page count are a final
+PDF; exports continue to wait for the full convergence result.
+
 ### The others
 
 | Event | Meaning |
