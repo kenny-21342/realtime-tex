@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.10 (2026-10-13)
+
 - Newly typed plain paragraphs can borrow outer heading/environment state when no standalone
   body paragraph is available. Paragraphs following a completed run-in heading recognize its
   inactive hook and become live-eligible after capture. Blank lines between an empty run-in
