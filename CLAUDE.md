@@ -58,6 +58,12 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
     live row counts keep all changed rows and the following drawing visible before cancellation.
     `tests/new_paragraphs.rs` covers early progress, overflow, drawing retention and clean PDFs.
     A late-page edit still waits for its prefix; no claim of constant-time whole-document layout.
+    New plain paragraphs can also borrow outer heading/environment entry state when no
+    standalone paragraph donor exists. Empty run-in headings keep their first text across blank
+    source lines; completed run-in hooks replay only their captured inactive branch. Regression
+    tests type new lines, check captured eligibility, and compare subsequent live results
+    with the completed page rows. Policy tracks explicit titlesec display shapes and spacing;
+    FileBuf applies the same heading segmentation to main files, inputs and verifier snapshots.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by

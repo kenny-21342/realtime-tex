@@ -1331,7 +1331,7 @@ fn layout_lists(
                 })
                 .unwrap_or(false);
         if source_ok
-            && check_engine_unit(&c.kind, &c.everypar, has_ctx, eu.rows(), &eu.flags).is_empty()
+            && check_engine_unit(&c.kind, eu.everypar(), has_ctx, eu.rows(), &eu.flags).is_empty()
         {
             eligible.push(*id);
             let strict_ok = files

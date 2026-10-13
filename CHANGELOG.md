@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Newly typed plain paragraphs can borrow outer heading/environment state when no standalone
+  body paragraph is available. Paragraphs following a completed run-in heading recognize its
+  inactive hook and become live-eligible after capture. Blank lines between an empty run-in
+  heading and its first text no longer split that single TeX unit; live compilation keeps the
+  title with the text, including before the first captured rows exist. Explicit titlesec
+  display shapes and first-paragraph indentation are respected instead of treating every
+  `\paragraph` as run-in.
+
 ## 0.0.9 (2026-10-13)
 
 - New plain-text paragraphs and paragraph splits can use live-validated page previews without
