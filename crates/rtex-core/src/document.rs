@@ -45,6 +45,7 @@ pub struct FileBuf {
     pub spans: Vec<Span>,
     /// Extra block environments (theorem-like) that end a span like the built-in ones.
     pub extra_block_envs: Vec<String>,
+    pub display_headings: std::collections::BTreeSet<String>,
 }
 
 /// Block environments after whose `\end` a span ends (the capture closes the unit there); the
@@ -389,7 +390,16 @@ fn compute_line_starts(text: &str) -> Vec<usize> {
 }
 
 /// Boundaries of paragraph-ish units in `text`, as byte ranges with kinds (ids not assigned).
+#[cfg(test)]
 fn segment(text: &str, extra_block_envs: &[String]) -> Vec<(Range<usize>, SpanKind)> {
+    segment_with_headings(text, extra_block_envs, &Default::default())
+}
+
+fn segment_with_headings(
+    text: &str,
+    extra_block_envs: &[String],
+    display_headings: &std::collections::BTreeSet<String>,
+) -> Vec<(Range<usize>, SpanKind)> {
     let mut out: Vec<(Range<usize>, SpanKind)> = Vec::new();
     let begin_doc = find_command(text, "\\begin{document}");
     let end_doc = find_command(text, "\\end{document}");
@@ -407,7 +417,14 @@ fn segment(text: &str, extra_block_envs: &[String]) -> Vec<(Range<usize>, SpanKi
         None => 0,
     };
     let body_end = end_doc.filter(|e| *e >= body_start).unwrap_or(text.len());
-    let _ = segment_body(text, body_start, body_end, &mut out, extra_block_envs);
+    let _ = segment_body(
+        text,
+        body_start,
+        body_end,
+        &mut out,
+        extra_block_envs,
+        display_headings,
+    );
     if body_end < text.len() {
         out.push((body_end..text.len(), SpanKind::Trailer));
     }
@@ -423,6 +440,7 @@ fn segment_body(
     body_end: usize,
     out: &mut Vec<(Range<usize>, SpanKind)>,
     extra_block_envs: &[String],
+    display_headings: &std::collections::BTreeSet<String>,
 ) -> bool {
     let is_block =
         |name: &str| BLOCK_ENVS.contains(&name) || extra_block_envs.iter().any(|e| e == name);
@@ -468,9 +486,10 @@ fn segment_body(
         };
         let heading = HEADING_CMDS.iter().any(|h| stripped.starts_with(h));
         let runin_heading = RUNIN_HEADING_CMDS.iter().any(|h| {
-            stripped
-                .strip_prefix(h)
-                .is_some_and(|r| !r.starts_with(|c: char| c.is_ascii_alphabetic()))
+            !display_headings.contains(&h[1..])
+                && stripped
+                    .strip_prefix(h)
+                    .is_some_and(|r| !r.starts_with(|c: char| c.is_ascii_alphabetic()))
         });
         // a picture environment opened while a paragraph is open (text before it in this span
         // or on its line) is an inline box of that paragraph, as the capture sees it (no unit
@@ -494,11 +513,29 @@ fn segment_body(
         };
         if env_stack.is_empty() {
             if is_blank && trimmed.is_empty() {
+                // A run-in heading still waits for its first text paragraph. TeX ignores
+                // these blank lines in vertical mode; the title and that text share a unit.
+                if cur_kind == SpanKind::Heading
+                    && runin
+                    && cur_start
+                        .is_some_and(|s| crate::eligibility::heading_only(&body[s..*lstart]))
+                {
+                    continue;
+                }
                 if let Some(s) = cur_start.take() {
                     flush(out, s, *lstart, cur_kind);
                 }
                 split_pending = false;
                 continue;
+            }
+            if cur_kind == SpanKind::Heading
+                && runin
+                && !begins.is_empty()
+                && cur_start.is_some_and(|s| crate::eligibility::heading_only(&body[s..*lstart]))
+            {
+                // A block environment has its own capture boundary, even when it
+                // immediately follows a still-empty run-in heading.
+                flush(out, cur_start.take().unwrap(), *lstart, cur_kind);
             }
             if cur_start.is_none() {
                 cur_start = Some(*lstart);
@@ -744,6 +781,24 @@ impl FileBuf {
             line_starts: compute_line_starts(text),
             spans: Vec::new(),
             extra_block_envs,
+            display_headings: Default::default(),
+        };
+        fb.resegment(ids, rev);
+        fb
+    }
+
+    pub fn with_policy(
+        text: &str,
+        ids: &mut IdAllocator,
+        rev: Revision,
+        policy: &crate::eligibility::Policy,
+    ) -> FileBuf {
+        let mut fb = FileBuf {
+            text: text.to_string(),
+            line_starts: compute_line_starts(text),
+            spans: Vec::new(),
+            extra_block_envs: policy.theorem_envs.iter().cloned().collect(),
+            display_headings: policy.display_headings.clone(),
         };
         fb.resegment(ids, rev);
         fb
@@ -751,7 +806,8 @@ impl FileBuf {
 
     /// Re-segment the whole buffer (new ids for every span).
     pub fn resegment(&mut self, ids: &mut IdAllocator, rev: Revision) {
-        let units = segment(&self.text, &self.extra_block_envs);
+        let units =
+            segment_with_headings(&self.text, &self.extra_block_envs, &self.display_headings);
         self.spans = units
             .into_iter()
             .map(|(range, kind)| {
@@ -890,6 +946,7 @@ impl FileBuf {
                 win_end,
                 &mut units,
                 &self.extra_block_envs,
+                &self.display_headings,
             ) {
                 let tail_from = if hi_is_trailer { hi } else { hi + 1 };
                 for sp in &old_spans[tail_from..] {
@@ -901,10 +958,10 @@ impl FileBuf {
                 }
                 units
             } else {
-                segment(&self.text, &self.extra_block_envs)
+                segment_with_headings(&self.text, &self.extra_block_envs, &self.display_headings)
             }
         } else {
-            segment(&self.text, &self.extra_block_envs)
+            segment_with_headings(&self.text, &self.extra_block_envs, &self.display_headings)
         };
         // old spans before the edit whose range came out unchanged are unchanged (a span that
         // merely borders the edit, like the preamble when typing at the top of the first
@@ -1305,6 +1362,39 @@ mod tests {
             )
         );
         assert_eq!(fb.spans.len(), 7);
+    }
+
+    #[test]
+    fn runin_heading_waits_across_blank_lines_but_not_a_block_environment() {
+        let doc = "\\begin{document}\n\\paragraph{Title}\n\nFirst text.\n\nSecond text.\n\n\\paragraph{List}\n\n\\begin{itemize}\n\\item One\n\\end{itemize}\n\\end{document}\n";
+        let mut ids = IdAllocator(0);
+        let fb = FileBuf::new(doc, &mut ids, 1);
+        let body: Vec<_> = fb
+            .spans
+            .iter()
+            .filter(|s| !matches!(s.kind, SpanKind::Preamble | SpanKind::Trailer))
+            .map(|s| (s.kind, fb.span_text(s.id).unwrap().trim()))
+            .collect();
+        assert_eq!(body.len(), 4);
+        assert_eq!(
+            body[0],
+            (SpanKind::Heading, "\\paragraph{Title}\n\nFirst text.")
+        );
+        assert_eq!(body[1], (SpanKind::Body, "Second text."));
+        assert_eq!(body[2], (SpanKind::Heading, "\\paragraph{List}"));
+        assert_eq!(body[3].0, SpanKind::Env);
+        let commented = doc.replacen(
+            "\\paragraph{Title}",
+            "\\paragraph{Title}% waiting for text",
+            1,
+        );
+        let fb = FileBuf::new(&commented, &mut ids, 1);
+        let heading = fb
+            .spans
+            .iter()
+            .find(|s| s.kind == SpanKind::Heading)
+            .unwrap();
+        assert!(fb.span_text(heading.id).unwrap().contains("First text."));
     }
 
     #[test]

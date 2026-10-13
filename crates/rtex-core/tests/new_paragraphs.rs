@@ -311,3 +311,164 @@ fn a_new_paragraph_does_not_cancel_before_the_following_drawing_is_visible() {
     s.close();
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn typing_new_paragraphs_after_boundaries_becomes_captured_live_text() {
+    if rtex_core::texlive::TexLive::discover().is_err() {
+        return;
+    }
+    for (name, prefix) in [
+        ("heading", "\\section{Title}\n"),
+        ("runin", "\\paragraph{Title} Existing text.\n"),
+        ("display-paragraph", "\\paragraph{Title}\n"),
+        ("display-unindented", "\\paragraph{Title}\n"),
+        ("pending-runin", "\\section{Section}\n\\paragraph{Title}\n"),
+        (
+            "list",
+            "\\begin{itemize}\n\\item Existing text.\n\\end{itemize}\n",
+        ),
+        (
+            "inline-list",
+            "\\noindent Existing text.\\begin{itemize}\\item One\\end{itemize}\n",
+        ),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("rtex-new-boundary-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let setup = if name.starts_with("display-") {
+            "\\usepackage{titlesec}\n\\titleformat{\\paragraph}[hang]{\\normalsize\\bfseries}{\\theparagraph}{1em}{}\n"
+        } else {
+            ""
+        };
+        let spacing = if name == "display-unindented" {
+            "\\titlespacing*{\\paragraph}{0pt}{2ex}{1em}\n"
+        } else {
+            ""
+        };
+        let text = format!(
+            "\\documentclass{{article}}\n{setup}{spacing}\\begin{{document}}\n{prefix}\n\\end{{document}}\n"
+        );
+        std::fs::write(root.join("main.tex"), &text).unwrap();
+        let mut cfg = SessionConfig::new(&root, "main.tex");
+        cfg.build_dir = root.join("build");
+        cfg.debounce = Duration::from_millis(100);
+        let s = Session::open(cfg).unwrap();
+        let mut observer = rtex_core::replay::Observer::new();
+        assert!(
+            observer.settle(&s, 1, Duration::from_secs(120)),
+            "{name}: initial layout"
+        );
+        let mut at = text.find("\\end{document}").unwrap();
+        // Build the paragraph as an editor does, including a source newline inside it.
+        // A single paste of a complete paragraph misses repeated NoContext refusals.
+        let mut id = None;
+        let mut revision = 1;
+        let mut last_edit_id = 0;
+        for addition in ["\n", "Z", "e", "bra", "\n", "new line."] {
+            let edit = s
+                .apply_edit(
+                    "main.tex",
+                    Edit {
+                        start_byte: at,
+                        end_byte: at,
+                        text: addition.into(),
+                    },
+                )
+                .unwrap();
+            at += addition.len();
+            revision = edit.source_revision;
+            last_edit_id = edit.edit_id;
+            if addition.trim().is_empty() && id.is_none() {
+                continue;
+            }
+            assert_eq!(edit.routed, "fast", "{name}: {:?}", edit.reasons);
+            let par_id = *id.get_or_insert_with(|| {
+                *edit
+                    .outcome
+                    .added
+                    .first()
+                    .or(edit.outcome.touched.first())
+                    .unwrap()
+            });
+            let (event, others) = s.wait_for(Duration::from_secs(30), |e| matches!(e,
+                Event::ParagraphUpdate { par_id: p, edit_id, .. } if *p == par_id && *edit_id == edit.edit_id));
+            for e in others {
+                observer.absorb(e);
+            }
+            if let Some(e) = event.clone() {
+                observer.absorb(e);
+            }
+            assert!(
+                matches!(event, Some(Event::ParagraphUpdate { status, dl, .. })
+                if status.starts_with("ok") && !dl.lines.is_empty()),
+                "{name}: no live result"
+            );
+        }
+        let par_id = id.unwrap();
+        let (event, others) = s.wait_for(Duration::from_secs(120), |e| {
+            matches!(e,
+            Event::LayoutUpdate { versions, convergence: Convergence::Converged, .. }
+            if versions.source_revision >= revision)
+        });
+        for e in others {
+            observer.absorb(e);
+        }
+        if let Some(e) = event.clone() {
+            observer.absorb(e);
+        }
+        let Some(Event::LayoutUpdate {
+            eligible_paragraphs,
+            ..
+        }) = event
+        else {
+            panic!("{name}: no layout")
+        };
+        assert!(eligible_paragraphs.contains(&par_id), "{name}: new paragraph {par_id:?} never became eligible: {eligible_paragraphs:?}; spans {:?}; units {:?}", s.spans("main.tex"), s.layout_units());
+        let served = observer.updates[&(last_edit_id, par_id)].clone();
+        assert_eq!(
+            observer.judge(&served).verdict,
+            rtex_core::replay::Verdict::Match,
+            "{name}: borrowed result differs from capture: {:?}",
+            observer.judge(&served).details
+        );
+        let edit = s
+            .apply_edit(
+                "main.tex",
+                Edit {
+                    start_byte: at,
+                    end_byte: at,
+                    text: " More.".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            edit.routed, "fast",
+            "{name}: captured edit {:?}",
+            edit.reasons
+        );
+        let (event, others) = s.wait_for(Duration::from_secs(30), |e| matches!(e,
+            Event::ParagraphUpdate { par_id: p, edit_id, .. } if *p == par_id && *edit_id == edit.edit_id));
+        assert!(
+            matches!(&event, Some(Event::ParagraphUpdate { status, dl, .. })
+            if status.starts_with("ok") && !dl.lines.is_empty()),
+            "{name}: captured result {event:?}"
+        );
+        for e in others {
+            observer.absorb(e);
+        }
+        if let Some(e) = event {
+            observer.absorb(e);
+        }
+        let served = observer.updates[&(edit.edit_id, par_id)].clone();
+        assert!(observer.settle(&s, edit.source_revision, Duration::from_secs(120)));
+        assert_eq!(
+            observer.judge(&served).verdict,
+            rtex_core::replay::Verdict::Match,
+            "{name}: captured live edit differs from full layout: {:?}",
+            observer.judge(&served).details
+        );
+        s.close();
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

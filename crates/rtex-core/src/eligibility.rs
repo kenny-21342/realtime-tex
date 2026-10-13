@@ -1200,6 +1200,10 @@ pub struct Policy {
     /// User macros whose body starts with a heading command (`\newcommand{\unnumberedsection}[1]{\section*{#1}…}`):
     /// macro name → heading name. A span starting with one has that heading's shape.
     pub heading_macros: BTreeMap<String, String>,
+    /// Standard run-in commands explicitly configured as display headings by titlesec.
+    pub display_headings: BTreeSet<String>,
+    /// Explicit titlesec spacing rules for the first paragraph's indentation.
+    pub heading_indents: BTreeMap<String, bool>,
     /// Environments defined in the preamble (`\newenvironment`) whose begin/end code is
     /// allow-listed text (font switches, `\noindent`, a label): typeset inside the paragraph
     /// they wrap. Ones whose code opens a block environment are in `theorem_envs` instead.
@@ -1210,6 +1214,12 @@ pub struct Policy {
 }
 
 impl Policy {
+    pub(crate) fn indent_after_heading(&self, name: &str) -> bool {
+        self.heading_indents.get(name).copied().unwrap_or_else(|| {
+            matches!(name, "paragraph" | "subparagraph") || self.packages.contains("indentfirst")
+        })
+    }
+
     /// Derive package facts and theorem environments from the document preamble.
     pub fn from_preamble(preamble: &str, trusted: &[String], unit_envs: &[String]) -> Policy {
         let text = strip_comments(preamble);
@@ -1292,9 +1302,49 @@ impl Policy {
             trusted_math: BTreeSet::new(),
             permissive: false,
             heading_macros: BTreeMap::new(),
+            display_headings: BTreeSet::new(),
+            heading_indents: BTreeMap::new(),
             user_inner_envs: BTreeSet::new(),
             list_envs,
         };
+        // titlesec's unstarred titleformat sets the heading shape (default: hang).
+        // Starred font-only changes leave the existing shape alone. Process declarations
+        // in order so a later [runin] restores the standard run-in behavior.
+        for (at, _) in text.match_indices("\\titleformat") {
+            let tail = &text[at..];
+            let tail = tail.strip_prefix("\\titleformat").unwrap().trim_start();
+            let Some(tail) = tail.strip_prefix('{') else {
+                continue;
+            };
+            let Some(end) = tail.find('}') else { continue };
+            let name = tail[..end].trim().trim_start_matches('\\');
+            if !matches!(name, "paragraph" | "subparagraph") {
+                continue;
+            }
+            let rest = tail[end + 1..].trim_start();
+            let shape = optional_arg(rest).unwrap_or("hang").trim();
+            if shape == "runin" {
+                policy.display_headings.remove(name);
+            } else if matches!(shape, "hang" | "block" | "display") {
+                policy.display_headings.insert(name.to_string());
+            }
+        }
+        for (at, _) in text.match_indices("\\titlespacing") {
+            let tail = text[at..]
+                .strip_prefix("\\titlespacing")
+                .unwrap()
+                .trim_start();
+            let starred = tail.starts_with('*');
+            let tail = tail.strip_prefix('*').unwrap_or(tail).trim_start();
+            let Some(tail) = tail.strip_prefix('{') else {
+                continue;
+            };
+            let Some(end) = tail.find('}') else { continue };
+            let name = tail[..end].trim().trim_start_matches('\\');
+            if HEADINGS.contains(&name) {
+                policy.heading_indents.insert(name.to_string(), !starred);
+            }
+        }
         // Macros defined in the preamble whose bodies are themselves allow-listed are trusted:
         // in text mode, in math mode, or both, depending on how the body classifies. Two rounds
         // let a macro use one defined before it.
@@ -1766,7 +1816,9 @@ pub fn classify_source_with(
     // its span (its paragraph after a blank line) it is a fragment of a paragraph elsewhere
     let run_in = match &shape {
         UnitShape::Heading(h)
-            if (h == "paragraph" || h == "subparagraph") && heading_only(&text) =>
+            if (h == "paragraph" || h == "subparagraph")
+                && !policy.display_headings.contains(h)
+                && heading_only(&text) =>
         {
             Some(h.clone())
         }
@@ -1801,7 +1853,8 @@ pub fn classify_source_with(
 }
 
 /// True when `text` is a heading command and its arguments and nothing else (`\paragraph*[toc]{Title.}`).
-fn heading_only(text: &str) -> bool {
+pub(crate) fn heading_only(text: &str) -> bool {
+    let text = strip_comments(text);
     let t = text.trim_start();
     let Some(rest) = t.strip_prefix('\\') else {
         return false;
@@ -2021,6 +2074,12 @@ impl<'a> Scan<'a> {
             && self.i + 1 < b.len()
             && !text[self.i + 1..].trim().is_empty()
             && self.line_start > 0
+            && !(matches!(&self.shape, UnitShape::Heading(h) if h == "paragraph" || h == "subparagraph")
+                && !self.policy.display_headings.contains(match &self.shape {
+                    UnitShape::Heading(h) => h,
+                    _ => unreachable!(),
+                })
+                && heading_only(&text[..self.i + 1]))
         {
             self.push(Reason::ParagraphBreak);
         }
@@ -2650,6 +2709,8 @@ pub fn everypar_allowed(ep: &str) -> bool {
         "\\if@nobreak \\@nobreakfalse \\clubpenalty \\@M \\setbox \\z@ \\lastbox \\else \\clubpenalty \\@clubpenalty \\everypar {}\\fi ",
         // \@doendpe (first paragraph after an environment)
         "{\\setbox \\z@ \\lastbox }\\everypar {}\\@endpefalse ",
+        // Inactive branch after a completed run-in heading (selected from captured state).
+        "\\clubpenalty \\@clubpenalty \\everypar {}",
         // \@setminipage (first paragraph in a float or minipage)
         "\\@minipagefalse \\everypar {}",
     ];
@@ -2726,6 +2787,8 @@ mod tests {
             cite_ok: true,
             permissive: false,
             heading_macros: BTreeMap::new(),
+            display_headings: BTreeSet::new(),
+            heading_indents: BTreeMap::new(),
             packages: [
                 "hyperref", "url", "natbib", "siunitx", "ulem", "listings", "multirow", "colortbl",
                 "cancel", "bm", "amssymb",
@@ -2890,6 +2953,32 @@ mod tests {
             UnitShape::Env("theorem".into())
         );
     }
+    #[test]
+    fn titlesec_shapes_distinguish_display_and_runin_paragraphs() {
+        let display = Policy::from_preamble(
+            "\\usepackage{titlesec}\n\\titleformat{\\paragraph}[hang]{\\bfseries}{}{1em}{}",
+            &[],
+            &[],
+        );
+        assert!(display.display_headings.contains("paragraph"));
+        assert!(display.indent_after_heading("paragraph"));
+        let starred_spacing =
+            Policy::from_preamble("\\titlespacing*{\\paragraph}{0pt}{2ex}{1em}", &[], &[]);
+        assert!(!starred_spacing.indent_after_heading("paragraph"));
+        assert!(classify_source("\\paragraph{Title}", &display).1.is_empty());
+        let runin = Policy::from_preamble(
+            "\\titleformat{\\paragraph}[hang]{}{}{}{}\n\\titleformat{\\paragraph}[runin]{}{}{}{}",
+            &[],
+            &[],
+        );
+        assert!(!runin.display_headings.contains("paragraph"));
+        assert!(classify_source("\\paragraph{Title}", &runin)
+            .1
+            .contains(&Reason::RunInHeading("paragraph".into())));
+        let starred = Policy::from_preamble("\\titleformat*{\\paragraph}{\\bfseries}", &[], &[]);
+        assert!(!starred.display_headings.contains("paragraph"));
+    }
+
     #[test]
     fn headings() {
         let (shape, r) = classify_source("\\section{A \\emph{title}}\\label{sec:a}", &pol());
@@ -3104,6 +3193,13 @@ mod tests {
         assert_eq!(r, vec![Reason::RunInHeading("subparagraph".into())]);
         let (_, r) = classify_source("\\paragraph{Run-in.} With text.", &p);
         assert!(r.is_empty(), "{r:?}");
+        let (_, r) = classify_source("\\paragraph{Run-in.}\n\nWith text.", &p);
+        assert!(r.is_empty(), "{r:?}");
+        let (_, r) = classify_source(
+            "\\paragraph{Run-in.}\n\nWith text.\n\nAnother paragraph.",
+            &p,
+        );
+        assert!(r.contains(&Reason::ParagraphBreak), "{r:?}");
         let r = check_source(
             "Text {\\rm roman} and $\\rm x \\uparrow \\iint$ and \\scalebox{2}{big}",
             &p,

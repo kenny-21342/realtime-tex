@@ -80,6 +80,18 @@ impl EngineUnit {
                 .unwrap_or(false)
     }
 
+    /// The second paragraph after a run-in heading still enters with the heading's
+    /// everypar hook installed, but noskipsec is already false. Replay only its
+    /// inactive branch: the heading text must never be executed for this paragraph.
+    pub fn everypar(&self) -> &str {
+        const RUNIN: &str = "\\if@noskipsec \\global \\@noskipsecfalse {\\setbox \\z@ \\lastbox }\\clubpenalty \\@M \\begingroup \\@svsechd \\endgroup \\unskip \\@tempskipa -1em\\relax \\hskip -\\@tempskipa \\else \\clubpenalty \\@clubpenalty \\everypar {}\\fi ";
+        if !self.captured.noskipsec && self.captured.everypar == RUNIN {
+            "\\clubpenalty \\@clubpenalty \\everypar {}"
+        } else {
+            &self.captured.everypar
+        }
+    }
+
     /// Counters the unit advanced in the last pass (name → value at its end).
     pub fn advanced(&self) -> BTreeMap<String, i64> {
         self.captured.advanced.clone().unwrap_or_default()
@@ -103,19 +115,29 @@ impl EngineUnit {
     }
     /// The context object the fast server replays before typesetting this unit.
     pub fn context_json(&self) -> serde_json::Value {
+        self.context_json_with_paragraph(true)
+    }
+
+    /// Outer state before a heading or block environment runs, without its member
+    /// paragraph's font, indentation or line-breaking parameters.
+    pub(crate) fn entry_context_json(&self) -> serde_json::Value {
+        self.context_json_with_paragraph(false)
+    }
+
+    fn context_json_with_paragraph(&self, paragraph: bool) -> serde_json::Value {
         let c = &self.captured;
         let (ints, dims, glues, parshape) = match &self.first_para {
-            Some(p) if c.kind == "par" => (&p.ints, &p.dims, &p.glues, &p.parshape),
+            Some(p) if paragraph && c.kind == "par" => (&p.ints, &p.dims, &p.glues, &p.parshape),
             _ => (&c.ints, &c.dims, &c.glues, &c.parshape),
         };
         let (nfss, color) = match self.first_para.as_ref().and_then(|p| p.begin.as_ref()) {
-            Some(b) if c.kind == "par" => (b.nfss.clone(), b.color.clone()),
+            Some(b) if paragraph && c.kind == "par" => (b.nfss.clone(), b.color.clone()),
             _ => (c.nfss.clone(), c.color.clone()),
         };
         serde_json::json!({
             "kind": c.kind, "name": c.name,
             "ints": ints, "dims": dims, "glues": glues, "parshape": parshape,
-            "everypar": c.everypar, "nobreak": c.nobreak, "afterindent": c.afterindent, "noskipsec": c.noskipsec,
+            "everypar": self.everypar(), "nobreak": c.nobreak, "afterindent": c.afterindent, "noskipsec": c.noskipsec,
             "counters": c.abs_counters, "thefmt": c.abs_thefmt, "macros": c.abs_macros,
             "begin": { "nfss": nfss, "color": color },
         })
@@ -489,12 +511,7 @@ impl LayoutStore {
                 .filter(|(n, _)| n.as_str() != main)
                 .map(|(n, t)| (n.as_str(), t.as_str())),
         ) {
-            let fb = crate::document::FileBuf::with_block_envs(
-                text,
-                &mut ids,
-                1,
-                policy.theorem_envs.iter().cloned().collect(),
-            );
+            let fb = crate::document::FileBuf::with_policy(text, &mut ids, 1, policy);
             spans.extend(snapshot_spans_of(
                 &fb,
                 name,

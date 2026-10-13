@@ -147,7 +147,10 @@ contains it. Keep the newer ones and move them to the new `placements`.
 These additive events do not advance the authoritative layout version or imply convergence.
 They are enabled for warm runs over validated plain-text paragraph edits, with an error-free
 base layout and no held pictures. Validated new plain-text paragraphs, splits and shifted source
-line ranges are accepted too; new units borrow a neighbouring context. Structural/stateful edits
+line ranges are accepted too; new units borrow a neighbouring paragraph context, or a heading/environment outer entry context
+when no standalone paragraph is available. Empty run-in headings and their first text share one
+unit even across blank source lines; explicit titlesec display shapes remain separate units.
+Structural/stateful edits
 and removed units use ordinary full layouts. A superseded run delivers the changed units' complete
 rows and the next unchanged unit before yielding, so a following drawing is not lost when it moves
 to another page.

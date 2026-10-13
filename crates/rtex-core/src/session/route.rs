@@ -102,9 +102,18 @@ impl Session {
                     }
                 }
                 let c = &eu.captured;
-                for r in
-                    check_engine_unit(&c.kind, &c.everypar, eu.has_context(), eu.rows(), &eu.flags)
-                {
+                // A captured run-in heading without text has no rows yet, but its
+                // outer context can compile the title together with newly typed text.
+                let waiting_heading = eu.rows() == 0
+                    && matches!(&shape, UnitShape::Heading(h) if h == "paragraph" || h == "subparagraph")
+                    && !crate::eligibility::heading_only(text);
+                for r in check_engine_unit(
+                    &c.kind,
+                    eu.everypar(),
+                    eu.has_context(),
+                    if waiting_heading { 1 } else { eu.rows() },
+                    &eu.flags,
+                ) {
                     reasons.push(reason_str(&r));
                 }
                 let shape_ok = match (&shape, c.kind.as_str()) {
@@ -147,7 +156,7 @@ impl Session {
                     reasons.push("unverified: no layout unit to compare with".into());
                 }
                 if reasons.is_empty() && derivable {
-                    match self.derive_context(fb, span, layout, &shape) {
+                    match self.derive_context(fb, span, layout, &shape, policy) {
                         Some((parent, anchor, after, json)) => {
                             // negative context ids never collide with unit ids
                             seq = -(span.id.0 as i64);
@@ -346,6 +355,7 @@ impl Session {
         span: &Span,
         layout: &LayoutStore,
         shape: &UnitShape,
+        policy: &Policy,
     ) -> Option<(ParaId, ParaId, bool, serde_json::Value)> {
         let idx = fb.spans.iter().position(|sp| sp.id == span.id)?;
         let usable = |sp: &Span| -> Option<&EngineUnit> {
@@ -368,7 +378,7 @@ impl Session {
                     .as_ref()
                     .map(|p| p.begin.is_some())
                     .unwrap_or(false)
-                && everypar_allowed(&eu.captured.everypar);
+                && everypar_allowed(eu.everypar());
             ok.then_some(eu)
         };
         // the context: the nearest paragraph unit before (after when there is none)
@@ -376,11 +386,35 @@ impl Session {
             .iter()
             .rev()
             .find_map(|sp| usable(sp).map(|eu| (sp.id, eu)));
-        let (parent, eu, ctx_after) = match ctx_before {
-            Some((id, eu)) => (id, eu, false),
-            None => fb.spans[idx + 1..]
+        let context = ctx_before.map(|(id, eu)| (id, eu, false)).or_else(|| {
+            fb.spans[idx + 1..]
                 .iter()
-                .find_map(|sp| usable(sp).map(|eu| (sp.id, eu, true)))?,
+                .find_map(|sp| usable(sp).map(|eu| (sp.id, eu, true)))
+        });
+        // Documents made of headings and block environments may have no standalone
+        // paragraph donor. Their outer entry state is captured before the heading/list
+        // runs, unlike a member paragraph's list indentation or heading font. Use that
+        // state only at the document's outer level; never borrow a nested box's state.
+        let boundary = |sp: &Span| -> Option<&EngineUnit> {
+            let eu = layout.unit(sp.id)?;
+            let c = &eu.captured;
+            (matches!(sp.kind, SpanKind::Heading | SpanKind::Env)
+                && c.nest <= 1
+                && c.nfss.family.as_ref().is_some_and(|f| !f.is_empty())
+                && everypar_allowed(eu.everypar()))
+            .then_some(eu)
+        };
+        let (parent, eu, ctx_after, entry) = match context {
+            Some((id, eu, after)) => (id, eu, after, false),
+            None => fb.spans[..idx]
+                .iter()
+                .rev()
+                .find_map(|sp| boundary(sp).map(|eu| (sp.id, eu, false, true)))
+                .or_else(|| {
+                    fb.spans[idx + 1..]
+                        .iter()
+                        .find_map(|sp| boundary(sp).map(|eu| (sp.id, eu, true, true)))
+                })?,
         };
         // the anchor: the nearest span before with rows, whatever its kind, or one live on a
         // borrowed context (a split's halves are routed in document order within one edit: the
@@ -404,15 +438,25 @@ impl Session {
             None if ctx_after => (parent, false),
             None => (parent, true),
         };
-        let mut json = eu.context_json();
-        let after_heading = idx > 0 && fb.spans[idx - 1].kind == SpanKind::Heading;
+        let mut json = if entry {
+            eu.entry_context_json()
+        } else {
+            eu.context_json()
+        };
+        let heading = (idx > 0 && fb.spans[idx - 1].kind == SpanKind::Heading)
+            .then(|| classify_source(&fb.text[fb.spans[idx - 1].range.clone()], policy).0);
+        let after_heading = matches!(&heading, Some(UnitShape::Heading(h))
+            if !matches!(h.as_str(), "paragraph" | "subparagraph") || policy.display_headings.contains(h));
+        let afterindent = after_heading
+            && matches!(&heading, Some(UnitShape::Heading(h))
+            if policy.indent_after_heading(h));
         json["everypar"] = serde_json::Value::String(if after_heading {
             AFTER_HEADING_EVERYPAR.to_string()
         } else {
             String::new()
         });
         json["nobreak"] = serde_json::Value::Bool(after_heading);
-        json["afterindent"] = serde_json::Value::Bool(false);
+        json["afterindent"] = serde_json::Value::Bool(afterindent);
         json["noskipsec"] = serde_json::Value::Bool(false);
         // a block environment starts in vertical mode with the same parameters; the server
         // tells environments from paragraphs by kind (floats, which are not borrowed, by name)

@@ -493,16 +493,15 @@ impl Session {
         let preamble_inputs = preamble_input_set(&texts, &cfg.main_file);
         let mut policy = Policy::from_preamble(&preamble, &cfg.trusted_macros, &cfg.unit_envs);
         policy.permissive = cfg.eligibility == EligibilityMode::Probe;
-        let envs: Vec<String> = policy.theorem_envs.iter().cloned().collect();
         // the main file first so its span ids come first
         files.insert(
             cfg.main_file.clone(),
-            FileBuf::with_block_envs(&texts[&cfg.main_file], &mut ids, 1, envs.clone()),
+            FileBuf::with_policy(&texts[&cfg.main_file], &mut ids, 1, &policy),
         );
         for (name, text) in texts.iter().filter(|(n, _)| **n != cfg.main_file) {
             files.insert(
                 name.clone(),
-                FileBuf::with_block_envs(text, &mut ids, 1, envs.clone()),
+                FileBuf::with_policy(text, &mut ids, 1, &policy),
             );
         }
         let (tx, rx) = unbounded();
@@ -679,17 +678,11 @@ impl Session {
         if len == 0 && !self.shared.files.lock().contains_key(rel_path) {
             let mut files = self.shared.files.lock();
             let rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
-            let fb = FileBuf::with_block_envs(
+            let fb = FileBuf::with_policy(
                 text,
                 &mut self.shared.ids.lock(),
                 rev,
-                self.shared
-                    .policy
-                    .lock()
-                    .theorem_envs
-                    .iter()
-                    .cloned()
-                    .collect(),
+                &self.shared.policy.lock(),
             );
             files.insert(rel_path.to_string(), fb);
             drop(files);
@@ -767,12 +760,14 @@ impl Session {
                 );
                 policy.permissive = self.shared.cfg.eligibility == EligibilityMode::Probe;
                 let envs: Vec<String> = policy.theorem_envs.iter().cloned().collect();
+                let display_headings = policy.display_headings.clone();
                 *self.shared.policy.lock() = policy;
                 drop(files);
                 let mut files = self.shared.files.lock();
                 for fb in files.values_mut() {
-                    if fb.extra_block_envs != envs {
+                    if fb.extra_block_envs != envs || fb.display_headings != display_headings {
                         fb.extra_block_envs = envs.clone();
+                        fb.display_headings = display_headings.clone();
                         fb.resegment(&mut self.shared.ids.lock(), rev);
                     }
                 }
@@ -1039,14 +1034,6 @@ impl Session {
     /// Returns the number of files added.
     fn load_new_inputs(&self) -> usize {
         let mut files = self.shared.files.lock();
-        let envs: Vec<String> = self
-            .shared
-            .policy
-            .lock()
-            .theorem_envs
-            .iter()
-            .cloned()
-            .collect();
         let mut added = 0;
         loop {
             let wanted: Vec<String> = files
@@ -1072,7 +1059,12 @@ impl Session {
                 let rev = self.shared.source_revision.load(Ordering::SeqCst);
                 files.insert(
                     rel,
-                    FileBuf::with_block_envs(&text, &mut self.shared.ids.lock(), rev, envs.clone()),
+                    FileBuf::with_policy(
+                        &text,
+                        &mut self.shared.ids.lock(),
+                        rev,
+                        &self.shared.policy.lock(),
+                    ),
                 );
                 added += 1;
                 any = true;

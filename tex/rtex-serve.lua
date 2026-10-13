@@ -121,6 +121,7 @@ local EVERYPAR_PATTERNS = {
   ["\\if@nobreak \\@nobreakfalse \\clubpenalty \\@M \\if@afterindent \\else {\\setbox \\z@ \\lastbox }\\fi \\else \\clubpenalty \\@clubpenalty \\everypar {}\\fi "] = true,
   ["\\if@nobreak \\@nobreakfalse \\clubpenalty \\@M \\setbox \\z@ \\lastbox \\else \\clubpenalty \\@clubpenalty \\everypar {}\\fi "] = true,
   ["{\\setbox \\z@ \\lastbox }\\everypar {}\\@endpefalse "] = true,
+  ["\\clubpenalty \\@clubpenalty \\everypar {}"] = true,
   ["\\@minipagefalse \\everypar {}"] = true,
 }
 local function everypar_allowed(ep)
