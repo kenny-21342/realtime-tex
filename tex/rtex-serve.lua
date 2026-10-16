@@ -243,7 +243,8 @@ local function install_context(id, ctx)
   if ep ~= "" then extra[#extra + 1] = "\\everypar{" .. ep .. "}" end
   ctx.float = kind == "env" and name and FLOAT_ENVS[name] or nil
   if ctx.float then
-    -- what \@xfloat does to the float box content (\@floatboxreset = \reset@font\normalsize\@setminipage)
+    -- what \@xfloat does to the float box content; \@floatboxreset is the kernel's
+    -- \reset@font\normalsize\@setminipage, or the class's version replayed with the macros above
     extra[#extra + 1] = "\\def\\@captype{" .. name:gsub("%*$", "") .. "}\\hsize\\" .. ctx.float .. "\\@parboxrestore\\@floatboxreset "
   end
   ctx.head_extra = table.concat(extra)
@@ -262,13 +263,56 @@ local function install_context(id, ctx)
   S.contexts[id] = ctx
 end
 
+-- A line without its % comment (\% is a percent sign).
+local function uncommented(line)
+  local i = 1
+  while true do
+    local j = line:find("[\\%%]", i)
+    if not j then return line end
+    if line:byte(j) == 37 then return line:sub(1, j - 1) end
+    i = j + 2
+  end
+end
+
+-- The vertical material a unit may start with (eligibility.rs vertical_prefix_len): where the
+-- command at p and its {argument} end, or nil.
+local VERTICAL = { "vspace%*", "vspace", "noindent", "newpage", "clearpage", "pagebreak",
+                   "smallskip", "medskip", "bigskip", "vfill", "centering" }
+local function vertical_end(s, p)
+  for _, v in ipairs(VERTICAL) do
+    local q = s:match("^\\" .. v .. "()", p)
+    if q and not s:find("^%a", q) then return s:match("^%b{}()", q) or q end
+  end
+end
+
 -- Strip the \begin{float}[opt] ... \end{float} wrapper: the content is typeset directly in the
--- unit box with the float-box state replayed by head_extra.
+-- unit box with the float-box state replayed by head_extra. Blank lines, comment lines and
+-- vertical material before the \begin act on the page, not on the float box, and go too, as
+-- do comments after the \end; what goes before the content is replaced by its newlines, so
+-- the content keeps its source line numbers (cur.lines, pics_by_line).
 local function float_content(source, name)
   local n = name:gsub("%*", "%%*")
-  local inner = source:gsub("^%s*\\begin%s*{" .. n .. "}%s*%b[]", ""):gsub("^%s*\\begin%s*{" .. n .. "}", "")
-  inner = inner:gsub("\\end%s*{" .. n .. "}%s*$", "")
-  return inner
+  local p = 1
+  while true do
+    p = source:match("^%s*()", p)
+    if source:find("^%%", p) then
+      p = source:match("^[^\n]*()", p)
+    else
+      local q = vertical_end(source, p)
+      if not q then break end
+      p = q
+    end
+  end
+  local b = source:match("^\\begin%s*{" .. n .. "}%s*%b[]()", p) or source:match("^\\begin%s*{" .. n .. "}()", p)
+  if not b then return source end
+  -- the \end ends the last line with anything before its comment
+  local inner, last = source:sub(b), nil
+  for s, line in (inner .. "\n"):gmatch("()([^\n]*)\n") do
+    if uncommented(line):find("%S") then last = s end
+  end
+  local head = last and uncommented(inner:match("^[^\n]*", last)):match("^(.-)\\end%s*{" .. n .. "}%s*$")
+  if not head then return source end
+  return source:sub(1, b - 1):gsub("[^\n]+", "") .. inner:sub(1, last - 1) .. head
 end
 
 -- An error in a Lua function TeX calls during a compile is reported by TeX and swallowed in
@@ -399,6 +443,7 @@ function S.begin_compile(req_id, ctx_id, source, pics)
     return
   end
   S.errors = {}
+  S.margin_notes = 0
   local ftoks = ctx.nfss_tokens
   local font_changed = ftoks ~= last_nfss
   if font_changed then last_nfss = ftoks else ftoks = "" end
@@ -459,6 +504,11 @@ function S.image(last, file, page, lastpages, cache, boxnum)
                                 pages = pages or (known and known.pages) or nil }
   S.images_used = true
 end
+
+-- \marginpar in a unit (hook in rtex-serve-patches.tex): LaTeX refuses it inside the unit box,
+-- so the note never becomes an insert there; it is counted as one, like footnote text, so the
+-- result says that the page builder places material of this unit.
+function S.margin_note() S.margin_notes = (S.margin_notes or 0) + 1 end
 
 function S.mark()
   local cur = S.current
@@ -556,7 +606,7 @@ finish_body = function(cur)
   local bytes, nlines, nglyphs, bw, bh, bd, flags = "", 0, 0, 0, 0, 0, nil
   if box then
     -- traversal and serialization fused: records are written while walking the nodes
-    bytes, nlines, nglyphs, bw, bh, bd, flags = dl.paragraph_binary(box, cur.ctx.color)
+    bytes, nlines, nglyphs, bw, bh, bd, flags = dl.paragraph_binary(box, cur.ctx.color, S.margin_notes)
   end
   local t2 = gettime()
   if trace_file then trace(format("finish: traversal done, %d bytes", #bytes)) end
