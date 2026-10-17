@@ -82,6 +82,7 @@ From `rtex verify` on 2026-10-10:
 | corpus: multi-file project (`multi`) | 14 of 14 | 1 126 / 1 126 | 3 of 3 | |
 | corpus: counters (`counters`) | 9 of 10 | 948 / 948 | 1 of 1 | |
 | corpus: TikZ document (`pictures`) | 9 of 20 | 750 / 750 | 0 of 3 (drawn from the PDF) | |
+| corpus: IEEEtran journal paper (`ieeetran`) | 18 of 30 | 3 658 / 3 658 | 2 of 2 | |
 
 Worst glyph deviation from the PDF: 0.0005 bp for glyphs placed by a text matrix, and 0.016 bp
 (under one `TJ` unit) for glyphs placed by a `TJ` adjustment.
@@ -90,15 +91,20 @@ The units that are not live are mostly generated material: the table of contents
 entries, and the bibliography. The rest are excluded by design:
 - a `\stepcounter` that comes before a paragraph's text;
 - the `\newpage` line in the homework;
+- in the IEEEtran paper, the run-in `\subsubsection` headings, the nomenclature lists that start
+  with such a heading's title, and the unit after each run-in paragraph, which starts under the
+  heading's `\everypar`;
 - in the TikZ document, the pictures, because `rtex verify` uses the allow-list unless you pass
   `--permissive`. In a session's default probe mode they can go live, and their pages are drawn
   from the PDF.
 
 **Probe mode** is checked separately. `fixtures/research/permissive` has 29 units built from
 commands outside the allow-list. With the allow-list switched off, 28 are compiled live and
-compared. 26 are identical; the 2 that differ depend on page state, as expected (`\thepage` on
-page 2, and `\marginpar`). The comparison catches both. CI requires exactly those two, so a
-construct the comparison stops catching fails the build.
+compared. 27 are identical. The one that differs is the `multicols` paragraph: multicol splits
+its lines into columns in its own output routine. The comparison catches it. CI requires exactly
+that one, so a construct the comparison stops catching fails the build. The `\marginpar`
+paragraph is identical: its note is placed by the page builder, and a live result reports it
+like footnote text, so the note follows after the next pass.
 
 ## In CI
 
@@ -115,7 +121,7 @@ rtex gen-book --pages 10 --out build/fx/book-10-pure
 rtex verify --project build/fx/book-10-pure --raster          # needs python3 with PyMuPDF for --raster
 rtex verify --project fixtures/book-10-units-lmtfm --dump-rows  # print both sides of any unit that differs
 rtex verify --project fixtures/corpus/pictures --pic-cache --raster
-rtex verify --project fixtures/research/permissive --permissive --expect-differing 2
+rtex verify --project fixtures/research/permissive --permissive --expect-differing 1
 ```
 
 To run the oracle (check 1):

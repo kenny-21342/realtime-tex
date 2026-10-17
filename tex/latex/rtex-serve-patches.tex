@@ -23,7 +23,13 @@
 %    per call, each through microtype's font hook) every time math is entered at a size other
 %    than the last one, e.g. for every footnote mark. The result only depends on the math
 %    version, the size and the \mv@<version> list, so it is memoized per (version, size) and
-%    reused while \mv@<version> is unchanged (\ifx on the token list).
+%    reused while \mv@<version> is unchanged (\ifx on the token list). A hit still runs
+%    \mv@<version>, with \getanddefine@fonts disabled as in the kernel's \dorestore@version:
+%    it loads no font but re-installs the version's math alphabets (\install@mathalphabet is
+%    \gdef). Entering another version, e.g. bold for \bm, installs that version's \mathbf & co.
+%    globally, and without this they would stay when math returns to a memoized version. The
+%    \begingroup already there undoes the \let; a brace group would add an atom in math mode
+%    (and break $$\halign...$$).
 \def\rtex@glb@settings@expected{%
      \expandafter\ifx\csname S@\f@size\endcsname\relax
        \calculate@math@sizes
@@ -52,6 +58,8 @@
          \expandafter\ifx\csname rtex@mv@\math@version/\f@size\expandafter\endcsname
                          \csname mv@\math@version\endcsname
            \expandafter\let\expandafter\math@fonts\csname rtex@mf@\math@version/\f@size\endcsname
+           \let\getanddefine@fonts\@gobbletwo
+           \csname mv@\math@version\endcsname
          \else
            \csname mv@\math@version \endcsname
            \global\expandafter\let\csname rtex@mf@\math@version/\f@size\endcsname\math@fonts
@@ -190,5 +198,10 @@
     \global\@topnum\rtex@save@topnum\relax
     \global\@specialpagefalse}%
 \fi
+%
+% 6. Margin notes. LaTeX refuses \marginpar inside the unit box ("Not in outer par mode"), so
+%    the note never becomes an insert there; the server counts it as one (rtex-serve.lua,
+%    margin_note), which makes the result say that the page builder places part of the unit.
+\AddToHook{cmd/marginpar/before}{\directlua{rtex_serve.margin_note()}}
 %
 \makeatother

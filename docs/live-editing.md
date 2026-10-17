@@ -15,10 +15,11 @@ This page lists what falls on which side. [how-it-works.md](how-it-works.md) exp
 | Body text, accents, `\emph`, `\textbf` and other font switches, colours, boxes (`\fbox`, `\parbox`, `\colorbox`, `\underline`, `\rule`) | |
 | Inline math and display math: `\[…\]`, `equation`, `align`, `gather`, `multline`, with `\label`, `\tag` and equation numbers | |
 | `\ref`, `\eqref`, `\pageref`, `\autoref`, `\cite` (plain, natbib and biblatex) | Numbers come from the last background pass. A new label shows its number after the next pass. |
-| Lists (`itemize`, `enumerate`, `description`, enumitem labels), `quote`, `quotation`, `verse`, `center`, `abstract`, theorems and `proof`, `verbatim`, `lstlisting` | Each environment is one unit. |
+| Lists (`itemize`, `enumerate`, `description`, enumitem labels), `quote`, `quotation`, `verse`, `center`, `abstract`, theorems and `proof`, `verbatim`, `lstlisting`, IEEEtran's `IEEEkeywords` and `IEEEdescription` | Each environment is one unit. |
 | Figures and tables: `\includegraphics`, `tabular`, `tabularx`, `booktabs`, `multirow`, `\rowcolor`, `subfigure`, `\caption` | Updated where the float currently is. If it should move, it moves after the next pass. |
 | Headings (`\chapter`, `\section`, …) | The table of contents and running heads follow after the next pass. |
 | Footnotes | The mark updates live. The footnote text at the bottom of the page follows after the next pass. |
+| A paragraph with a `\marginpar` (probe mode) | The paragraph updates live. The note in the margin follows after the next pass, like footnote text. |
 | Title block (`\title`, `\author`, `\date`, `\maketitle`) in `article`/`report` without `titlepage` | |
 | `thebibliography` with `\bibitem` | |
 | `\setcounter`, `\stepcounter`, `\refstepcounter` inside a paragraph | When this changes the numbering of what follows, a pass is scheduled to renumber it. |
@@ -47,10 +48,11 @@ interval, capped at three intervals.
 |---|---|
 | The preamble (packages, settings, macro definitions) | The live engine restarts with the new preamble (about 1–2 s). |
 | `\tableofcontents`, `\listoffigures`, `\printbibliography`, `\printindex` | Generated from the auxiliary files. |
-| `\marginpar`, `wrapfigure`, multicolumn text, a paragraph that continues after a float in the same TeX paragraph | Placed by the page builder, not by the paragraph. |
+| `wrapfigure`, multicolumn text, a paragraph that continues after a float in the same TeX paragraph | Placed by the page builder, not by the paragraph. |
 | Setup lines on their own between paragraphs (`\newcommand`, `\setlength`, `\definecolor`, `\lstset`, …) | rtex loads them with the preamble, so macros defined there work live everywhere. Editing them is like editing the preamble: the live engine restarts. |
 | `\setlength` or `\renewcommand` at the top level of a paragraph, next to its text | It changes how everything after it is typeset. Inside a group or an environment, it is fine. |
 | A run-in heading (`\paragraph`, `\subparagraph`) whose text starts after a blank line | The heading is set in the following paragraph. With its text on the heading's lines, heading and text are one unit and update live. |
+| Other headings the class sets run-in (IEEEtran's `\subsubsection`, seen by the capture) | The heading shares its line with the following paragraph. |
 | A paragraph that ends a file with `\endinput` | `\endinput` would end the live engine's own input. |
 | A list that continues an earlier one (enumitem `resume`, `series`) | The earlier list's count is not a LaTeX counter. |
 | Paragraphs inside `tcolorbox`, text printed from Lua (`\directlua`, `luacode`) | rtex cannot attribute those lines to a source span. |

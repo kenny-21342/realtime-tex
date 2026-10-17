@@ -757,7 +757,10 @@ const MATH_MACROS: &[&str] = &[
 const HARD_STOPS: &[(&str, Reason)] = &[("\\endinput", Reason::EndInput)];
 
 /// Macros provided by a package: allowed when the package is loaded, `NeedsPackage` otherwise.
+/// The document class counts as a package of its name.
 const PKG_MACROS: &[(&str, &[&str])] = &[
+    // list label setup, local to the list
+    ("IEEEtran", &["IEEEsetlabelwidth", "IEEEusemathlabelsep"]),
     (
         "hyperref",
         &[
@@ -1155,7 +1158,7 @@ const AMSMATH_INNER_ENVS: &[&str] = &[
     "array",
     "subarray",
 ];
-const LIST_ENVS: &[&str] = &["itemize", "enumerate", "description"];
+const LIST_ENVS: &[&str] = &["itemize", "enumerate", "description", "IEEEdescription"];
 const TABULAR_MACROS: &[&str] = &["hline", "cline", "multicolumn", "multirow"];
 const BOOKTABS_MACROS: &[&str] = &[
     "toprule",
@@ -1446,10 +1449,11 @@ impl Policy {
     }
 }
 
-/// `\usepackage[opts]{a,b}` / `\RequirePackage` occurrences as (options, names).
+/// `\usepackage[opts]{a,b}` / `\RequirePackage` occurrences as (options, names), and
+/// `\documentclass`: commands a class provides are allowed like a package's.
 fn usepackages(text: &str) -> Vec<(Vec<String>, Vec<String>)> {
     let mut out = Vec::new();
-    for key in ["\\usepackage", "\\RequirePackage"] {
+    for key in ["\\usepackage", "\\RequirePackage", "\\documentclass"] {
         let mut idx = 0;
         while let Some(p) = text[idx..].find(key) {
             let s = idx + p + key.len();
@@ -1676,7 +1680,8 @@ fn user_macro_definitions(text: &str) -> Vec<(String, usize, String)> {
     out
 }
 
-/// Strip `%` comments (respecting `\%`).
+/// Strip `%` comments (respecting `\%`). Like TeX, a comment also removes the end of its
+/// line, so comment-only lines inside a paragraph do not leave a blank line behind.
 pub fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for line in src.lines() {
@@ -1715,7 +1720,9 @@ pub fn strip_comments(src: &str) -> String {
             i += 1;
         }
         out.push_str(&line[..cut]);
-        out.push('\n');
+        if cut == line.len() {
+            out.push('\n');
+        }
     }
     out
 }
@@ -1792,6 +1799,11 @@ pub fn is_vocabulary_reason(r: &Reason) -> bool {
     )
 }
 
+/// Headings the standard classes set run-in, recognised by name in the source (a heading the
+/// layout has not seen yet). Other classes' run-in headings are recognised from the capture
+/// (`check_engine_unit`).
+const RUN_IN_HEADINGS: &[&str] = &["paragraph", "subparagraph"];
+
 pub fn classify_source(src: &str, policy: &Policy) -> (UnitShape, Vec<Reason>) {
     classify_source_with(src, policy, policy.permissive)
 }
@@ -1816,7 +1828,7 @@ pub fn classify_source_with(
     // its span (its paragraph after a blank line) it is a fragment of a paragraph elsewhere
     let run_in = match &shape {
         UnitShape::Heading(h)
-            if (h == "paragraph" || h == "subparagraph")
+            if RUN_IN_HEADINGS.contains(&h.as_str())
                 && !policy.display_headings.contains(h)
                 && heading_only(&text) =>
         {
@@ -2718,14 +2730,20 @@ pub fn everypar_allowed(ep: &str) -> bool {
 }
 
 /// Engine-side check of a unit from the capture: `everypar` pattern, node flags, members.
+/// `run_in`: the heading's name when the capture saw it set run-in (`CapturedUnit::runin`).
 pub fn check_engine_unit(
     kind: &str,
     everypar: &str,
     has_context: bool,
     rows: i64,
     flags: &std::collections::BTreeMap<String, i64>,
+    run_in: Option<&str>,
 ) -> Vec<Reason> {
     let mut reasons = Vec::new();
+    // `classify_source` reports the run-in headings it knows by name from the source
+    if let Some(h) = run_in.filter(|h| !RUN_IN_HEADINGS.contains(h)) {
+        reasons.push(Reason::RunInHeading(h.to_string()));
+    }
     if !everypar_allowed(everypar) {
         reasons.push(Reason::NonDefaultEverypar);
     }
@@ -2827,6 +2845,16 @@ mod tests {
         assert!(reasons("one\n\ntwo").contains(&Reason::ParagraphBreak));
         // an explicit \par is fine: a span may hold several consecutive paragraphs (one unit)
         assert!(!reasons("a \\par b").contains(&Reason::ParagraphBreak));
+        // comment lines are not blank lines: `%` also removes the end of its line
+        for src in [
+            "% one\n% two\nHello world.\nMore.",
+            "Hello world.\n% one\nMore.",
+            "Hello world.\n% one\n% two\nMore.",
+            "Hello % note\n% two\nworld.",
+        ] {
+            assert!(!reasons(src).contains(&Reason::ParagraphBreak), "{src:?}");
+        }
+        assert!(reasons("one\n% c\n\ntwo").contains(&Reason::ParagraphBreak));
         let r = reasons("{\\Large\\bfseries Title\\par}\nName \\hfill 22 September 2026");
         assert!(r.is_empty(), "{r:?}");
         assert!(!ok("a \\parbox-like? no: \\parskip is disallowed"));
@@ -3281,11 +3309,58 @@ mod tests {
         assert!(!everypar_allowed("\\@itemlabel"));
         let mut flags = std::collections::BTreeMap::new();
         flags.insert("ins".to_string(), 1);
-        assert!(check_engine_unit("par", "", true, 3, &flags).is_empty());
+        assert!(check_engine_unit("par", "", true, 3, &flags, None).is_empty());
         flags.insert("dir".to_string(), 1);
         assert_eq!(
-            check_engine_unit("par", "", true, 3, &flags),
+            check_engine_unit("par", "", true, 3, &flags, None),
             vec![Reason::EngineFlag("dir=1".into())]
         );
+    }
+    #[test]
+    fn ieeetran_lists() {
+        let list = "\\begin{IEEEdescription}[\\IEEEusemathlabelsep\\IEEEsetlabelwidth{$\\alpha,\\beta$}]\n\
+                    \\item[$\\alpha$] First symbol.\n\\item[$\\beta$] Second symbol.\n\\end{IEEEdescription}";
+        let keywords = "\\begin{IEEEkeywords}\nReliability, topology.\n\\end{IEEEkeywords}";
+        let ieee = Policy::from_preamble("\\documentclass[journal]{IEEEtran}\n", &[], &[]);
+        for (src, env) in [(list, "IEEEdescription"), (keywords, "IEEEkeywords")] {
+            let (shape, r) = classify_source(src, &ieee);
+            assert_eq!(shape, UnitShape::Env(env.into()));
+            assert!(r.is_empty(), "{env}: {r:?}");
+        }
+        // the label setup commands are the class's own
+        let article = Policy::from_preamble("\\documentclass{article}\n", &[], &[]);
+        assert_eq!(
+            classify_source(list, &article).1,
+            vec![Reason::NeedsPackage("IEEEtran".into())]
+        );
+    }
+    #[test]
+    fn run_in_headings_from_the_capture() {
+        let p = pol();
+        let flags = BTreeMap::new();
+        // a heading the capture saw set run-in, whatever its name (IEEEtran's \subsubsection)
+        assert_eq!(
+            check_engine_unit("heading", "", true, 2, &flags, Some("subsubsection")),
+            vec![Reason::RunInHeading("subsubsection".into())]
+        );
+        assert!(check_engine_unit("heading", "", true, 2, &flags, None).is_empty());
+        // each heading says so once, whether the source, the capture or both know it is run-in
+        for (src, run_in, name) in [
+            (
+                "\\subsubsection{Paths}",
+                Some("subsubsection"),
+                "subsubsection",
+            ),
+            ("\\paragraph{Paths.}", Some("paragraph"), "paragraph"),
+            ("\\paragraph{Paths.}", None, "paragraph"),
+        ] {
+            let mut r = classify_source(src, &p).1;
+            r.extend(check_engine_unit("heading", "", true, 2, &flags, run_in));
+            assert_eq!(
+                r,
+                vec![Reason::RunInHeading(name.into())],
+                "{src} {run_in:?}"
+            );
+        }
     }
 }

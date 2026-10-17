@@ -113,6 +113,7 @@ impl Session {
                     eu.has_context(),
                     if waiting_heading { 1 } else { eu.rows() },
                     &eu.flags,
+                    c.name.as_deref().filter(|_| c.runin),
                 ) {
                     reasons.push(reason_str(&r));
                 }

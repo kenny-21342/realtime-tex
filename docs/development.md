@@ -59,11 +59,13 @@ The integration tests in `crates/rtex-core/tests/`:
 |---|---|
 | `session.rs` | edits, splits and merges, stale results, probe mode, borrowed contexts, multi-file projects, counters, user environments, the title block |
 | `units.rs` | every unit kind takes the live path; the time budget |
-| `engine_robustness.rs` | errors, runaway loops, the watchdog, leaked definitions, large results, request order |
+| `engine_robustness.rs` | errors, runaway loops, the watchdog, leaked definitions, large results, request order, math alphabets after `\bm` |
 | `convergence.rs` | a converged layout equals a fresh run; the capture package does not change the PDF; biber and degraded pages |
 | `bibliography.rs` | biblatex in a fresh session, makeindex and imakeidx, glossaries |
 | `standby.rs` | the standby engine gives the same layout as a fresh run |
 | `capture_groups.rs` | paragraphs that start inside a group |
+| `twocolumn.rs` | every unit of a two-column document has its lines as rows |
+| `ieeetran.rs` | IEEEtran's own float boxes compiled live equal the full run; its run-in headings wait |
 | `piccache_live.rs` | cached pictures in the live engine |
 | `internal_error.rs` | a Lua error inside the server is answered, not swallowed |
 | `export.rs` | export equals a clean build; errors are reported |
@@ -86,9 +88,9 @@ rtex dl2json FILE
 ```
 
 `fixtures/corpus/` has realistic documents (homework, analysis notes, a report, a lab report, a
-code document, a multi-file project, counters, a TikZ-heavy document). CI runs `rtex verify` on
-each with a minimum number of live units. `fixtures/research/permissive/` holds constructs
-outside the allow-list, used to check that probe mode catches every difference.
+code document, a multi-file project, counters, a TikZ-heavy document, an IEEEtran journal paper).
+CI runs `rtex verify` on each with a minimum number of live units. `fixtures/research/permissive/`
+holds constructs outside the allow-list, used to check that probe mode catches every difference.
 
 ## CI
 

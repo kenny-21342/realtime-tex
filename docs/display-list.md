@@ -257,7 +257,7 @@ content. `rtex serve` sends display lists in this form.
 | `["g", font, char, index, x, y, advance, expansion]` | `index` is null for TFM fonts | glyph |
 | `["r", x, y_top, w, h]` | | rule |
 | `["c", stack, cmd, data, after]` | `cmd`: 0 set, 1 push, 2 pop, 3 current; `after` in page lists | colour |
-| `["l", mode, data, x, y]` | `x`, `y` in page lists | PDF literal or `\special`; degrades the list |
+| `["l", mode, data, x, y]` | `x`, `y` in page lists | PDF literal or `\special{pdf:…}`; degrades the list. Other specials draw nothing in the PDF and are left out |
 | `["u", kind, detail]` | | something not representable; degrades the list |
 | `["m", "on"\|"off", x]` | | inline math boundary |
 | `["i", index, x, y_top, w, h]` | | image |

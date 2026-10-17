@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+Merged from upstream (HenryXiaoYang/realtime-tex `1257261`: its 0.0.4 release and SDDKKK's
+IEEEtran and live-engine fixes after it).
+
+### Fixed
+
+- A figure or table with a comment line or `\vspace` right above it, or a comment after its
+  `\end`, compiles in the live engine. The engine looked for `\begin{figure}` only at the very
+  start of the unit and for `\end{figure}` only at its very end, so it typeset the `\begin` as
+  text and failed with "Not in outer par mode".
+- A figure, table, list or other block environment that is the last thing in an `\input` file
+  is live. Unless the file ended with a blank line, its edits went to the background pass: the
+  trailing space rtex keeps for a paragraph at the end of an `\input` file was added after the
+  environment too, and it no longer ended with its `\end`.
+- A file `\input` in the preamble (a macro file, say) is loaded once by the live engine. It
+  was also read again as document setup, so every engine start logged "Command ... already
+  defined" for each of its macros.
+- `\mathbf` after `\bm` (fontspec documents) is right in the live engine. Its memoized math
+  font setup kept the bold math version's alphabets when math returned to the normal version,
+  so `\mathbf{M}` came out in the wrong font. After a footnote, TeX could even loop on it until
+  the engine stopped, and the paragraph was not live again until the preamble changed.
+- The first page of an IEEEtran document is drawn from its display list, not from the
+  PDF. Under LuaLaTeX the class writes a `\special{papersize=…}`, which LuaTeX's PDF backend
+  ignores, and rtex took it for something a display list cannot show. Only `pdf:` specials,
+  the ones the backend draws, mark a page as degraded now.
+- A table edited live in IEEEtran keeps the class's `\footnotesize`. The live engine set every
+  float box like the LaTeX kernel, in `\normalsize`; it now uses the float box the class sets
+  up for tables and figures.
+- IEEEtran's `\subsubsection`, a run-in heading like `\paragraph`, waits for the next pass
+  instead of going live without the paragraph its title shares a line with. rtex knew run-in
+  headings only by name; the capture now records which headings the class sets run-in.
+
+### New
+
+- IEEEtran's `IEEEkeywords` and `IEEEdescription` (a nomenclature, with `\IEEEsetlabelwidth`
+  and `\IEEEusemathlabelsep`) update as you type, like the standard lists. Commands a document
+  class provides can be allowed like a package's; these two are allowed with IEEEtran only.
+
+### CI and repository
+
+- The corpus has an IEEEtran journal paper (two columns, a nomenclature, run-in headings,
+  floats). CI checks that at least 18 of its units are live and that all of them are exact.
+
+From upstream 0.0.4 (HenryXiaoYang/realtime-tex `ab734b1`):
+
+### Fixed
+
+- **Two-column documents** (IEEEtran, `twocolumn`) are live again. When a column break fell
+  inside a paragraph, the page's two-column box was recorded as a row of that paragraph, and
+  the lines inside it lost their placements: in a 12-page IEEEtran paper almost no body text
+  was live (HenryXiaoYang/realtime-tex#2). The capture now leaves everything the output routine builds out of units.
+- Comment lines inside or right above a paragraph no longer send its edits to the background
+  pass. rtex read two `%` lines in a row as a blank line (a paragraph break); like TeX, it now
+  drops the end of a commented line too (HenryXiaoYang/realtime-tex#3).
+- A paragraph with a `\marginpar` is live in probe mode, with the note in the margin following
+  after the next pass, like footnote text. The live engine reports the note as an insert.
+- Diagnostics keep the whole text of LaTeX, class and package messages, including the
+  `(LaTeX)`/`(<package>)` continuation lines. Before, only the first line came through, so
+  an error such as "Mismatched LaTeX support files detected" lost the lines that say which
+  versions do not match (HenryXiaoYang/realtime-tex#1).
+
+### CI and repository
+
+- `scripts/install-texlive.sh` installs only missing packages and contacts the TeX Live
+  repository only then, updating tlmgr first. A newer tlmgr on CTAN stopped re-runs over an
+  existing installation with "tlmgr itself needs to be updated".
+
 ## 0.0.10 (2026-10-13)
 
 - Newly typed plain paragraphs can borrow outer heading/environment state when no standalone

@@ -108,9 +108,10 @@ One per unit, built by the host from the latest capture (`EngineUnit::context_js
 - `everypar` must be one of the kernel's own patterns: empty, `\leftprotrusion`, or what
   `\@afterheading`, `\@doendpe` or `\@setminipage` leave. The host refuses anything else.
 - `macros` holds the meanings of macros the document body redefines, as `\meaning` prints them,
-  and the server replays them as local definitions. A `\newif` switch (`\iftrue`/`\iffalse`,
-  for example glossaries' first-use flags) is set locally for the compile and reset globally to
-  its idle value afterwards.
+  and the server replays them as local definitions. For a float it also holds `\@floatboxreset`
+  as the float environment set it up (IEEEtran's tables are `\footnotesize`). A `\newif` switch
+  (`\iftrue`/`\iffalse`, for example glossaries' first-use flags) is set locally for the compile
+  and reset globally to its idle value afterwards.
 - `thefmt` holds `\the<counter>` bodies, replayed when they differ from the server's.
 - `counters` are the LaTeX counters at the unit's start. `page` is never replayed.
 
@@ -191,7 +192,7 @@ the definition it was written against (`\ifx` against a copy), and is skipped ot
 | Patch | Saves |
 |---|---|
 | `\markright`/`\markboth` insert no marks (only their `\nobreak` after a heading remains): the box is never shipped, so no running head reads them | about 150 µs per `\section` |
-| `\glb@settings` memoizes the math font setup per (math version, size). The kernel rebuilds about 40 fonts whenever math is entered at a new size, which a footnote mark does twice | about 0.7 ms per footnote paragraph with microtype |
+| `\glb@settings` memoizes the math font setup per (math version, size). The kernel rebuilds about 40 fonts whenever math is entered at a new size, which a footnote mark does twice. A hit still runs `\mv@<version>` with `\getanddefine@fonts` disabled: that loads no font but re-installs the version's math alphabets, which entering another version (bold, for `\bm`) replaces globally | about 0.7 ms per footnote paragraph with microtype |
 | graphics: the two file-existence probes per `\includegraphics` are remembered for files that exist, and log-only messages are dropped | about 170 µs per figure |
 
 `rtex verify` compares every kind of unit against a full run without these patches.
