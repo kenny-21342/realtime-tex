@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.11 (2026-10-17)
+
 Merged from upstream (HenryXiaoYang/realtime-tex `1257261`: its 0.0.4 release and SDDKKK's
 IEEEtran and live-engine fixes after it).
 
