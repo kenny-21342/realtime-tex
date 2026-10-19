@@ -29,6 +29,8 @@ PACKAGES=(
   nicematrix physics placeins tcolorbox tikz-cd pict2e tikzfill pdfcol latexmk
   # its edit scenarios (babel ngerman)
   babel-german hyphen-german
+  # newtxmath virtual fonts (tests/virtual_fonts.rs)
+  newtx txfonts kastrup
 )
 
 WINDOWS=0

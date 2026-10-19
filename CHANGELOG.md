@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+Merged from upstream 0.0.5 (HenryXiaoYang/realtime-tex `e0ad117`, with fixes by Sigewinne-330
+and Steve-Li-1998).
+
+### Fixed
+
+- A main file whose name has a space (`my paper.tex`) works. LuaTeX quotes such a job name,
+  and the capture wrote its results under the quoted name, so no layout ever arrived
+  (HenryXiaoYang/realtime-tex#8).
+- A page without glyphs (a blank page left by `\cleardoublepage` with `\pagestyle{empty}`) no
+  longer makes the whole layout fail with "invalid type: sequence, expected a map".
+- Math set with newtxmath, or any font whose TFM comes with a `.vf`, is right in the live
+  display list. LuaTeX reports such a font as a real font and reads its `.vf` only when it
+  writes the PDF, so rtex did not expand it: glyphs named `ntxmi`, `ntxsy`, … with their
+  virtual character codes, which have no outline file in `pdftex.map`, and a host drew
+  the wrong characters (`+` came out as `Ï`). rtex now reads the `.vf` itself and names the
+  real fonts (`NewTXMI`, `txsys`, …).
+
+### CI and repository
+
+- CI installs newtx (with txfonts and kastrup) for a test that a live edit in newtxmath math
+  names the real fonts, not the virtual ones.
+
 ## 0.0.12 (2026-10-19)
 
 ### New
