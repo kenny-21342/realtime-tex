@@ -1006,6 +1006,12 @@ impl Session {
         self.schedule_background(BackgroundPriority::CatchUp);
     }
 
+    /// A background run (capture passes to convergence) is in progress. Live compiles that
+    /// overrun the budget meanwhile are not held against their unit: the pass has the CPU.
+    pub fn background_running(&self) -> bool {
+        self.shared.bg_running.load(Ordering::SeqCst)
+    }
+
     /// Defer background passes (they run when resumed). The fast path keeps working.
     pub fn pause_background(&self, paused: bool) {
         self.shared.bg_paused.store(paused, Ordering::SeqCst);
