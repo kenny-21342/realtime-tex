@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.13 (2026-10-19)
+
 Merged from upstream 0.0.5 (HenryXiaoYang/realtime-tex `e0ad117`, with fixes by Sigewinne-330
 and Steve-Li-1998).
 
