@@ -294,7 +294,17 @@ fn over_budget_units_fall_back_to_background() {
         panic!("no layout")
     };
     s.pause_background(true);
-    std::thread::sleep(Duration::from_millis(1500));
+    // a follow-up pass already under way still finishes, and while it runs slow compiles are
+    // not counted (on a loaded machine it can outlast any fixed pause): wait until it is done
+    let t0 = std::time::Instant::now();
+    while s.background_running() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(300),
+            "background pass did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let layout_version = s.versions().layout_version;
     let doc = s.document_text("main.tex").unwrap();
     let spans = s.spans("main.tex");
     let sp = spans
@@ -351,6 +361,8 @@ fn over_budget_units_fall_back_to_background() {
         "{:?}",
         r2.reasons
     );
+    // the mark belongs to the layout it was made in; paused, no pass replaced it
+    assert_eq!(s.versions().layout_version, layout_version);
     s.close();
     let _ = std::fs::remove_dir_all(&root);
 }

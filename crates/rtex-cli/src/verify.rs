@@ -236,7 +236,10 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
             (UnitShape::Heading(n), "heading") => Some(n.as_str()) == c.name.as_deref(),
             _ => false,
         };
-        if !shape_ok {
+        let generated = reasons
+            .iter()
+            .any(|r| matches!(r, rtex_core::eligibility::Reason::GeneratedList(_)));
+        if !shape_ok && !generated {
             reasons.push(rtex_core::eligibility::Reason::KindMismatch);
         }
         if c.placements.is_empty() {

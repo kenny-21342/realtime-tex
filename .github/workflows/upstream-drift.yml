@@ -1,0 +1,72 @@
+name: upstream-drift
+# Once a week, trial-merge upstream (HenryXiaoYang/realtime-tex main) into kenny/main in the
+# runner's checkout and keep one open issue up to date with the upstream commits not merged
+# yet and the files that would conflict. Nothing is pushed; the merge itself stays a PR.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: https://github.com/HenryXiaoYang/realtime-tex.git
+      LABEL: upstream-drift
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: kenny/main
+          fetch-depth: 0
+      - name: Trial merge
+        id: merge
+        run: |
+          git config user.name "upstream-drift"
+          git config user.email "upstream-drift@users.noreply.github.com"
+          git fetch --quiet "$UPSTREAM" main
+          base=$(git rev-parse HEAD)
+          up=$(git rev-parse FETCH_HEAD)
+          n=$(git rev-list --count "$base..$up")
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          {
+            echo "Upstream \`main\` is at [\`${up:0:7}\`](https://github.com/HenryXiaoYang/realtime-tex/commit/$up); \`kenny/main\` is at \`${base:0:7}\`."
+            echo
+            echo "### $n upstream commits not in kenny/main"
+            echo
+            git log --no-merges --format='- `%h` %s (%an, %as)' "$base..$up"
+            echo
+            if git merge --no-commit --no-ff FETCH_HEAD > /tmp/merge.log 2>&1; then
+              echo "### Trial merge: no conflicts"
+            else
+              conflicts=$(git diff --name-only --diff-filter=U)
+              echo "### Trial merge: $(echo "$conflicts" | grep -c .) files conflict"
+              echo
+              echo "$conflicts" | sed 's/^/- `/; s/$/`/'
+            fi
+            git merge --abort 2>/dev/null || true
+            echo
+            echo "Updated by \`.github/workflows/upstream-drift.yml\` ($(date -u +%F))."
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md"
+      - name: Open or update the drift issue
+        run: |
+          n=${{ steps.merge.outputs.count }}
+          open=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+          if [ "$n" -eq 0 ]; then
+            if [ -n "$open" ]; then
+              gh issue close "$open" --comment "kenny/main has every upstream commit."
+            fi
+            exit 0
+          fi
+          title="Upstream drift: $n commits on HenryXiaoYang/realtime-tex main"
+          if [ -n "$open" ]; then
+            gh issue edit "$open" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh label create "$LABEL" --color c5def5 --description "Upstream commits not merged yet" --force
+            gh issue create --title "$title" --label "$LABEL" --body-file "$RUNNER_TEMP/body.md"
+          fi
