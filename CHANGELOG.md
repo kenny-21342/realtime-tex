@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### New
+
+- More package commands update live when their package is loaded: amsmath's `\boxed`,
+  gensymb's `\degree`, `\celsius`, `\ohm`, `\micro` and `\perthousand`, cleveref's `\cref`
+  family (`\cref`, `\Cref`, `\crefrange`, `\cpageref`, …), and physics' derivatives, brackets
+  and operators (`\dv`, `\pdv`, `\dd`, `\abs`, `\norm`, `\order`, `\bra`, `\ket`, …). `\coth`
+  joins the kernel's other hyperbolic functions. A command the preamble defines itself (a
+  `\newcommand{\abs}`) is still the document's own, physics or not.
+- `\tableofcontents`, `\listoffigures`, `\printbibliography`, `\printindex` and the other lists
+  LaTeX writes from the auxiliary files say so ("generated from the auxiliary files: the full
+  compile updates it") instead of reporting an unknown macro and a `KindMismatch`.
+- `Session::background_running()`: a background run is in progress.
+
+### CI and repository
+
+- `scripts/version.sh`: `bump X.Y.Z` sets the version in every file that states it and dates
+  the CHANGELOG section, `check` (run by CI) fails when one disagrees, `notes` prints a version's
+  CHANGELOG section. A release without a description gets that section.
+- `.github/workflows/upstream-drift.yml`: every Monday, a trial merge of HenryXiaoYang's `main`
+  keeps one issue up to date with the upstream commits not merged yet and the files that would
+  conflict. It pushes nothing.
+- `over_budget_units_fall_back_to_background` waits for the running background pass instead of
+  a fixed pause, so a loaded machine no longer fails it.
+- `examples/eligibility_census.rs`: which reasons keep a project's units off the live path,
+  counted without compiling.
+
 ## 0.0.11 (2026-10-17)
 
 Merged from upstream (HenryXiaoYang/realtime-tex `1257261`: its 0.0.4 release and SDDKKK's

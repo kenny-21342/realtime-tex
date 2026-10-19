@@ -24,7 +24,7 @@ This page lists what falls on which side. [how-it-works.md](how-it-works.md) exp
 | `thebibliography` with `\bibitem` | |
 | `\setcounter`, `\stepcounter`, `\refstepcounter` inside a paragraph | When this changes the numbering of what follows, a pass is scheduled to renumber it. |
 | Macros and environments you define (`\newcommand`, `\DeclareMathOperator`, `\newenvironment`) | Allowed when their bodies only use commands rtex knows. In the default probe mode, others are allowed too after one verification compile. |
-| Package commands: hyperref (`\url`, `\href`), siunitx, ulem, soul, listings, cancel, bm, csquotes, mhchem, … | The package must be loaded in your preamble. |
+| Package commands: hyperref (`\url`, `\href`), siunitx, ulem, soul, listings, cancel, bm, csquotes, mhchem, cleveref (`\cref`), physics (`\dv`, `\pdv`, `\dd`, …), gensymb (`\degree`), amsmath's `\boxed`, … | The package must be loaded in your preamble. |
 | Splitting a paragraph, merging two, typing a new paragraph or list | The new part borrows its neighbour's settings until the next pass confirms them. Numbers may lag by one, and its vertical position is approximate. |
 | A paragraph that grows or shrinks by a line | Its own lines update live. The text after it moves after the next pass. |
 

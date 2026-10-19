@@ -52,6 +52,9 @@ pub enum Reason {
     OutsideState(String),
     /// `\endinput`: it ends the input file it is read from, in the live server the server's own.
     EndInput,
+    /// A list LaTeX writes from the auxiliary files (`\tableofcontents`, `\printbibliography`,
+    /// …): only a full compile has the entries.
+    GeneratedList(String),
 }
 
 impl std::fmt::Display for Reason {
@@ -95,6 +98,10 @@ impl std::fmt::Display for Reason {
                 "\\{h} is a run-in heading: its title is set in the following paragraph"
             ),
             Reason::EndInput => write!(f, "\\endinput ends the file it is read from"),
+            Reason::GeneratedList(m) => write!(
+                f,
+                "\\{m} is generated from the auxiliary files: the full compile updates it"
+            ),
             other => write!(f, "{other:?}"),
         }
     }
@@ -633,6 +640,7 @@ const MATH_MACROS: &[&str] = &[
     "sinh",
     "cosh",
     "tanh",
+    "coth",
     "log",
     "ln",
     "lg",
@@ -785,6 +793,64 @@ const PKG_MACROS: &[(&str, &[&str])] = &[
         ],
     ),
     ("xspace", &["xspace"]),
+    ("amsmath", &["boxed"]),
+    (
+        "gensymb",
+        &["degree", "celsius", "perthousand", "ohm", "micro"],
+    ),
+    (
+        "cleveref",
+        &[
+            "cref",
+            "Cref",
+            "crefrange",
+            "Crefrange",
+            "cpageref",
+            "Cpageref",
+            "labelcref",
+            "namecref",
+            "nameCref",
+            "lcnamecref",
+        ],
+    ),
+    (
+        "physics",
+        &[
+            "dd",
+            "dv",
+            "pdv",
+            "abs",
+            "norm",
+            "order",
+            "tr",
+            "Tr",
+            "vb",
+            "va",
+            "vu",
+            "vdot",
+            "cross",
+            "grad",
+            "curl",
+            "laplacian",
+            "comm",
+            "acomm",
+            "bra",
+            "ket",
+            "braket",
+            "ketbra",
+            "expval",
+            "mel",
+            "eval",
+            "dyad",
+            "mqty",
+            "pmqty",
+            "bmqty",
+            "Res",
+            "erf",
+            "rank",
+            "sgn",
+        ],
+    ),
     ("nicefrac", &["nicefrac"]),
     ("units", &["nicefrac"]),
     ("mhchem", &["ce"]),
@@ -1064,6 +1130,25 @@ fn package_macro(name: &str, policy: &Policy) -> Option<Result<(), &'static str>
 /// Picture environments (`piccache::PICTURE_ENVS`): block units when they start the unit,
 /// inline boxes after text, in either case with vocabulary the allow-list does not cover.
 use crate::piccache::PICTURE_ENVS;
+
+/// Lists LaTeX builds from the auxiliary files of the previous pass (contents, bibliography,
+/// index, glossaries): a unit with one waits for the full compile, whatever its shape.
+pub const GENERATED_LISTS: &[&str] = &[
+    "tableofcontents",
+    "listoffigures",
+    "listoftables",
+    "listoflistings",
+    "lstlistoflistings",
+    "printbibliography",
+    "bibliography",
+    "printindex",
+    "printglossaries",
+    "printglossary",
+    "printnoidxglossaries",
+    "printnoidxglossary",
+    "printacronyms",
+    "printnomenclature",
+];
 
 /// Macros whose argument(s) are opaque (URLs, units, verbatim): skipped, not classified.
 /// (name, brace arguments to skip; 0 = delimited like \verb|…|).
@@ -2427,7 +2512,9 @@ impl<'a> Scan<'a> {
     /// A macro: allowed by the vocabulary for its mode and context, or a reason.
     fn macro_word(&mut self, name: String, in_math: bool) {
         let (text, policy) = (self.text, self.policy);
-        let allowed = if let Some(provided) = package_macro(&name, policy) {
+        // a macro the preamble defines itself (\newcommand{\abs}) is not the package's
+        let own = policy.trusted_macros.contains(&name) || policy.trusted_math.contains(&name);
+        let allowed = if let Some(provided) = package_macro(&name, policy).filter(|_| !own) {
             if let Err(pkg) = provided {
                 self.push(Reason::NeedsPackage(pkg.into()));
             }
@@ -2542,7 +2629,9 @@ impl<'a> Scan<'a> {
             TEXT_MACROS.contains(&name.as_str()) || policy.trusted_macros.contains(&name)
         };
         if !allowed {
-            let r = if in_math {
+            let r = if GENERATED_LISTS.contains(&name.as_str()) {
+                Reason::GeneratedList(name)
+            } else if in_math {
                 Reason::DisallowedMathMacro(name)
             } else {
                 Reason::DisallowedMacro(name)
@@ -3042,6 +3131,64 @@ mod tests {
             .1
             .is_empty());
     }
+
+    #[test]
+    fn math_and_reference_packages() {
+        let p = Policy::from_preamble(
+            "\\usepackage{amsmath}\\usepackage{gensymb}\\usepackage{physics}\\usepackage{cleveref}\n",
+            &[],
+            &[],
+        );
+        for src in [
+            "So $\\boxed{x = 2}$ and $\\coth x$ hold.",
+            "An angle of $30\\degree$, or 30\\degree.",
+            "The rate $\\dv{f}{x}$, $\\pdv{f}{x}{y}$ and $\\dd{x}$, $\\abs{z}$, $\\order{h^2}$.",
+            "See \\cref{fig:a} and \\Cref{tab:b}, \\crefrange{a}{b}.",
+        ] {
+            assert!(
+                check_source(src, &p).is_empty(),
+                "{src}: {:?}",
+                check_source(src, &p)
+            );
+        }
+        // without the package, the command is the package's and needs it
+        let p0 = Policy::from_preamble("\\documentclass{article}\n", &[], &[]);
+        assert!(check_source("$\\boxed{x}$", &p0).contains(&Reason::NeedsPackage("amsmath".into())));
+        assert!(
+            check_source("See \\cref{a}.", &p0).contains(&Reason::NeedsPackage("cleveref".into()))
+        );
+        // a document's own \abs is not physics'
+        let own = Policy::from_preamble(
+            "\\usepackage{amsmath}\\newcommand{\\abs}[1]{\\left\\lvert #1 \\right\\rvert}\n",
+            &[],
+            &[],
+        );
+        assert!(check_source("We have $\\abs{x} < 1$.", &own).is_empty());
+    }
+
+    #[test]
+    fn generated_lists_wait_for_the_full_compile() {
+        let p = pol();
+        for (src, name) in [
+            ("\\tableofcontents", "tableofcontents"),
+            ("\\clearpage\n\\listoffigures", "listoffigures"),
+            ("\\printbibliography[heading=bibintoc]", "printbibliography"),
+            ("\\printindex", "printindex"),
+        ] {
+            let r = check_source(src, &p);
+            assert!(
+                r.contains(&Reason::GeneratedList(name.into())),
+                "{src}: {r:?}"
+            );
+            assert!(
+                !r.contains(&Reason::DisallowedMacro(name.into())),
+                "{src}: {r:?}"
+            );
+            // not a vocabulary reason: probe mode does not try it live either
+            assert!(!is_vocabulary_reason(&Reason::GeneratedList(name.into())));
+        }
+    }
+
     #[test]
     fn user_environments() {
         let p = Policy::from_preamble(

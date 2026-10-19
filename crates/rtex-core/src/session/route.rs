@@ -29,6 +29,11 @@ impl Session {
         let (shape, src_reasons) = classify_source_with(text, policy, false);
         let mut needs_probe = false;
         let mut vocab: Vec<Reason> = Vec::new();
+        // a generated list (\tableofcontents) is typeset as whatever LaTeX builds from the aux
+        // files, a heading for one: that its shape differs from the source says nothing more
+        let generated = src_reasons
+            .iter()
+            .any(|r| matches!(r, Reason::GeneratedList(_)));
         for r in src_reasons {
             if probe_mode && crate::eligibility::is_vocabulary_reason(&r) {
                 // not a verdict: the probe compile decides
@@ -123,7 +128,7 @@ impl Session {
                     (UnitShape::Heading(n), "heading") => Some(n.as_str()) == c.name.as_deref(),
                     _ => false,
                 };
-                if !shape_ok {
+                if !shape_ok && !generated {
                     reasons.push(reason_str(&Reason::KindMismatch));
                 }
                 if let Some((lv, ms)) = over_budget {
