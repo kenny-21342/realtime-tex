@@ -64,7 +64,10 @@ jobs:
     needs: build
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -72,8 +75,19 @@ jobs:
       - run: cd dist && cat *.sha256 > SHA256SUMS && ls -la
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+          tag_name: ${{ env.TAG }}
           files: |
             dist/rtex-*
             dist/SHA256SUMS
           fail_on_unmatched_files: true
+      # a release without a description (one this workflow created) gets the version's
+      # CHANGELOG.md section; a description written by hand is left as it is
+      - name: Release notes from CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(gh release view "$TAG" --json body --jq .body)
+          scripts/version.sh notes "${TAG#v}" > "$RUNNER_TEMP/notes.md"
+          if [ -z "$body" ] && [ -s "$RUNNER_TEMP/notes.md" ]; then
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi

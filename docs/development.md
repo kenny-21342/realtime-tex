@@ -25,7 +25,12 @@ with `scripts/package.sh`. It smoke-tests the packages with `rtex doctor`, then 
 no version, so `releases/latest/download/rtex-<target>.tar.gz` always points at the newest
 build. To attach binaries to an existing release, run the workflow by hand ("Run workflow")
 with its tag. Pushes that change the workflow or the package script run the builds without
-publishing.
+publishing. A release with an empty description gets the version's `CHANGELOG.md` section.
+
+The version is stated in Cargo.toml, Cargo.lock, both READMEs, `include/rtex.h`,
+`tex/latex/rtex-capture.sty` and `docs/display-list.md`. `scripts/version.sh bump X.Y.Z` sets
+it in all of them and moves the Unreleased entries of `CHANGELOG.md` under `## X.Y.Z (date)`;
+`scripts/version.sh check`, run by CI, fails when one of them disagrees.
 
 ## Setting up
 

@@ -17,6 +17,7 @@ jobs:
       - run: cargo build --workspace --release
       - run: cargo test --workspace --lib
       - run: scripts/check-abi.sh
+      - run: scripts/version.sh check
       - run: cc -Iinclude examples/c/edit_loop.c -Ltarget/release -lrtex_core -lpthread -ldl -lm -o /tmp/edit_loop
   integration:
     runs-on: ubuntu-24.04
