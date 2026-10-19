@@ -335,7 +335,19 @@ impl Observer {
 
     /// Judge a served result against the current (settled) layout.
     pub fn judge(&self, served: &Served) -> Judgement {
-        if served.status != "ok" {
+        self.judge_with(served, false)
+    }
+
+    /// `drawings`: also judge `ok_degraded` results whose only degradation is PDF literals
+    /// (pictures drawn by the live engine), comparing their drawing code, transformations and
+    /// colours with the pass besides the glyphs. Results that borrow cached pictures
+    /// (`pic_cache`: the live engine left the picture's box empty) are still declined.
+    pub fn judge_with(&self, served: &Served, drawings: bool) -> Judgement {
+        let drawn = drawings
+            && served.status == "ok_degraded"
+            && !served.reasons.is_empty()
+            && served.reasons.iter().all(|r| r == "literal");
+        if served.status != "ok" && !drawn {
             let mut d = served.reasons.clone();
             d.push(format!("status {}", served.status));
             return Judgement {
@@ -349,7 +361,10 @@ impl Observer {
                 details: vec![],
             };
         };
-        let d = diff(&served.dl, &rows);
+        let mut d = diff(&served.dl, &rows);
+        if drawn && d.is_empty() {
+            d = diff_drawing(&served.dl, &rows);
+        }
         if d.is_empty() {
             Judgement {
                 verdict: Verdict::Match,
@@ -518,6 +533,72 @@ pub fn diff(fast: &DisplayList, rows: &[(&Line, &DisplayList)]) -> Vec<String> {
             );
             if a != b {
                 d.push(format!("row {} {kind} count {a} vs {b}", k + 1));
+            }
+        }
+    }
+    d
+}
+
+/// Drawing differences, row by row, between a live result and the pass rows `diff` found
+/// equal in glyphs: PDF literals (code and position), transformations and colour commands
+/// (without `after`, the colour-stack top only page lists record).
+pub fn diff_drawing(fast: &DisplayList, rows: &[(&Line, &DisplayList)]) -> Vec<String> {
+    let mut d = Vec::new();
+    for (k, (fl, (rl, _))) in fast.lines.iter().zip(rows.iter()).enumerate() {
+        let (ox, oy) = (rl.x - fl.x, rl.y - fl.y);
+        let moved = |i: &Item| -> Option<Item> {
+            Some(match i {
+                Item::Literal { mode, data, at } => Item::Literal {
+                    mode: *mode,
+                    data: data.clone(),
+                    at: at.map(|(x, y)| (x + ox, y + oy)),
+                },
+                Item::Matrix { op, x, y, data } => Item::Matrix {
+                    op: op.clone(),
+                    x: x + ox,
+                    y: y + oy,
+                    data: data.clone(),
+                },
+                Item::Color {
+                    stack, cmd, data, ..
+                } => Item::Color {
+                    stack: *stack,
+                    cmd: *cmd,
+                    data: data.clone(),
+                    after: None,
+                },
+                _ => return None,
+            })
+        };
+        let a: Vec<Item> = fl.items.iter().filter_map(moved).collect();
+        let b: Vec<Item> = rl
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Color {
+                    stack, cmd, data, ..
+                } => Some(Item::Color {
+                    stack: *stack,
+                    cmd: *cmd,
+                    data: data.clone(),
+                    after: None,
+                }),
+                Item::Literal { .. } | Item::Matrix { .. } => Some(i.clone()),
+                _ => None,
+            })
+            .collect();
+        if a.len() != b.len() {
+            d.push(format!(
+                "row {} drawing items {} vs {}",
+                k + 1,
+                a.len(),
+                b.len()
+            ));
+            continue;
+        }
+        for (x, y) in a.iter().zip(&b) {
+            if x != y && d.len() < 8 {
+                d.push(format!("row {} drawing: fast {x:?} pass {y:?}", k + 1));
             }
         }
     }
