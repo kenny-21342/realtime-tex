@@ -74,6 +74,14 @@ pub(super) fn debug_bundle(
                 }
             }
         }
+    } else {
+        // an error the server answered (no server at hand here): the preamble it was started
+        // with, so `rtex bundle replay` can start one like it
+        let preamble = super::passes::effective_preamble(
+            &super::passes::texts_of(&s.files.lock()),
+            &s.cfg.main_file,
+        );
+        write("rtex-preamble.tex", preamble.as_bytes());
     }
     Some(dir)
 }
