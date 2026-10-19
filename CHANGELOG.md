@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.12 (2026-10-19)
+
 ### New
 
 - More package commands update live when their package is loaded: amsmath's `\boxed`,
