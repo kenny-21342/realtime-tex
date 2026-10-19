@@ -271,3 +271,53 @@ fn unavailable_pattern_has_no_partial_native_drawing() {
     );
     s.close();
 }
+
+/// A picture's live redraws are held against the full compile they replace, not against the
+/// paragraph budget: with a budget no paragraph can meet, edits of a label stay live.
+#[test]
+fn pictures_are_budgeted_against_the_full_compile() {
+    if rtex_core::texlive::TexLive::discover().is_err() {
+        return;
+    }
+    let root =
+        std::env::temp_dir().join(format!("rtex-live-picture-{}-budget", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let text = "\\documentclass{article}\n\\usepackage{tikz}\n\\begin{document}\nBefore.\n\n\\begin{tikzpicture}\\draw (0,0) -- (2,1) node[above] {static};\\end{tikzpicture}\n\nAfter.\n\\end{document}\n";
+    std::fs::write(root.join("main.tex"), text).unwrap();
+    let mut cfg = SessionConfig::new(&root, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.fast_budget = Duration::from_micros(1); // every paragraph is over budget
+    cfg.fast_budget_factor = 0.0;
+    let s = Session::open(cfg).unwrap();
+    layout(&s);
+    s.pause_background(true);
+    let t0 = Instant::now();
+    while s.background_running() {
+        assert!(t0.elapsed() < Duration::from_secs(120));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // five edits: three slow ones in a row would mark a paragraph over budget
+    for k in 0..5 {
+        let doc = s.document_text("main.tex").unwrap();
+        let at = doc.find("{stati").unwrap() + 6;
+        let r = s
+            .apply_edit(
+                "main.tex",
+                Edit {
+                    start_byte: at,
+                    end_byte: at + 1,
+                    text: ["a", "b", "c", "d", "e"][k].into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(r.routed, "fast", "edit {k}: {:?}", r.reasons);
+        let (ev, _) = s.wait_for(
+            Duration::from_secs(60),
+            |e| matches!(e, Event::ParagraphUpdate { edit_id, .. } if *edit_id == r.edit_id),
+        );
+        assert!(ev.is_some(), "edit {k}: no live update");
+    }
+    s.close();
+    let _ = std::fs::remove_dir_all(&root);
+}

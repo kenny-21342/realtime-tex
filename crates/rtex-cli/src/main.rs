@@ -1,5 +1,6 @@
 use rtex_core::fixtures as gen_book;
 mod bench;
+mod bundle;
 mod probe;
 mod serve;
 mod slice;
@@ -203,12 +204,67 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Debug bundles of live-engine failures: replay one, or anonymize it for a regression test.
+    Bundle {
+        #[command(subcommand)]
+        op: BundleOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum BundleOp {
+    /// Send the bundle's request to a fresh live engine. Exit 1 when it fails again.
+    Replay {
+        dir: PathBuf,
+        /// Project directory the request's \input files and images are found in.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Answer timeout (default: the session's, from report.json).
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
+    /// Copy what replay needs, with the document's words replaced; review before committing.
+    Anonymize { dir: PathBuf, out: PathBuf },
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Bundle { op } => match op {
+            BundleOp::Replay {
+                dir,
+                project,
+                timeout_ms,
+            } => {
+                let o = bundle::replay(
+                    &dir,
+                    project.as_deref(),
+                    timeout_ms.map(std::time::Duration::from_millis),
+                )?;
+                println!(
+                    "{}: {} in {} ms{}",
+                    dir.display(),
+                    o.status,
+                    o.ms,
+                    if o.detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", o.detail)
+                    }
+                );
+                if !bundle::passed(&o) {
+                    std::process::exit(1);
+                }
+            }
+            BundleOp::Anonymize { dir, out } => {
+                bundle::anonymize(&dir, &out)?;
+                println!(
+                    "{} written; read source.tex and rtex-preamble.tex before committing",
+                    out.display()
+                );
+            }
+        },
         Cmd::Slice {
             project,
             main,

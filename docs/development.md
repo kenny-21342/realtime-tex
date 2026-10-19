@@ -128,6 +128,10 @@ That is much slower, so the watchdog is ten times longer while it is on.
 A unit that hangs or crashes the engine is not tried again until the preamble changes. Without
 that, every keystroke in it would kill the engine.
 
+`rtex bundle replay DIR` sends a bundle's request to a fresh engine (exit 1 when it fails
+again), and `rtex bundle anonymize DIR OUT` copies it with the document's words replaced, for
+`fixtures/bundles/`, whose bundles CI replays (fixtures/bundles/README.md).
+
 ## Conventions
 
 - Version: the library, C ABI, display-list format and engine protocol are versioned together

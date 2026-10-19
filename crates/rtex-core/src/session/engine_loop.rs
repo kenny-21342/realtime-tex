@@ -1185,6 +1185,16 @@ pub(super) fn handle_result(
     let Some(budget_us) = budget_us else {
         return;
     };
+    // picture code in the unit (whether or not the picture cache is on)
+    let pictures = crate::piccache::PICTURE_ENVS
+        .iter()
+        .any(|e| req.source.contains(&format!("\\begin{{{e}}}")))
+        || req.source.contains("\\tikz");
+    let budget_us = if pictures {
+        picture_budget_us(budget_us, s.slowest_pass_ms.load(Ordering::SeqCst))
+    } else {
+        budget_us
+    };
     if total_us > budget_us {
         if s.bg_running.load(Ordering::SeqCst) {
             // a layout pass is using the CPU: a slow round trip now says nothing about the unit
@@ -1224,6 +1234,16 @@ const BUDGET_SAMPLES: usize = 8;
 /// The budget a live compile is held to (µs): `floor_us` (`fast_budget`), or `factor` times the
 /// median of the session's recent compiles when that is larger. `None` (judge nothing) while
 /// fewer than `BUDGET_SAMPLES` compiles are known, unless `factor` is 0 (the floor alone).
+/// The budget of a unit with picture environments: a live redraw of a TikZ picture takes far
+/// longer than a paragraph (pgf's arithmetic), yet is still worth it while it is well under
+/// the full compile it replaces. A quarter of the slowest full compile so far, at most
+/// `PICTURE_BUDGET_CAP_US`; never less than the unit budget.
+const PICTURE_BUDGET_CAP_US: u64 = 2_000_000;
+
+fn picture_budget_us(budget_us: u64, slowest_pass_ms: u64) -> u64 {
+    budget_us.max((slowest_pass_ms.saturating_mul(1000) / 4).min(PICTURE_BUDGET_CAP_US))
+}
+
 fn effective_budget_us(
     floor_us: u64,
     factor: f64,
@@ -1245,6 +1265,18 @@ fn effective_budget_us(
 mod budget_tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn pictures_are_judged_against_the_full_compile() {
+        // no pass measured yet: the unit budget
+        assert_eq!(picture_budget_us(50_000, 0), 50_000);
+        // a 2 s document: pictures may take half a second
+        assert_eq!(picture_budget_us(50_000, 2_000), 500_000);
+        // a 35 s document: capped
+        assert_eq!(picture_budget_us(50_000, 35_000), PICTURE_BUDGET_CAP_US);
+        // a tiny document: never below the unit budget
+        assert_eq!(picture_budget_us(50_000, 100), 50_000);
+    }
 
     #[test]
     fn the_budget_follows_the_document() {

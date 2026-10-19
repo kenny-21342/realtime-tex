@@ -64,6 +64,16 @@ response reader thread (`crates/rtex-core/src/transport.rs`) replaces them on ev
     tests type new lines, check captured eligibility, and compare subsequent live results
     with the completed page rows. Policy tracks explicit titlesec display shapes and spacing;
     FileBuf applies the same heading segmentation to main files, inputs and verifier snapshots.
+11. Upstream 0.0.4 merged 2026-10-16 (PR #23, conflicts listed there); `.github/workflows/upstream-drift.yml`
+    reports later upstream commits and would-be conflicts in one issue every Monday (never pushes).
+12. Allow-list from a census (`examples/eligibility_census.rs`): amsmath `\boxed`, gensymb, physics, cleveref,
+    `\coth`; a preamble's own `\abs` is not blamed on physics. Aux-generated lists say `GeneratedList`.
+    `\tikzset`/`\definecolor`/… are local inside a group (`LOCAL_STYLE_SETTERS`). Units with picture code get
+    the picture budget (`engine_loop.rs` `picture_budget_us`: a quarter of the slowest pass, at most 2 s).
+13. Robustness tooling: `scripts/version.sh bump|check|notes` (CI runs `check`); mutation edit families
+    (`RTEX_MUTATION_KINDS=all`, drawing comparison of `ok_degraded` results, `.github/workflows/nightly.yml`);
+    `rtex bundle replay|anonymize` with `fixtures/bundles/` replayed by `crates/rtex-cli/tests/bundles.rs`.
+    Only anonymized bundles of public or synthetic documents go into `fixtures/bundles/`.
 
 ## Running in a Claude Code cloud session
 Environment: Ubuntu 24.04 x86_64, 4 vCPU, 16 GB RAM, 30 GB disk; Rust is preinstalled; TeX Live is installed by
