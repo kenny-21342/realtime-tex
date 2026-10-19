@@ -57,7 +57,7 @@ interval, capped at three intervals.
 | A list that continues an earlier one (enumitem `resume`, `series`) | The earlier list's count is not a LaTeX counter. |
 | Paragraphs inside `tcolorbox`, text printed from Lua (`\directlua`, `luacode`) | rtex cannot attribute those lines to a source span. |
 | Text whose output depends on state built up earlier in the document that rtex does not restore | The probe sees the difference, and the unit waits for the pass. |
-| A unit whose live compiles keep taking longer than the budget (50 ms, or 4 times the document's typical live update when that is larger) | Usually a large TikZ picture being edited. It goes back to live editing after the next layout. |
+| A unit whose live compiles keep taking longer than the budget (50 ms, or 4 times the document's typical live update when that is larger) | It goes back to live editing after the next layout. A unit with a picture has a larger budget: a quarter of the slowest full compile so far, at most 2 s, since a redraw that long still beats waiting for the full compile. |
 | A unit that hung or crashed the live engine | Kept on the background path until the preamble changes, so it cannot crash the engine again. |
 
 **TikZ, pgfplots and other drawings** are typeset live when they fit in the budget. Their pages

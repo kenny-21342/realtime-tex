@@ -1187,6 +1187,17 @@ const GROUP_ONLY_SETTERS: &[&str] = &[
     "fontsize",
 ];
 
+/// Style and colour settings that are local to the group they run in (pgfkeys styles, xcolor
+/// names): fine inside a figure or another environment, where they cannot reach the next unit;
+/// at a unit's top level they would. (name, brace arguments to skip after an optional `[…]`)
+const LOCAL_STYLE_SETTERS: &[(&str, usize)] = &[
+    ("tikzset", 1),
+    ("pgfplotsset", 1),
+    ("ctikzset", 1),
+    ("definecolor", 3),
+    ("colorlet", 2),
+];
+
 /// Block environments that form units (or end a paragraph unit) and may nest.
 pub use crate::document::BLOCK_ENVS;
 pub const FLOAT_ENVS: &[&str] = &["figure", "figure*", "table", "table*"];
@@ -2522,6 +2533,54 @@ impl<'a> Scan<'a> {
                 self.text_group_pending = true;
             }
             true
+        } else if let Some(&(_, nargs)) = LOCAL_STYLE_SETTERS.iter().find(|(n, _)| *n == name) {
+            if self.depth == 0 && self.env_depth == 0 {
+                self.push(Reason::SizeDeclarationOutsideGroup(name.clone()));
+            }
+            // the arguments are keys, names and colour specs, not text: skip them
+            let b = text.as_bytes();
+            let mut k = self.i;
+            let ws = |k: &mut usize| {
+                while *k < b.len() && b[*k].is_ascii_whitespace() {
+                    *k += 1;
+                }
+            };
+            ws(&mut k);
+            if k < b.len() && b[k] == b'[' {
+                if let Some(e) = text[k..].find(']') {
+                    k += e + 1;
+                }
+            }
+            for _ in 0..nargs {
+                ws(&mut k);
+                if k >= b.len() || b[k] != b'{' {
+                    break;
+                }
+                let mut depth = 0i32;
+                let start = k;
+                while k < b.len() {
+                    match b[k] {
+                        b'\\' => k += 1,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if depth != 0 {
+                    // unbalanced: leave it to the brace check
+                    k = start;
+                    break;
+                }
+                k += 1;
+            }
+            self.i = k;
+            true
         } else if GROUP_ONLY_SETTERS.contains(&name.as_str())
             || ((name == "renewcommand" || name == "renewcommand*")
                 && text[self.i..].trim_start().starts_with("{\\arraystretch}"))
@@ -3164,6 +3223,32 @@ mod tests {
             &[],
         );
         assert!(check_source("We have $\\abs{x} < 1$.", &own).is_empty());
+    }
+
+    #[test]
+    fn style_settings_are_fine_inside_a_group() {
+        let p = Policy::from_preamble("\\usepackage{tikz}\\usepackage{xcolor}\n", &[], &[]);
+        // inside an environment: local, and their arguments are keys, not text
+        let fig = "\\begin{center}\n\\tikzset{every node/.style={draw, fill=blue!10}, >=latex}\n\\definecolor{mine}{RGB}{10,20,30}\\colorlet{soft}{mine!40}\nSome text in \\textcolor{soft}{colour}.\n\\end{center}";
+        let r = check_source(fig, &p);
+        assert!(r.is_empty(), "{r:?}");
+        // the picture itself is still vocabulary the probe decides on, nothing else
+        let pic = "\\begin{figure}\n\\centering\n\\tikzset{x=1cm}\n\\begin{tikzpicture}\\draw (0,0) -- (1,1);\\end{tikzpicture}\n\\end{figure}";
+        assert_eq!(
+            check_source(pic, &p),
+            vec![Reason::DisallowedEnvironment("tikzpicture".into())]
+        );
+        // at a paragraph's top level it reaches the units after it
+        let r = check_source("Text \\tikzset{x=2cm} more text.", &p);
+        assert!(
+            r.contains(&Reason::SizeDeclarationOutsideGroup("tikzset".into())),
+            "{r:?}"
+        );
+        let r = check_source(
+            "Text {\\definecolor{c}{rgb}{1,0,0}\\color{c} red} back.",
+            &p,
+        );
+        assert!(r.is_empty(), "{r:?}");
     }
 
     #[test]
