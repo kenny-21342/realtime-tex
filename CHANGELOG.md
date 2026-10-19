@@ -13,7 +13,18 @@
 - `\tableofcontents`, `\listoffigures`, `\printbibliography`, `\printindex` and the other lists
   LaTeX writes from the auxiliary files say so ("generated from the auxiliary files: the full
   compile updates it") instead of reporting an unknown macro and a `KindMismatch`.
+- TikZ pictures stay live while you edit them. A unit with picture code is held to a quarter of
+  the slowest full compile so far (at most 2 s) instead of the paragraph budget (50 ms, or 4
+  times the typical update). Most pictures take 50–500 ms to redraw, so after three edits they
+  used to wait for the full compile, which took far longer.
+- `\tikzset`, `\pgfplotsset`, `\ctikzset`, `\definecolor` and `\colorlet` inside a group or an
+  environment (a figure around a picture) no longer keep the unit off the live path; their
+  arguments are skipped. At a paragraph's top level they still wait, as they reach later units.
 - `Session::background_running()`: a background run is in progress.
+- Debug bundles of internal errors carry the preamble the engine was started with.
+  `rtex bundle replay DIR` sends a bundle's request to a fresh engine (exit 1 when it fails
+  again); `rtex bundle anonymize DIR OUT` copies it with the document's words replaced.
+  Bundles kept in `fixtures/bundles/` are replayed by CI.
 
 ### CI and repository
 
@@ -27,6 +38,12 @@
   a fixed pause, so a loaded machine no longer fails it.
 - `examples/eligibility_census.rs`: which reasons keep a project's units off the live path,
   counted without compiling.
+- The mutation test has edit families (`RTEX_MUTATION_KINDS`): text inside environments, inline
+  math, picture labels and coordinates, option numbers, and preamble edits that restart the live
+  engine. With picture or option edits, `ok_degraded` results are judged too: their PDF literals,
+  transformations and colours against the clean pass (`replay::diff_drawing`), as well as their
+  glyphs. `.github/workflows/nightly.yml` runs every family over the public corpus each night
+  with a new seed.
 
 ## 0.0.11 (2026-10-17)
 
