@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+Merged from upstream main (HenryXiaoYang/realtime-tex `80528e6`, with fixes by SDDKKK,
+Steve-Li-1998 and leo1oel). Run-in headings now follow upstream's segmentation: the fork's own
+rule (a run-in heading without text waits across blank lines, but a list after it is a unit of
+its own) is replaced by keeping the list in the heading's unit too. A `\paragraph` that titlesec
+gives a display shape is still no run-in heading.
+
+### Fixed
+
+- A preamble that ends the run before `\begin{document}` (a `\stop`, a half-typed preamble)
+  no longer restarts the live engine every second until the preamble changes. A failed start
+  is retried only after a preamble edit or a new pass, the failure says "the preamble ended the
+  run before `\begin{document}`" instead of quoting PDF statistics, and the full compile of
+  that text reports `Failed`: it read the previous pass's capture file and reported `Ok` with
+  the old pages (HenryXiaoYang/realtime-tex-vsc-plugin#10).
+- Documents that load the `float` package no longer report "Unknown float option `\'",
+  "`U'", "`s'" for every float. The capture hooked the end of `\@xfloat`, which `float`
+  redefines with a parameter text ending in `[`, so the hook was read as the float's placement.
+  The float box is now recorded at `\end{figure}` and `\end{table}` instead
+  (HenryXiaoYang/realtime-tex-vsc-plugin#8).
+- A main file in a subfolder (`cv/sop/sop.tex`) reads document-relative paths from its own
+  folder, as `latexmk -cd` compiles it. `\input{body}`, a figure next to the main file and
+  `\graphicspath` entries are found in that folder, and bibtex and biber run there, so
+  `\bibliography{../../references}` is found and citations resolve. A `.bst` file at the top
+  of the project is found too (`BSTINPUTS`, like `BIBINPUTS`).
+- Live edits no longer stop for good after a paragraph that typesets no rows (only a `\label`,
+  `\vspace` or `\noindent`) is typed next to another paragraph typed fresh, before the
+  background pass. Its placement read the first of no rows and the engine thread panicked
+  ("index out of bounds" in `layout.rs`), so no edit was live again until the engine restarted
+  (HenryXiaoYang/realtime-tex#13).
+- The paragraph after a run-in heading's own paragraph (the second paragraph under an IEEEtran
+  `\subsubsection` or a `\paragraph`) is live, and so is a heading right after a run-in
+  heading's paragraph. They start under the heading's `\everypar`, which the live engine cannot
+  replay; by then it only restores `\clubpenalty` and empties itself, so the capture records it
+  as the default `\everypar` (HenryXiaoYang/realtime-tex#14).
+- A live-engine error is withdrawn once a pass compiles the fixed source, and a pass without
+  errors clears the previous pass's errors, so a host no longer shows an error after the text
+  is valid again. A paragraph that crashed the live engine (often a half-typed command) goes
+  live again when it is edited after a clean pass, instead of waiting for the preamble to
+  change; after three crashes in a row it still waits (HenryXiaoYang/realtime-tex#11).
+- Run-in headings (`\paragraph`, `\subparagraph`, IEEEtran's `\subsubsection`) are live. The
+  source cut such a heading off from the paragraph or list that sets its title, so the heading
+  alone typeset nothing, and an edit in that paragraph was drawn without the title in the wrong
+  place until the pass. The heading's span now runs on through that paragraph or list, a label
+  and a blank line between them included, and the capture keeps a list that takes the title in
+  the heading's unit. The IEEEtran corpus paper goes from 20 to 27 of 27 units live, all exact
+  (HenryXiaoYang/realtime-tex#15).
+
 ## 0.0.13 (2026-10-19)
 
 Merged from upstream 0.0.5 (HenryXiaoYang/realtime-tex `e0ad117`, with fixes by Sigewinne-330

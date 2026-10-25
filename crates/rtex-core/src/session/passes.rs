@@ -425,7 +425,7 @@ fn run_pass(
         };
         failed_with(msg, vec![item])
     };
-    if let Err(e) = write_snapshot(&s.cfg.project_root, &texts, &snap_dir) {
+    if let Err(e) = write_snapshot(&s.cfg.project_root, &texts, &s.cfg.main_file, &snap_dir) {
         failed(format!("snapshot: {e}"));
         return !holding;
     }
@@ -985,6 +985,27 @@ pub(super) fn layout_failed(s: &Shared, t0: Instant, rev: Revision, msg: String)
         .ok();
 }
 
+/// Withdraw the `fast:<unit>` diagnostics of live-engine failures that a layout of revision
+/// `rev` supersedes (it typeset the failing source or a later one): an empty set per source.
+fn withdraw_fast_failures(s: &Shared, rev: Revision) {
+    let mut withdrawn = Vec::new();
+    s.fast_failures.lock().retain(|par_id, at| {
+        let superseded = *at <= rev;
+        if superseded {
+            withdrawn.push(*par_id);
+        }
+        !superseded
+    });
+    for par_id in withdrawn {
+        s.events
+            .send(Event::Diagnostics {
+                source: format!("fast:{par_id:?}"),
+                items: vec![],
+            })
+            .ok();
+    }
+}
+
 /// Install a pass's capture as the current layout and tell the host. `provisional`: a pass of a
 /// run that is not stable yet (another pass follows); the layout is usable, its convergence is
 /// `Converging`.
@@ -1032,6 +1053,7 @@ fn deliver_layout_inner(
     provisional: bool,
     held: Option<(Vec<HeldPicture>, Vec<Diagnostic>)>,
 ) -> CompileStatus {
+    withdraw_fast_failures(s, rev);
     // a held layout reports the errors of the run it holds for (its own run is clean)
     let (held, mut diagnostics) = match held {
         Some((pictures, diagnostics)) => (pictures, diagnostics),
@@ -1055,6 +1077,10 @@ fn deliver_layout_inner(
         compile == CompileStatus::Ok && held.is_empty(),
         Ordering::SeqCst,
     );
+    if compile == CompileStatus::Ok {
+        // the state the live engine starts units from no longer comes from text that crashed it
+        s.live.lock().on_clean_pass(rev);
+    }
     if compile == CompileStatus::Failed {
         s.events
             .send(Event::Diagnostics {
@@ -1236,14 +1262,13 @@ fn deliver_layout_inner(
             .collect()
     };
     let pages_total = cap.json.pages;
-    if !diagnostics.is_empty() {
-        s.events
-            .send(Event::Diagnostics {
-                source: "background".into(),
-                items: diagnostics,
-            })
-            .ok();
-    }
+    // also when empty: the set replaces the previous pass's, so fixed errors go away
+    s.events
+        .send(Event::Diagnostics {
+            source: "background".into(),
+            items: diagnostics,
+        })
+        .ok();
     // the fallback is named whenever the layout has a degraded page, changed in this
     // layout or not: a host that keeps one PDF per layout needs the current file
     let any_degraded = {
@@ -1309,6 +1334,7 @@ fn layout_lists(
             });
         }
         let has_ctx = eu.has_context();
+        let span_text = files.values().find_map(|fb| fb.span_text(*id));
         // eligible = capture facts clean AND the span's source passes the allow-list with the
         // shape the capture saw (what apply_edit will decide for a one-character edit)
         let source_ok = layout
@@ -1317,9 +1343,7 @@ fn layout_lists(
             .find(|sp| sp.id == *id)
             .map(|sp| !sp.background_only)
             .unwrap_or(false)
-            && files
-                .values()
-                .find_map(|fb| fb.span_text(*id))
+            && span_text
                 .map(|text| {
                     let (shape, _) = classify_source(text, &policy);
                     match (&shape, c.kind.as_str()) {
@@ -1337,14 +1361,14 @@ fn layout_lists(
                 has_ctx,
                 eu.rows(),
                 &eu.flags,
-                c.name.as_deref().filter(|_| c.runin),
+                c.name
+                    .as_deref()
+                    .filter(|_| c.runin && !span_text.is_some_and(runs_into_title)),
             )
             .is_empty()
         {
             eligible.push(*id);
-            let strict_ok = files
-                .values()
-                .find_map(|fb| fb.span_text(*id))
+            let strict_ok = span_text
                 .map(|text| classify_source_with(text, &policy, false).1.is_empty())
                 .unwrap_or(false);
             if strict_ok {
@@ -1431,7 +1455,7 @@ fn publish_unchanged_layout(
 pub(super) fn run_export(s: &Shared, job: u64, out: PathBuf) {
     let (texts, _spans, _rev) = snapshot(s);
     let snap_dir = s.cfg.build_dir.join("export-src");
-    if let Err(e) = write_snapshot(&s.cfg.project_root, &texts, &snap_dir) {
+    if let Err(e) = write_snapshot(&s.cfg.project_root, &texts, &s.cfg.main_file, &snap_dir) {
         s.events
             .send(Event::PdfExported {
                 job_id: job,
