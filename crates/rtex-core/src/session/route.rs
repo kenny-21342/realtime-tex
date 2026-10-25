@@ -45,12 +45,16 @@ impl Session {
         }
         // read the live record once, into locals: no lock guard lives in a scrutinee (one
         // there stays held through the whole block)
-        let (leak, internal_error, over_budget) = {
-            let live = self.shared.live.lock();
+        let (leak, internal_error, over_budget, crashes) = {
+            let mut live = self.shared.live.lock();
+            live.lift_quarantine_if_edited(span.id, span.hash);
             (
                 live.get(span.id).and_then(|u| u.leak.clone()),
                 live.internal_error_for(span.id, layout.layout_version),
                 live.get(span.id).and_then(|u| u.over_budget),
+                live.get(span.id)
+                    .and_then(|u| u.crash)
+                    .map_or(0, |c| c.count),
             )
         };
         if let Some(why) = leak {
@@ -118,7 +122,9 @@ impl Session {
                     eu.has_context(),
                     if waiting_heading { 1 } else { eu.rows() },
                     &eu.flags,
-                    c.name.as_deref().filter(|_| c.runin),
+                    c.name
+                        .as_deref()
+                        .filter(|_| c.runin && !runs_into_title(text)),
                 ) {
                     reasons.push(reason_str(&r));
                 }
@@ -132,8 +138,10 @@ impl Session {
                     reasons.push(reason_str(&Reason::KindMismatch));
                 }
                 if let Some((lv, ms)) = over_budget {
-                    if lv == QUARANTINED {
-                        reasons.push("EngineFailed: the live engine hung or crashed on this paragraph; it stays on the full compile until the preamble changes".into());
+                    if lv == QUARANTINED && crashes >= MAX_CRASH_RETRIES {
+                        reasons.push("EngineFailed: the live engine hung or crashed on this paragraph repeatedly; it stays on the full compile until the preamble changes".into());
+                    } else if lv == QUARANTINED {
+                        reasons.push("EngineFailed: the live engine hung or crashed on this paragraph; it stays on the full compile until it is edited after a clean full compile".into());
                     } else if lv == layout.layout_version {
                         reasons.push(reason_str(&Reason::OverBudget(ms)));
                     }
@@ -450,12 +458,12 @@ impl Session {
             eu.context_json()
         };
         let heading = (idx > 0 && fb.spans[idx - 1].kind == SpanKind::Heading)
-            .then(|| classify_source(&fb.text[fb.spans[idx - 1].range.clone()], policy).0);
-        let after_heading = matches!(&heading, Some(UnitShape::Heading(h))
-            if !matches!(h.as_str(), "paragraph" | "subparagraph") || policy.display_headings.contains(h));
+            .then(|| &fb.text[fb.spans[idx - 1].range.clone()]);
+        // not after a run-in heading's span, which holds the paragraph that set its title
+        let after_heading = heading.is_some_and(|h| !runs_into_title(h));
         let afterindent = after_heading
-            && matches!(&heading, Some(UnitShape::Heading(h))
-            if policy.indent_after_heading(h));
+            && matches!(heading.map(|h| classify_source(h, policy).0),
+                Some(UnitShape::Heading(h)) if policy.indent_after_heading(&h));
         json["everypar"] = serde_json::Value::String(if after_heading {
             AFTER_HEADING_EVERYPAR.to_string()
         } else {

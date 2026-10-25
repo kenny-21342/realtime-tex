@@ -16,6 +16,7 @@ pub(super) fn engine_thread(s: Arc<Shared>) {
         standby: None,
         bbl_checked: u64::MAX,
         swapped_from: None,
+        failed_start: None,
     }
     .run();
 }
@@ -37,6 +38,9 @@ struct EngineLoop {
     /// replaced server are still valid (same preamble) and are carried over, as long as the
     /// generation is still the one the swap installed.
     swapped_from: Option<(u64, u64)>,
+    /// (generation, layout version) of the last start that failed: the same preamble with the
+    /// same `.aux` fails the same way, so it is not started again until one of them changes.
+    failed_start: Option<(u64, u64)>,
 }
 
 /// A server for the latest bibliography (`refresh_bibliography`): starting on a helper thread,
@@ -364,6 +368,13 @@ impl EngineLoop {
         if let Some(mut old) = self.server.take() {
             old.kill();
         }
+        // the layout the server starts from: its .bbl is compared with later layouts'
+        let (aux, aux_layout) = layout_aux(&s);
+        if self.failed_start == Some((wanted_gen, aux_layout)) {
+            // wait for a preamble edit (a new generation) or a new pass instead of retrying
+            let _ = s.pending_signal.1.recv_timeout(Duration::from_millis(200));
+            return false;
+        }
         let preamble = effective_preamble(&texts_of(&s.files.lock()), &s.cfg.main_file);
         s.events
             .send(Event::EngineState {
@@ -372,8 +383,6 @@ impl EngineLoop {
                 reason: None,
             })
             .ok();
-        // the layout the server starts from: its .bbl is compared with later layouts'
-        let (aux, aux_layout) = layout_aux(&s);
         match FastServer::spawn_with(
             &s.tl,
             &s.cfg.project_root,
@@ -416,7 +425,7 @@ impl EngineLoop {
                         reason: Some(reason),
                     })
                     .ok();
-                std::thread::sleep(Duration::from_secs(1));
+                self.failed_start = Some((wanted_gen, aux_layout));
                 false
             }
         }
@@ -798,15 +807,23 @@ pub(super) fn engine_failed(
             }],
         })
         .ok();
+    // nothing on the live path reports this unit again (it stays on the background path): the
+    // next layout of this revision or a later one withdraws the diagnostic
+    s.fast_failures
+        .lock()
+        .insert(req.par_id, req.versions.source_revision);
     s.engine_generation.fetch_add(1, Ordering::SeqCst);
-    // the paragraph goes to the background path, and stays there until the preamble changes:
-    // retrying a unit that hung or crashed the engine would kill the server on every keystroke
+    // the paragraph goes to the background path, and stays there until it is edited after a
+    // clean pass (or, after a few crashes, until the preamble changes): retrying the text that
+    // hung or crashed the engine would kill the server on every keystroke
     s.bg_signal
         .0
         .send(BgCmd::Pass(BackgroundPriority::Debounced))
         .ok();
     if !req.warmup {
-        s.live.lock().unit(req.par_id).over_budget = Some((QUARANTINED, 0));
+        s.live
+            .lock()
+            .quarantine(req.par_id, req.span_hash, req.versions.source_revision);
         s.events
             .send(Event::BackgroundScheduled {
                 par_id: Some(req.par_id),
@@ -1122,6 +1139,8 @@ pub(super) fn handle_result(
             .send(BgCmd::Pass(BackgroundPriority::Reflow))
             .ok();
     }
+    // the engine typeset the unit: its earlier crashes no longer count as crashes in a row
+    s.live.lock().forget_crashes(req.par_id);
     // A unit can contain an edited picture and unchanged cached ones. Expand the latter
     // exactly as a background page does, and send that list only when all drawing resolves.
     // Cache-only text edits keep their opaque cached_picture items and existing host path.

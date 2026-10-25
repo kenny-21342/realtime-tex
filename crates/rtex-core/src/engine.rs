@@ -216,7 +216,7 @@ impl FastServer {
             &driver,
             format!(
                 concat!(
-                    "\\input{{{}}}\n\\newbox\\rtexbox\\newcount\\rtexcontinue\\rtexcontinue=1 \\edef\\rtexcountnum{{\\number\\allocationnumber}}\\newcatcodetable\\rtexcct{{\\makeatletter\\savecatcodetable\\rtexcct}}\n\\begin{{document}}\n",
+                    "{}\n\\input{{{}}}\n\\newbox\\rtexbox\\newcount\\rtexcontinue\\rtexcontinue=1 \\edef\\rtexcountnum{{\\number\\allocationnumber}}\\newcatcodetable\\rtexcct{{\\makeatletter\\savecatcodetable\\rtexcct}}\n\\begin{{document}}\n",
                     // server-only shortcuts (tex/latex/rtex-serve-patches.tex): marks, math font memo, graphics probes
                     "\\input{{rtex-serve-patches}}\n",
                     "\\directlua{{rtex_serve = dofile(kpse.find_file(\"rtex-serve.lua\", \"lua\") or \"rtex-serve.lua\") rtex_serve.init(\\number\\rtexbox, \\rtexcountnum, \\number\\rtexcct)}}\n",
@@ -224,6 +224,7 @@ impl FastServer {
                     "\\makeatletter\\newbox\\rtex@imgbox\\IfPackageLoadedTF{{graphicx}}{{\\AddToHook{{cmd/Gin@setfile/after}}{{\\setbox\\rtex@imgbox\\hbox{{\\csname\\Gin@base\\Gin@ext\\space image\\ifdefined\\Gin@attr@hash\\Gin@attr@hash\\fi\\endcsname}}\\directlua{{rtex_serve.image(\\number\\lastsavedimageresourceindex,\"\\luaescapestring{{\\Gin@base\\Gin@ext}}\",\"\\luaescapestring{{\\Gin@page}}\",\\number\\lastsavedimageresourcepages,\"\\luaescapestring{{\\Gin@base\\Gin@ext\\space image\\ifdefined\\Gin@attr@hash\\Gin@attr@hash\\fi}}\",\\number\\rtex@imgbox)}}}}}}{{}}\\makeatother\n",
                     "\\loop\\rtexstep\\ifnum\\rtexcontinue>0 \\repeat\n\\end{{document}}\n"
                 ),
+                crate::texlive::INPUT_PATH_HOOK,
                 crate::paths::tex(&preamble_file)
             ),
         )?;
@@ -643,6 +644,10 @@ fn tex_log_excerpt(log: &Path) -> Option<String> {
         }
     };
     let mut out = picked.join(" / ");
+    if first.is_none() && text.to_ascii_lowercase().contains("no pages of output") {
+        // no error, yet the run ended: a \stop or \end{document} before \begin{document}
+        out = "the preamble ended the run before \\begin{document} (no page was written)".into();
+    }
     if out.chars().count() > 400 {
         out = out.chars().take(400).collect::<String>() + "…";
     }
@@ -684,5 +689,13 @@ mod tests {
         let x = tex_log_excerpt(&log).unwrap();
         let _ = std::fs::remove_file(&log);
         assert!(x.contains("cannot open response channel PIPE"), "{x}");
+        // \stop in the preamble: no error, no page
+        std::fs::write(&log, "(./rtex-preamble.tex)\n )\n\nwarning  (pdf backend): no pages of output.\n\nPDF statistics: 0 PDF objects out of 1000\n").unwrap();
+        let x = tex_log_excerpt(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            x.starts_with("the preamble ended the run before \\begin{document}"),
+            "{x}"
+        );
     }
 }

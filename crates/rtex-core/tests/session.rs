@@ -1379,3 +1379,139 @@ fn a_fresh_paragraph_after_a_heading_is_placed_below_it() {
     s.close();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Two paragraphs typed fresh before the pass, the second one typesetting no rows (only a
+/// `\label`): it is placed against the first one's live placement, and its empty result must
+/// not take the engine thread down (what a host saw as live updates stopping for good).
+#[test]
+fn a_fresh_paragraph_without_rows_after_a_fresh_one_keeps_the_engine_alive() {
+    if let Err(e) = rtex_core::texlive::TexLive::discover() {
+        eprintln!("SKIP: {e}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-fresh-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\nA first paragraph, long enough to be a real line of text on the page.\n\n\\end{document}\n",
+    )
+    .unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.fast_budget = Duration::from_millis(5000);
+    // no pass between the edits: the live placements they rely on last until the next layout
+    cfg.debounce = Duration::from_secs(60);
+    let s = Session::open(cfg).unwrap();
+    wait_layout(&s);
+    let type_after = |anchor: &str, text: &str| {
+        let doc = s.document_text("main.tex").unwrap();
+        let pos = doc.find(anchor).unwrap() + anchor.len();
+        let r = s
+            .apply_edit(
+                "main.tex",
+                Edit {
+                    start_byte: pos,
+                    end_byte: pos,
+                    text: text.into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(r.routed, "fast", "{:?}", r.reasons);
+        assert_eq!(r.outcome.added.len(), 1, "{:?}", r.outcome);
+        let id = r.outcome.added[0];
+        let (ev, _) = wait(
+            &s,
+            60,
+            |e| matches!(e, Event::ParagraphUpdate { par_id, .. } if *par_id == id),
+        );
+        ev.expect("an update for the fresh paragraph")
+    };
+    step("a fresh paragraph with rows");
+    type_after(
+        "page.\n\n",
+        "A second paragraph typed fresh, also a real line of text.\n\n",
+    );
+    step("a fresh paragraph without rows after it");
+    type_after("of text.\n\n", "\\label{fresh}\n\n");
+    step("the engine still answers");
+    type_after("of text.\n\n", "A third paragraph typed fresh.\n\n");
+    s.close();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A run-in heading (`\paragraph`) is set by the paragraph after it, a label and a blank line
+/// between them or not: they are one span, and an edit in that paragraph is typeset live with
+/// the title, as the unit the layout has (not placed on a borrowed context without it).
+#[test]
+fn an_edit_under_a_run_in_heading_goes_live_with_the_title() {
+    if let Err(e) = rtex_core::texlive::TexLive::discover() {
+        eprintln!("SKIP: {e}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-run-in-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\nA first paragraph, long enough to be a real line of text on the page.\n\n\\paragraph{Run-in.}\n\\label{p}\n\nThe paragraph that sets the title, long enough to run over more than one line of text on the page here.\n\nA last paragraph.\n\\end{document}\n",
+    )
+    .unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.fast_budget = Duration::from_millis(5000);
+    let s = Session::open(cfg).unwrap();
+    let Event::LayoutUpdate { placements, .. } = wait_layout(&s) else {
+        unreachable!()
+    };
+    let text = s.document_text("main.tex").unwrap();
+    let heading = s
+        .spans("main.tex")
+        .into_iter()
+        .find(|sp| sp.kind == rtex_core::document::SpanKind::Heading)
+        .expect("a heading span");
+    assert!(
+        text[heading.range.clone()].contains("sets the title"),
+        "{:?}",
+        &text[heading.range.clone()]
+    );
+    let rows = placements
+        .iter()
+        .find(|p| p.par_id == heading.id)
+        .expect("the heading's placement")
+        .lines;
+    assert!(rows >= 2, "{rows}");
+    let pos = text.find("sets the title").unwrap();
+    let r = s
+        .apply_edit(
+            "main.tex",
+            Edit {
+                start_byte: pos,
+                end_byte: pos,
+                text: "now ".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(r.routed, "fast", "{:?}", r.reasons);
+    let (ev, _) = wait(
+        &s,
+        60,
+        |e| matches!(e, Event::ParagraphUpdate { par_id, .. } if *par_id == heading.id),
+    );
+    let Some(Event::ParagraphUpdate {
+        status,
+        dl,
+        fragments,
+        ..
+    }) = ev
+    else {
+        panic!("no update for the heading's span")
+    };
+    assert_eq!(status, "ok");
+    assert_eq!(dl.lines.len() as i64, rows, "the title's line included");
+    assert!(fragments.iter().all(|f| !f.approximate), "{fragments:?}");
+    s.close();
+    let _ = std::fs::remove_dir_all(&root);
+}

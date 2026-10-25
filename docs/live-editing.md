@@ -51,14 +51,13 @@ interval, capped at three intervals.
 | `wrapfigure`, multicolumn text, a paragraph that continues after a float in the same TeX paragraph | Placed by the page builder, not by the paragraph. |
 | Setup lines on their own between paragraphs (`\newcommand`, `\setlength`, `\definecolor`, `\lstset`, …) | rtex loads them with the preamble, so macros defined there work live everywhere. Editing them is like editing the preamble: the live engine restarts. |
 | `\setlength` or `\renewcommand` at the top level of a paragraph, next to its text | It changes how everything after it is typeset. Inside a group or an environment, it is fine. |
-| A run-in heading (`\paragraph`, `\subparagraph`) whose text starts after a blank line | The heading is set in the following paragraph. With its text on the heading's lines, heading and text are one unit and update live. |
-| Other headings the class sets run-in (IEEEtran's `\subsubsection`, seen by the capture) | The heading shares its line with the following paragraph. |
+| A run-in heading rtex does not know by name (amsart's `\subsection`, one made run-in with titlesec) | Its title is set in the paragraph after it. rtex keeps the heading and that paragraph (or list) in one unit for `\paragraph`, `\subparagraph` and IEEEtran's `\subsubsection` only (not when titlesec gives them a display shape). |
 | A paragraph that ends a file with `\endinput` | `\endinput` would end the live engine's own input. |
 | A list that continues an earlier one (enumitem `resume`, `series`) | The earlier list's count is not a LaTeX counter. |
 | Paragraphs inside `tcolorbox`, text printed from Lua (`\directlua`, `luacode`) | rtex cannot attribute those lines to a source span. |
 | Text whose output depends on state built up earlier in the document that rtex does not restore | The probe sees the difference, and the unit waits for the pass. |
 | A unit whose live compiles keep taking longer than the budget (50 ms, or 4 times the document's typical live update when that is larger) | It goes back to live editing after the next layout. A unit with a picture has a larger budget: a quarter of the slowest full compile so far, at most 2 s, since a redraw that long still beats waiting for the full compile. |
-| A unit that hung or crashed the live engine | Kept on the background path until the preamble changes, so it cannot crash the engine again. |
+| A unit that hung or crashed the live engine | Kept on the background path until it is edited after a full compile without errors, so the same text cannot crash the engine again. A half-typed command that crashed it, once finished, is live again from the next edit. After three crashes in a row the unit stays on the background path until the preamble changes. |
 
 **TikZ, pgfplots and other drawings** are typeset live when they fit in the budget. Their pages
 are drawn from the display list's native drawing operations (paths, fills, strokes, clips,

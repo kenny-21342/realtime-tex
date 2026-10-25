@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 text.as_str()
             };
-            let fb = FileBuf::with_policy(body, &mut ids, 0, &policy);
+            let fb = FileBuf::with_rules(body, &mut ids, 0, policy.segment_rules());
             for sp in &fb.spans {
                 let src = &fb.text[sp.range.clone()];
                 if src.trim().is_empty() {

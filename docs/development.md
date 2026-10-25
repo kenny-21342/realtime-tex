@@ -70,7 +70,7 @@ The integration tests in `crates/rtex-core/tests/`:
 | `standby.rs` | the standby engine gives the same layout as a fresh run |
 | `capture_groups.rs` | paragraphs that start inside a group |
 | `twocolumn.rs` | every unit of a two-column document has its lines as rows |
-| `ieeetran.rs` | IEEEtran's own float boxes compiled live equal the full run; its run-in headings wait |
+| `ieeetran.rs` | IEEEtran's own float boxes, its run-in headings and the paragraphs after them compiled live equal the full run |
 | `piccache_live.rs` | cached pictures in the live engine |
 | `internal_error.rs` | a Lua error inside the server is answered, not swallowed |
 | `export.rs` | export equals a clean build; errors are reported |
@@ -125,8 +125,11 @@ Set `debug_dir` (`SessionConfig::debug_dir`, C `"debug_dir"`, `rtex serve --debu
 time and total time. With `RTEX_TRACE_MACROS=1` the server also runs with `\tracingmacros=1`.
 That is much slower, so the watchdog is ten times longer while it is on.
 
-A unit that hangs or crashes the engine is not tried again until the preamble changes. Without
-that, every keystroke in it would kill the engine.
+A unit that hangs or crashes the engine is not tried again until it is edited after a pass that
+compiled without errors. Without that, every keystroke in it would kill the engine; without the
+clean pass, the engine would start it from state the broken text left behind. After three
+crashes of the same unit in a row (with no live compile of it in between), its edits wait for
+the preamble to change instead.
 
 `rtex bundle replay DIR` sends a bundle's request to a fresh engine (exit 1 when it fails
 again), and `rtex bundle anonymize DIR OUT` copies it with the document's words replaced, for
