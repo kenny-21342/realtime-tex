@@ -1995,6 +1995,35 @@ pub fn labels_only(src: &str) -> bool {
 
 /// Does the heading that starts `src` (comments allowed) have material after its title other
 /// than labels: for a run-in heading, the paragraph or list that sets the title?
+/// True when `src` uses a citation command (`\cite`, natbib's `\citep`, biblatex's
+/// `\parencite`, …): its output depends on the bibliography data the engine read.
+pub fn cites(src: &str) -> bool {
+    let text = strip_comments(src);
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            let n = b[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .count();
+            if n == 0 {
+                i += 2;
+                continue;
+            }
+            // \cite, \citep, \citeauthor, \Citet, … and \parencite, \footfullcite, \nocite, …
+            let name = text[i + 1..i + 1 + n].to_ascii_lowercase();
+            if name.starts_with("cite") || name.ends_with("cite") {
+                return true;
+            }
+            i += 1 + n;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 pub fn runs_into_title(src: &str) -> bool {
     after_heading(&strip_comments(src)).is_some_and(|rest| !labels_only(rest))
 }
@@ -3068,6 +3097,27 @@ mod tests {
     fn reasons(s: &str) -> Vec<Reason> {
         check_source(s, &pol())
     }
+    #[test]
+    fn citing_units_are_recognised() {
+        for src in [
+            "As \\cite{a} shows.",
+            "\\citep[p.~2]{a} and \\citet*{b}",
+            "\\parencite{a}",
+            "\\Textcite{a}",
+            "\\citeauthor{a}",
+        ] {
+            assert!(cites(src), "{src}");
+        }
+        for src in [
+            "No citation.",
+            "% \\cite{a}\nText.",
+            "\\\\cite",
+            "\\excited",
+        ] {
+            assert!(!cites(src), "{src}");
+        }
+    }
+
     #[test]
     fn plain_and_fonts_ok() {
         assert!(ok(

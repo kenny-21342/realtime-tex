@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- A paragraph with a natbib citation edited while the first build of a session was still
+  running could be shown with the wrong brackets (round instead of the square ones
+  `\bibliographystyle{plainnat}` gives) and so with the wrong line breaks until the full compile.
+  The live engine had started before that build wrote the `.aux` and `.bbl`, and natbib reads
+  its brackets from the `.aux` at `\begin{document}`. While a live engine with the new
+  bibliography is starting, citing paragraphs now wait for the full compile; the others stay
+  live. This was the mutation test's one mismatch on the corpus report document and the cause
+  of the nightly failures of 2026-10-22 and 2026-10-23.
+
 ## 0.0.14 (2026-10-25)
 
 Merged from upstream main (HenryXiaoYang/realtime-tex `80528e6`, with fixes by SDDKKK,

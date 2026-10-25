@@ -228,10 +228,12 @@ impl EngineLoop {
 
     /// Step 1b: biblatex reads its `.bbl` once, at `\begin{document}`: a server started before
     /// the pass that wrote the bibliography (a session opened without an earlier build), or
-    /// before the bibliography changed, prints citations as unresolved keys, and the probe
-    /// keeps every citing unit on the pass. When the latest layout's `.bbl` differs from the
-    /// server's, a server is started with it on a helper thread while the running one keeps
-    /// serving, and replaces it once ready and idle. True: the iteration is settled (swapped).
+    /// before the bibliography changed, prints citations as unresolved keys. natbib takes its
+    /// brackets from the `\bibstyle` the `.aux` holds, also read at `\begin{document}`. When
+    /// the latest layout's `.bbl` differs from the server's, a server is started with it and
+    /// that layout's `.aux` on a helper thread while the running one keeps serving the units
+    /// without citations (`EngineLink::bib_stale`), and replaces it once ready and idle. True:
+    /// the iteration is settled (swapped).
     fn refresh_bibliography(&mut self, wanted_gen: u64) -> bool {
         let s = self.s.clone();
         if let Some(mut sb) = self.standby.take() {
@@ -294,6 +296,11 @@ impl EngineLoop {
             self.server_generation = sb.generation;
             self.server_bbl = self.server.as_ref().and_then(server_bbl_hash);
             self.labels_sent = 0;
+            {
+                let mut l = s.link.lock();
+                l.bib_stale = false;
+                l.bib_checked = self.bbl_checked;
+            }
             // verdicts reached against the old server's citations no longer apply
             s.live.lock().on_server_swap();
             s.events
@@ -314,7 +321,13 @@ impl EngineLoop {
         }
         self.bbl_checked = lv;
         let bbl = bbl_hash(aux.as_deref());
-        if bbl.is_none() || bbl == self.server_bbl {
+        let stale = bbl.is_some() && bbl != self.server_bbl;
+        {
+            let mut l = s.link.lock();
+            l.bib_checked = lv;
+            l.bib_stale = stale;
+        }
+        if !stale {
             return false;
         }
         let preamble = effective_preamble(&texts_of(&s.files.lock()), &s.cfg.main_file);
@@ -401,6 +414,8 @@ impl EngineLoop {
                     l.generation = wanted_gen;
                     l.contexts_sent.clear();
                     l.inflight = None;
+                    l.bib_checked = aux_layout;
+                    l.bib_stale = false;
                 }
                 self.server_bbl = server_bbl_hash(&srv);
                 self.server = Some(srv);
@@ -473,6 +488,17 @@ impl EngineLoop {
     fn serve(&mut self, mut req: FastRequest, wanted_gen: u64) {
         let s = self.s.clone();
         let mut link = s.link.lock();
+        if link.bib_stale && crate::eligibility::cites(&req.source) {
+            // the server prints citations from older bibliography data than the pass's (a
+            // server with the latest `.bbl` and `.aux` is starting): this unit waits for the pass
+            drop(link);
+            demote_span(
+                &s,
+                &req,
+                "the live engine is restarting with the latest bibliography",
+            );
+            return;
+        }
         if !self.ensure_context(&mut link, &mut req, wanted_gen) {
             return;
         }
