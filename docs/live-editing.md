@@ -14,7 +14,7 @@ This page lists what falls on which side. [how-it-works.md](how-it-works.md) exp
 |---|---|
 | Body text, accents, `\emph`, `\textbf` and other font switches, colours, boxes (`\fbox`, `\parbox`, `\colorbox`, `\underline`, `\rule`) | |
 | Inline math and display math: `\[…\]`, `equation`, `align`, `gather`, `multline`, with `\label`, `\tag` and equation numbers | |
-| `\ref`, `\eqref`, `\pageref`, `\autoref`, `\cite` (plain, natbib and biblatex) | Numbers come from the last background pass. A new label shows its number after the next pass. |
+| `\ref`, `\eqref`, `\pageref`, `\autoref`, `\cite` (plain, natbib and biblatex) | Numbers come from the last background pass. A new label shows its number after the next pass. When a pass brings a new bibliography (the first build of a session, or a changed `.bib`), paragraphs with citations wait for the full compile until the live engine has restarted with it, a few seconds. |
 | Lists (`itemize`, `enumerate`, `description`, enumitem labels), `quote`, `quotation`, `verse`, `center`, `abstract`, theorems and `proof`, `verbatim`, `lstlisting`, IEEEtran's `IEEEkeywords` and `IEEEdescription` | Each environment is one unit. |
 | Figures and tables: `\includegraphics`, `tabular`, `tabularx`, `booktabs`, `multirow`, `\rowcolor`, `subfigure`, `\caption` | Updated where the float currently is. If it should move, it moves after the next pass. |
 | Headings (`\chapter`, `\section`, …) | The table of contents and running heads follow after the next pass. |

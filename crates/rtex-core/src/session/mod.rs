@@ -374,6 +374,12 @@ struct EngineLink {
     /// Probe mode statistics: probe compiles run and their total time.
     probes: u64,
     probe_us: u64,
+    /// The layout version whose bibliography data (`.bbl`) the engine thread last compared with
+    /// the server's, and whether they differed (a server with the new data is starting): until
+    /// then the server's citations (natbib's brackets from the `.aux`, biblatex's labels) may
+    /// not be the pass's, so citing units are not served live.
+    bib_checked: u64,
+    bib_stale: bool,
 }
 
 type PreviewValidationHistory =
@@ -964,7 +970,11 @@ impl Session {
             && link.inflight.is_none()
             && link.generation == req.versions.engine_generation
             && link.context_rev_sent == req.versions.context_revision
-            && link.contexts_sent.contains(&req.seq);
+            && link.contexts_sent.contains(&req.seq)
+            // a citing unit while the server's bibliography is stale, or after a new layout
+            // (the engine thread compares bibliographies first)
+            && !((link.bib_stale || link.bib_checked != req.versions.layout_version)
+                && crate::eligibility::cites(&req.source));
         if direct {
             let req_id = link.next_req;
             link.next_req += 1;

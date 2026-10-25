@@ -4,7 +4,7 @@
 
 use rtex_core::session::CompileStatus;
 use rtex_core::texlive::TexLive;
-use rtex_core::{Convergence, Event, Session, SessionConfig};
+use rtex_core::{Convergence, Edit, Event, Session, SessionConfig};
 use std::time::{Duration, Instant};
 
 fn open(name: &str, main: &str) -> Option<Session> {
@@ -1106,4 +1106,126 @@ fn an_input_created_after_it_is_named_is_read() {
         "the file's text is not on the page: {text}"
     );
     s.close();
+}
+
+/// A session opened without an earlier build starts its live engine before any pass has written
+/// the `.bbl` and the `.aux`, whose `\bibstyle{plainnat}` gives natbib its square brackets. A
+/// citing paragraph edited before the server with that bibliography takes over must not be
+/// served with the old round brackets (the report corpus document's first edit, mutation seed
+/// 21, and the nightly failures of 2026-10-22/23).
+#[test]
+fn citations_wait_for_the_server_with_the_bibliography() {
+    use rtex_core::replay::{Observer, Verdict};
+    if let Err(e) = TexLive::discover() {
+        eprintln!("SKIP: {e}");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-regr-{}-natbib", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("refs.bib"),
+        "@book{hp,author={John Hennessy and David Patterson},title={Architecture},publisher={MK},year={2017}}\n\
+         @article{sm,author={Alan Smith},title={Caches},journal={CS},year={1982}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("main.tex"),
+        "\\documentclass{article}\n\\usepackage{natbib}\n\\begin{document}\n\
+         Memory hierarchies trade capacity for speed \\citep{hp}. \\citet{sm} surveyed cache \
+         designs; later work \\cite{hp,sm} refined them, and many more words follow here.\n\n\
+         A paragraph without citations.\n\n\\bibliographystyle{plainnat}\n\\bibliography{refs}\n\
+         \\end{document}\n",
+    )
+    .unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    let s = Session::open(cfg).unwrap();
+    let mut st = Observer::new();
+    assert!(
+        st.pump(&s, Duration::from_secs(300), |o| o.layouts > 0),
+        "no first layout"
+    );
+    let doc = s.document_text("main.tex").unwrap();
+    let at = doc.find("later work ").unwrap() + "later ".len();
+    let id = s
+        .spans("main.tex")
+        .iter()
+        .find(|sp| sp.range.contains(&at))
+        .unwrap()
+        .id;
+    let r = s
+        .apply_edit(
+            "main.tex",
+            Edit {
+                start_byte: at,
+                end_byte: at + "work ".len(),
+                text: String::new(),
+            },
+        )
+        .unwrap();
+    st.pump(&s, Duration::from_secs(60), |o| {
+        o.updates.contains_key(&(r.edit_id, id)) || o.background.contains_key(&r.edit_id)
+    });
+    let rev = s.versions().source_revision;
+    assert!(
+        st.settle(&s, rev, Duration::from_secs(300)),
+        "no clean pass"
+    );
+    if let Some(served) = st.updates.remove(&(r.edit_id, id)) {
+        let j = st.judge(&served);
+        assert!(
+            j.verdict != Verdict::Mismatch,
+            "served with the old citations: {:?}",
+            j.details
+        );
+    }
+    // once the server with the bibliography has taken over, the paragraph is live again
+    assert!(
+        st.pump(&s, Duration::from_secs(60), |o| o
+            .log
+            .iter()
+            .any(|l| l.contains("restarted with the bibliography"))),
+        "no server with the bibliography took over"
+    );
+    let doc = s.document_text("main.tex").unwrap();
+    let at = doc.find("refined them").unwrap() + "refined them".len();
+    let id = s
+        .spans("main.tex")
+        .iter()
+        .find(|sp| sp.range.contains(&at))
+        .unwrap()
+        .id;
+    let r = s
+        .apply_edit(
+            "main.tex",
+            Edit {
+                start_byte: at,
+                end_byte: at,
+                text: " further".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        st.pump(&s, Duration::from_secs(60), |o| o
+            .updates
+            .contains_key(&(r.edit_id, id))),
+        "the citing paragraph never went live again (routed {}, {:?})",
+        r.routed,
+        r.reasons
+    );
+    let rev = s.versions().source_revision;
+    assert!(
+        st.settle(&s, rev, Duration::from_secs(300)),
+        "no clean pass"
+    );
+    let served = st.updates.remove(&(r.edit_id, id)).unwrap();
+    let j = st.judge(&served);
+    assert!(
+        j.verdict == Verdict::Match,
+        "{:?} {:?}",
+        served.status,
+        j.details
+    );
 }

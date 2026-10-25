@@ -52,6 +52,34 @@ fn kind_of(text: &str) -> &'static str {
     }
 }
 
+/// The layout that ends the first run, once the live engine has the bibliography: a fresh
+/// project's engine starts before any pass has written the `.bbl`, and until the server with it
+/// takes over (seconds after that pass), units with citations wait for the full compile.
+fn run_end_with_bibliography(s: &Session) -> Event {
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let (mut layout, mut swapped) = (None, false);
+    while layout.is_none() || !swapped {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no run-ending layout and bibliography server (layout {}, swapped {swapped})",
+            layout.is_some()
+        );
+        for e in s.poll(Duration::from_millis(100)) {
+            match &e {
+                Event::LayoutUpdate {
+                    convergence: Convergence::Converged | Convergence::PassLimitReached { .. },
+                    ..
+                } => layout = Some(e),
+                Event::EngineState {
+                    reason: Some(r), ..
+                } if r.contains("bibliography") => swapped = true,
+                _ => {}
+            }
+        }
+    }
+    layout.unwrap()
+}
+
 /// Byte offset just after the first letter of body text: control words, the arguments of
 /// `\begin`/`\end`/`\label`/`\ref`-like commands and `\includegraphics`, and option groups are
 /// skipped; `\caption{…}` text is preferred when present.
@@ -138,16 +166,13 @@ fn every_unit_kind_takes_the_fast_path() {
     cfg.build_dir = root.join("build");
     cfg.fast_budget = Duration::from_millis(50); // first compiles load fonts
     let s = Session::open(cfg).unwrap();
-    let (first, _) = s.wait_for(Duration::from_secs(300), |e| {
-        matches!(e, Event::LayoutUpdate { .. })
-    });
-    let Some(Event::LayoutUpdate {
+    let Event::LayoutUpdate {
         eligible_paragraphs,
         placements,
         ..
-    }) = first
+    } = run_end_with_bibliography(&s)
     else {
-        panic!("no layout")
+        unreachable!()
     };
     s.pause_background(true);
     std::thread::sleep(Duration::from_millis(1500)); // warm-up compile
