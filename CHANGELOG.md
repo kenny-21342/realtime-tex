@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.14 (2026-10-25)
+
 Merged from upstream main (HenryXiaoYang/realtime-tex `80528e6`, with fixes by SDDKKK,
 Steve-Li-1998 and leo1oel). Run-in headings now follow upstream's segmentation: the fork's own
 rule (a run-in heading without text waits across blank lines, but a list after it is a unit of
