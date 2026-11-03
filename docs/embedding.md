@@ -89,9 +89,10 @@ briefly. The live engine and the background passes run on their own threads.
 | `max_passes` | `max_passes` | | 5 | passes per layout before giving up (`PassLimitReached`) |
 | `fast_budget` | `fast_budget_ms` | `--fast-budget-ms` | 50 ms | a unit slower than this three times in a row waits for the pass |
 | `fast_budget_factor` | `fast_budget_factor` | `--fast-budget-factor` | 4 | the budget is also at least this many times the session's median live compile (0: `fast_budget` alone) |
-| `pass_timeout` | `pass_timeout_ms` | `--pass-timeout-ms` | 120 s | a background pass still running after this is stopped and the run fails |
-| `compile_timeout` | `compile_timeout_ms` | | 5 s | a live compile that takes longer is killed and the engine restarted |
+| `compile_timeout` | `compile_timeout_ms` | `--compile-timeout-ms` | 5 s | a live compile that takes longer is killed and the engine restarted |
+| `pass_timeout` | `pass_timeout_ms` | `--pass-timeout-ms` | 120 s | a background or export lualatex run still going after this is stopped and the layout reports `Failed`; a background run is stopped sooner once the sources changed and it has taken twice as long as the slowest finished run |
 | `eligibility` | `eligibility` | `--eligibility` | `probe` | `probe` verifies unknown commands by comparison; `allowlist` only allows known ones |
+| `math_owner_attribute` | `math_owner_attribute` | `--math-owner-attribute` | none / `null` | observe host ids on this one LuaTeX attribute (`0..65535`) |
 | `trusted_macros` | `trusted_macros` | | none | macros you vouch for, treated as allow-listed |
 | `unit_envs` | `unit_envs` | | none | extra environments to treat like theorems (found automatically from `\newtheorem`) |
 | `picture_cache` | `picture_cache` | `--no-picture-cache` | on | reuse unchanged TikZ pictures from earlier passes |
@@ -100,6 +101,47 @@ briefly. The live engine and the background passes run on their own threads.
 | `fast_on_stale_context` | `fast_on_stale_context` | | on | deliver live results even when something before the unit changed since the last pass |
 | `bib_tool` | | | auto | `biber`, `bibtex` or none; auto picks from the files the pass writes |
 | `debug_dir` | `debug_dir` | `--debug-dir` | `$RTEX_DEBUG_DIR` | write a diagnostic bundle per engine failure ([development.md](development.md#when-the-live-engine-fails)) |
+
+## Math source ownership
+
+A host can opt into math hit-testing metadata by setting
+`cfg.math_owner_attribute = Some(65000)` (Rust), `"math_owner_attribute": 65000` in the C
+JSON config, or `rtex serve --math-owner-attribute 65000`. Omission or `null` in the C config
+leaves it off. Pick an attribute number that your document and its packages do not use;
+rtex does not reserve it or allocate host ids. Invalid C config values are errors.
+
+Tag your own source atoms, localizing assignments so they do not reach subsequent text:
+
+```tex
+$\begingroup\attribute65000=10
+  \frac{\attribute65000=11 a}{\attribute65000=12 b}
+\endgroup$
+```
+
+With this option, the allow-list accepts decimal literal assignments to that attribute
+(`\attribute65000=11`, spaces and a signed integer value allowed), plus balanced
+`\begingroup`/`\endgroup`. Other attribute numbers, register expressions and attribute
+primitives are not added to the allow-list. Probe mode's existing verification rules still
+apply to vocabulary outside the allow-list. The observer reads the node attributes in both
+live compiles and background passes; it does not rewrite source or track offsets, revisions,
+parent ids or macro expansion. Keep that mapping in the host, update it with each edit, and
+interpret metadata only with the event's matching `source_revision`.
+
+Tagged glyphs and observed math-field boxes arrive in `dl.math_owners`, including zero-size
+anchors for empty numerators, denominators, scripts and matrix cells. Attributes must be in
+force when TeX creates the relevant nodes; packed fields can carry the field's id or their
+containing atom's id. They are not inferred from a source tree. See
+[display-list.md](display-list.md#optional-math-ownership) for roles, coordinates and encoding.
+Tags can also cover text inside math, including CJK text with a suitable LuaLaTeX setup.
+Leaving the option unset preserves display-list bytes and PDF output. Enabling it adds
+metadata and zero-size markers only in truly empty fields; it leaves nonempty fields alone.
+
+Empty unicode-math radical degrees have a computed `degree` point (`empty: true`): LuaTeX
+discards their zero-width boxes, so rtex uses the converted radical delimiter and the
+effective degree kern/raise math parameters to report the degree's left edge at its baseline.
+The owner and parameters travel as attributes; no degree node is inserted. Classic LaTeX's
+degree may instead appear as a `math` boundary box. These observations are not a complete
+source syntax tree; hosts must handle missing positions and multiple output boxes for an id.
 
 ## Events
 
@@ -265,6 +307,18 @@ line, on stdout:
 Replies have a `"reply"` key (`"edit"`, `"spans"`, …, or `"error"`). Events have an `"event"`
 key (`"ParagraphUpdate"`, `"LayoutUpdate"`, …) with the fields above. Display lists are inline,
 in their JSON form.
+
+`start` and `end` are byte offsets into the file's UTF-8 text. A range that is reversed, runs
+past the end or splits a character gets `"reply": "error"`, as do an unknown file and a new
+`set_document` path outside the project (`..`, an absolute path elsewhere).
+
+## Untrusted documents
+
+rtex runs LuaLaTeX with the user's privileges, and a document can run Lua. LuaLaTeX may write
+anywhere the user can (`openout_any=a`): the live engine talks to rtex through a pipe outside
+the output directory, and Lua's file functions (`io.open`, `lfs`, `os.remove`) are not
+limited by `openout_any` anyway. rtex is not a sandbox: a host that opens projects it does not
+trust should run `rtex serve` in OS-level isolation (a container, bubblewrap, a separate user).
 
 ## Versioning
 

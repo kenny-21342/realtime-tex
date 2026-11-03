@@ -1515,3 +1515,177 @@ fn an_edit_under_a_run_in_heading_goes_live_with_the_title() {
     s.close();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Bad host input is an error, not a panic or a silent clamp: an edit range inside a UTF-8
+/// character, reversed or past the end, and a new file outside the project (#25, #26).
+#[test]
+fn bad_edit_ranges_and_outside_paths_are_errors() {
+    let Some((s, project)) = open("badinput") else {
+        return;
+    };
+    let text = s.document_text("main.tex").unwrap();
+    let at = text.find("\\end{document}").unwrap();
+    s.apply_edit(
+        "main.tex",
+        Edit {
+            start_byte: at,
+            end_byte: at,
+            text: "Café.\n\n".into(),
+        },
+    )
+    .unwrap();
+    let e = at + "Caf".len() + 1; // inside the two bytes of `é`
+    let len = text.len() + "Café.\n\n".len();
+    for (start, end) in [(e, e), (at, e), (at + 2, at), (len + 1, len + 1)] {
+        let r = s.apply_edit(
+            "main.tex",
+            Edit {
+                start_byte: start,
+                end_byte: end,
+                text: "x".into(),
+            },
+        );
+        assert!(r.is_err(), "{start}..{end} was accepted");
+    }
+    assert!(s.document_text("main.tex").unwrap().contains("Café.\n\n"));
+
+    let escape = project.parent().unwrap().join("escape.tex");
+    for p in ["../escape.tex", escape.to_str().unwrap()] {
+        assert!(s.set_document(p, "x").is_err(), "{p} was accepted");
+    }
+    s.request_layout();
+    wait_layout(&s);
+    assert!(!escape.exists());
+    assert!(s.set_document("chapters/new.tex", "x").is_ok());
+}
+
+/// A pass that runs past `pass_timeout` is killed and reported as failed, and the next edit
+/// gets a fresh pass (#22).
+#[test]
+fn a_pass_past_its_time_limit_fails_and_the_next_one_runs() {
+    if rtex_core::texlive::TexLive::discover().is_err() {
+        eprintln!("SKIP: no lualatex");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("rtex-session-{}-timeout", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    generate(2, Variant::Pure, FontSet::Pagella, 11, &project).unwrap();
+    let mut cfg = SessionConfig::new(&project, "main.tex");
+    cfg.build_dir = root.join("build");
+    cfg.debounce = Duration::from_millis(50);
+    // longer than a cold first pass on a Windows runner (over 8 s)
+    cfg.pass_timeout = Duration::from_secs(30);
+    let s = Session::open(cfg).unwrap();
+    assert!(matches!(
+        wait_layout(&s),
+        Event::LayoutUpdate {
+            compile: rtex_core::session::CompileStatus::Ok,
+            ..
+        }
+    ));
+
+    let text = s.document_text("main.tex").unwrap();
+    let at = text.find("\\end{document}").unwrap();
+    let lp = "\\directlua{while true do end}\n\n";
+    s.apply_edit(
+        "main.tex",
+        Edit {
+            start_byte: at,
+            end_byte: at,
+            text: lp.into(),
+        },
+    )
+    .unwrap();
+    s.request_layout();
+    let t0 = std::time::Instant::now();
+    match wait_layout(&s) {
+        Event::LayoutUpdate {
+            compile,
+            convergence,
+            ..
+        } => {
+            assert_eq!(
+                compile,
+                rtex_core::session::CompileStatus::Failed,
+                "{convergence:?}"
+            );
+            assert!(
+                format!("{convergence:?}").contains("time limit"),
+                "{convergence:?}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    assert!(t0.elapsed() < Duration::from_secs(90));
+
+    let fixed = s
+        .apply_edit(
+            "main.tex",
+            Edit {
+                start_byte: at,
+                end_byte: at + lp.len(),
+                text: String::new(),
+            },
+        )
+        .unwrap()
+        .source_revision;
+    s.request_layout();
+    // a second pass of the looping text may still be running: wait for the fixed text's
+    loop {
+        if let Event::LayoutUpdate {
+            versions, compile, ..
+        } = wait_layout(&s)
+        {
+            if versions.source_revision >= fixed {
+                assert_eq!(compile, rtex_core::session::CompileStatus::Ok);
+                break;
+            }
+        }
+    }
+}
+
+/// A preamble that cannot load (a missing package) fails the live engine's start once; it is
+/// not restarted until the preamble changes (#27, realtime-tex-vsc-plugin#10).
+#[test]
+fn a_missing_package_does_not_restart_the_engine_in_a_loop() {
+    let Some((s, _project)) = open("missingpkg") else {
+        return;
+    };
+    wait_layout(&s);
+    let text = s.document_text("main.tex").unwrap();
+    let at = text.find("\\begin{document}").unwrap();
+    let pkg = "\\usepackage{rtexnosuchpackage}\n";
+    let edit = |start, end, text: &str| {
+        s.apply_edit(
+            "main.tex",
+            Edit {
+                start_byte: start,
+                end_byte: end,
+                text: text.into(),
+            },
+        )
+        .unwrap()
+    };
+    edit(at, at, pkg);
+    // the events before the failure are not requeued: only later starts are counted
+    let (failed, _) = s.wait_for(
+        Duration::from_secs(120),
+        |e| matches!(e, Event::EngineState { state, .. } if state == "Failed"),
+    );
+    assert!(failed.is_some(), "the start did not fail");
+    let (_, later) = s.wait_for(Duration::from_secs(6), |_| false);
+    let starts = later
+        .iter()
+        .filter(|e| matches!(e, Event::EngineState { state, .. } if state == "Starting"))
+        .count();
+    assert_eq!(starts, 0, "restarted the same preamble");
+
+    edit(at, at + pkg.len(), "");
+    let (ready, _) = wait(
+        &s,
+        120,
+        |e| matches!(e, Event::EngineState { state, .. } if state == "Ready"),
+    );
+    assert!(ready.is_some(), "no restart after the fix");
+}

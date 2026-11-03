@@ -48,8 +48,8 @@ pub struct SessionConfig {
     pub fast_on_stale_context: bool,
     pub bib_tool: BibTool,
     pub compile_timeout: Duration,
-    /// A background lualatex run still going after this long is stopped and the run fails
-    /// (default 120 s): a document that loops forever (`\def\x{\x}\x`) would hold the
+    /// A background or export lualatex run still going after this long is stopped and the run
+    /// fails (default 120 s): a document that loops forever (`\def\x{\x}\x`) would hold the
     /// background path. A run is stopped sooner once the sources have changed since it started
     /// and it has taken twice as long as the slowest run that finished (a loop being fixed).
     pub pass_timeout: Duration,
@@ -80,6 +80,8 @@ pub struct SessionConfig {
     /// (default true; needs `picture_cache`). The errors are still reported; `LayoutUpdate.held`
     /// names the pictures (docs/how-it-works.md, "Held pictures").
     pub hold_broken_pictures: bool,
+    /// Observe opaque host ids carried by this LuaTeX attribute (off by default).
+    pub math_owner_attribute: Option<u16>,
     /// Debugging: a directory the session writes diagnostics into (default: `$RTEX_DEBUG_DIR`
     /// when set, else none). Every engine failure (watchdog, state mismatch, crash) leaves a
     /// bundle there with the request's source, context and picture entries, the server's
@@ -160,6 +162,7 @@ impl SessionConfig {
             eligibility: EligibilityMode::Probe,
             picture_cache: true,
             hold_broken_pictures: true,
+            math_owner_attribute: None,
             debug_dir: std::env::var_os("RTEX_DEBUG_DIR")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -475,6 +478,7 @@ impl Session {
         let project_root = crate::paths::canonical(&cfg.project_root).context("project root")?;
         tl.project_dir = Some(project_root.clone());
         tl.main_dir = crate::paths::folder(&cfg.main_file);
+        tl.math_owner_attribute = cfg.math_owner_attribute;
         let cfg = SessionConfig {
             project_root,
             main_file: crate::paths::key(&cfg.main_file),
@@ -504,6 +508,7 @@ impl Session {
         let preamble_inputs = preamble_input_set(&texts, &cfg.main_file);
         let mut policy = Policy::from_preamble(&preamble, &cfg.trusted_macros, &cfg.unit_envs);
         policy.permissive = cfg.eligibility == EligibilityMode::Probe;
+        policy.math_owner_attribute = cfg.math_owner_attribute;
         let rules = policy.segment_rules();
         // the main file first so its span ids come first
         files.insert(
@@ -689,6 +694,10 @@ impl Session {
             .map(|f| f.text.len())
             .unwrap_or(0);
         if len == 0 && !self.shared.files.lock().contains_key(rel_path) {
+            // the snapshot writes the file at this key
+            if !crate::paths::inside_project(rel_path) {
+                return Err(anyhow!("{rel_path} is outside the project"));
+            }
             let mut files = self.shared.files.lock();
             let rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
             let fb = FileBuf::with_rules(
@@ -735,6 +744,14 @@ impl Session {
             let fb = files
                 .get_mut(rel_path)
                 .ok_or_else(|| anyhow!("unknown file {rel_path}"))?;
+            let (start, end) = (edit.start_byte, edit.end_byte);
+            if start > end || !fb.text.is_char_boundary(start) || !fb.text.is_char_boundary(end) {
+                return Err(anyhow!(
+                    "bad edit range {start}..{end} in {rel_path}: the file has {} bytes and \
+                     offsets must fall on UTF-8 character boundaries",
+                    fb.text.len()
+                ));
+            }
             // A snapshot takes this same lock: its revision must describe the buffers it
             // actually copies, rather than an edit still waiting to acquire the lock.
             rev = self.shared.source_revision.fetch_add(1, Ordering::SeqCst) + 1;
@@ -772,6 +789,7 @@ impl Session {
                     &self.shared.cfg.unit_envs,
                 );
                 policy.permissive = self.shared.cfg.eligibility == EligibilityMode::Probe;
+                policy.math_owner_attribute = self.shared.cfg.math_owner_attribute;
                 let rules = policy.segment_rules();
                 *self.shared.policy.lock() = policy;
                 drop(files);

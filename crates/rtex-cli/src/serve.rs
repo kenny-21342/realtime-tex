@@ -7,6 +7,14 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Optional overrides for the session's live-compile and pass timeouts, in milliseconds.
+/// `None` keeps the `SessionConfig` default.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Timeouts {
+    pub compile_ms: Option<u64>,
+    pub pass_ms: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     project: PathBuf,
@@ -14,8 +22,9 @@ pub fn run(
     build: Option<PathBuf>,
     fast_budget_ms: u64,
     fast_budget_factor: f64,
-    pass_timeout_ms: u64,
     eligibility: &str,
+    math_owner_attribute: Option<u16>,
+    timeouts: Timeouts,
     picture_cache: bool,
     hold_broken_pictures: bool,
     debug_dir: Option<PathBuf>,
@@ -23,9 +32,15 @@ pub fn run(
     let mut cfg = SessionConfig::new(project, main);
     cfg.fast_budget = std::time::Duration::from_millis(fast_budget_ms);
     cfg.fast_budget_factor = fast_budget_factor;
-    cfg.pass_timeout = Duration::from_millis(pass_timeout_ms);
+    if let Some(ms) = timeouts.compile_ms {
+        cfg.compile_timeout = Duration::from_millis(ms);
+    }
+    if let Some(ms) = timeouts.pass_ms {
+        cfg.pass_timeout = Duration::from_millis(ms);
+    }
     cfg.picture_cache = picture_cache;
     cfg.hold_broken_pictures = hold_broken_pictures;
+    cfg.math_owner_attribute = math_owner_attribute;
     if debug_dir.is_some() {
         cfg.debug_dir = debug_dir;
     }
@@ -83,16 +98,26 @@ pub fn run(
                     .and_then(|p| p.as_str())
                     .unwrap_or("main.tex")
                     .to_string();
-                let edit = Edit {
-                    start_byte: v.get("start").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-                    end_byte: v.get("end").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-                    text: v
-                        .get("text")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                // a missing offset is 0; a negative or fractional one is an error, not 0
+                let offset = |k: &str| match v.get(k) {
+                    None => Ok(0),
+                    Some(x) => x
+                        .as_u64()
+                        .map(|n| n as usize)
+                        .ok_or_else(|| anyhow::anyhow!("bad {k} offset {x}")),
                 };
-                match session.apply_edit(&path, edit) {
+                let edit = offset("start").and_then(|start_byte| {
+                    Ok(Edit {
+                        start_byte,
+                        end_byte: offset("end")?,
+                        text: v
+                            .get("text")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                });
+                match edit.and_then(|edit| session.apply_edit(&path, edit)) {
                     Ok(r) => serde_json::json!({"reply": "edit", "result": r}),
                     Err(e) => serde_json::json!({"reply": "error", "message": e.to_string()}),
                 }

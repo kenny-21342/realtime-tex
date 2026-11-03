@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+Merged from upstream main (HenryXiaoYang/realtime-tex `531e2c6`: upstream 0.0.6 and later, with
+work by ACG-j).
+
+### Added
+
+- Optional `math_owner_attribute` in Rust, C/JSON and `rtex serve` configuration: hosts can
+  attach opaque ids to math source with one LuaTeX attribute and receive glyph ownership
+  and math-field boxes in `math_owners` display-list metadata (binary record `0x2E`; upstream
+  numbers it `0x29`, which is the fork's PICTURE record). Truly empty fields get zero-size
+  anchors without changing nonempty fields or PDF output. Off by default.
+- `rtex serve --compile-timeout-ms` and `--pass-timeout-ms` set the live-compile and
+  background/export pass timeouts that the Rust and C/JSON configurations already take
+  (`compile_timeout`, `pass_timeout`). A host that drives `rtex serve` could not change the pass
+  timeout before. Defaults are unchanged; the fork's `--pass-timeout-ms` default (120 s) is
+  now the session default it overrides.
+
+### Changed
+
+- lopdf 0.42 (from 0.36): 0.36 overflows the stack on deeply nested PDF objects
+  (RUSTSEC-2026-0187), and rtex reads every pass's PDF with it (HenryXiaoYang/realtime-tex#24).
+
 ### Fixed
 
 - A paragraph with a natbib citation edited while the first build of a session was still
@@ -12,6 +33,32 @@
   bibliography is starting, citing paragraphs now wait for the full compile; the others stay
   live. This was the mutation test's one mismatch on the corpus report document and the cause
   of the nightly failures of 2026-10-22 and 2026-10-23.
+- The build directory no longer copies the main file's folder. Each snapshot a pass reads
+  (`src`, `src-body-0`, `src-body-1`) holds only the edited sources, in real folders, and links
+  everything else: a folder without sources is one link to the project's folder, a file next to
+  a source a link to the project's file. On Windows without Developer Mode, folders become
+  junctions and files hard links, or copies up to 8 MiB (a bigger file is still found through
+  `\input@path` and the graphics path). Three copies of a big folder filled users' disks, and
+  every pass walked all of it (HenryXiaoYang/realtime-tex-vsc-plugin#13,
+  HenryXiaoYang/realtime-tex-vsc-plugin#15). A snapshot from an earlier version is replaced on
+  the first pass.
+- Empty unicode-math radical degrees now report a zero-size `degree` ownership point,
+  derived from the converted radical and its MATH parameters without changing PDF output.
+- A background or export pass that never ends (`\directlua{while true do end}`) is killed
+  after `pass_timeout` (the fork's 120 s, `pass_timeout_ms` in the C/JSON config; the fork
+  already stopped background passes, exports are now stopped too) and the layout reports
+  `Failed` with "lualatex was stopped after … s". It kept one CPU busy forever,
+  and no layout or export finished after it, even once the source was fixed. A pass whose
+  lualatex was killed by a signal (a CPU limit, the OOM killer) reports `Failed` too; it
+  reported `Ok` with whatever pages it had written (HenryXiaoYang/realtime-tex#22).
+- `rtex serve` no longer exits (status 101, "start of range should be a character boundary")
+  on an `edit` whose offset falls inside a multi-byte UTF-8 character. A range inside a
+  character, a start after the end, an offset past the end of the file and a negative or
+  non-integer offset now get `reply: error` and leave the session running; they were clamped
+  before, which could turn a body edit into a preamble edit (HenryXiaoYang/realtime-tex#25).
+- `set_document` refuses a new file outside the project (`../escape.tex`, an absolute path
+  elsewhere) with `reply: error`. The snapshot wrote such a file at that path
+  (HenryXiaoYang/realtime-tex#26).
 
 ## 0.0.14 (2026-10-25)
 

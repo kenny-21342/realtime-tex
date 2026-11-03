@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+    <img src="docs/images/logo.svg" alt="realtime-tex logo: a T. rex in sunglasses between curly braces, then -TeX" width="520">
+  </picture>
+</p>
+
 # realtime-tex (rtex)
 
 [English](README.md) | 简体中文
@@ -25,7 +32,12 @@ LuaLaTeX 进程，然后把排好的新行交给编辑器绘制。完整编译�
 ## 在 VS Code 中使用
 
 使用 rtex 最简单的方式是 VS Code 插件
-**[Realtime TeX Live Preview](https://github.com/HenryXiaoYang/realtime-tex-vsc-plugin)**。它在编辑器旁显示实时预览，
+**[Realtime TeX](https://marketplace.visualstudio.com/items?itemName=henryxiaoyang.realtime-tex)**（[源码](https://github.com/HenryXiaoYang/realtime-tex-vsc-plugin)）。
+可以从 [VS Code 插件市场](https://marketplace.visualstudio.com/items?itemName=henryxiaoyang.realtime-tex)（VSCodium、Cursor 等编辑器请用 [Open VSX](https://open-vsx.org/extension/henryxiaoyang/realtime-tex)）安装，或在扩展视图中搜索 "realtime tex"：
+
+<img src="https://raw.githubusercontent.com/HenryXiaoYang/realtime-tex-vsc-plugin/main/docs/marketplace.png" alt="VS Code 扩展视图中的 Realtime TeX 及其安装按钮" width="362">
+
+它在编辑器旁显示实时预览，
 并在首次使用时自动为你安装 rtex（需要时还会安装一个精简版 TeX Live）。打开一个 `.tex` 文件，点击编辑器标题栏上的
 预览图标（或按 Ctrl+Alt+V，Mac 上为 Cmd+Alt+V），然后开始输入即可。插件在 Linux、macOS 和 Windows 上原生运行 rtex，并会为你的平台下载预编译的引擎。
 
