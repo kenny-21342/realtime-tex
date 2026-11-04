@@ -83,6 +83,9 @@ enum Cmd {
         /// With --pic-cache: fail unless at least this many pictures were recorded and reused.
         #[arg(long)]
         min_cached: Option<usize>,
+        /// Observe host math ids carried by this LuaTeX attribute.
+        #[arg(long)]
+        math_owner_attribute: Option<u16>,
     },
     /// JSON-lines session front end (commands on stdin, events on stdout).
     Serve {
@@ -101,13 +104,21 @@ enum Cmd {
         /// 0: --fast-budget-ms alone).
         #[arg(long, default_value_t = 4.0)]
         fast_budget_factor: f64,
-        /// A background pass still running after this many milliseconds is stopped and the
-        /// run fails (an endless loop; default 120000).
-        #[arg(long, default_value_t = 120_000)]
-        pass_timeout_ms: u64,
         /// How units qualify for the fast path: probe (default) or allowlist.
         #[arg(long, default_value = "probe")]
         eligibility: String,
+        /// Observe host math ids carried by this LuaTeX attribute.
+        #[arg(long)]
+        math_owner_attribute: Option<u16>,
+        /// Kill a live compile that takes longer than this many milliseconds and restart the
+        /// engine (default 5000).
+        #[arg(long)]
+        compile_timeout_ms: Option<u64>,
+        /// Kill a background or export pass that takes longer than this many milliseconds; its
+        /// layout reports `Failed` (default 120000, two minutes; a pass is stopped sooner once
+        /// the sources changed and it has taken twice as long as the slowest finished one).
+        #[arg(long)]
+        pass_timeout_ms: Option<u64>,
         /// Draw every picture environment on every background pass instead of reusing the
         /// unchanged ones from an earlier pass's PDF.
         #[arg(long)]
@@ -298,6 +309,7 @@ fn main() -> anyhow::Result<()> {
             expect_differing,
             pic_cache,
             min_cached,
+            math_owner_attribute,
         } => {
             let r = verify::run(verify::VerifyOpts {
                 project,
@@ -315,6 +327,7 @@ fn main() -> anyhow::Result<()> {
                 expect_differing,
                 pic_cache,
                 min_cached,
+                math_owner_attribute,
             })?;
             if !(r.layer1_pass
                 && r.layer2_pass
@@ -331,8 +344,10 @@ fn main() -> anyhow::Result<()> {
             build,
             fast_budget_ms,
             fast_budget_factor,
-            pass_timeout_ms,
             eligibility,
+            math_owner_attribute,
+            compile_timeout_ms,
+            pass_timeout_ms,
             no_picture_cache,
             no_hold_broken_pictures,
             debug_dir,
@@ -342,8 +357,12 @@ fn main() -> anyhow::Result<()> {
             build,
             fast_budget_ms,
             fast_budget_factor,
-            pass_timeout_ms,
             &eligibility,
+            math_owner_attribute,
+            serve::Timeouts {
+                compile_ms: compile_timeout_ms,
+                pass_ms: pass_timeout_ms,
+            },
             !no_picture_cache,
             !no_hold_broken_pictures,
             debug_dir,
@@ -487,4 +506,36 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serve_args(extra: &[&str]) -> (Option<u64>, Option<u64>) {
+        let mut argv = vec!["rtex", "serve", "--project", "p"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv)
+            .expect("serve arguments parse")
+            .cmd
+        {
+            Cmd::Serve {
+                compile_timeout_ms,
+                pass_timeout_ms,
+                ..
+            } => (compile_timeout_ms, pass_timeout_ms),
+            _ => panic!("expected the serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn serve_timeouts_default_to_the_session_config() {
+        assert_eq!(serve_args(&[]), (None, None));
+    }
+
+    #[test]
+    fn serve_accepts_both_timeouts_in_milliseconds() {
+        let parsed = serve_args(&["--compile-timeout-ms", "2000", "--pass-timeout-ms", "8000"]);
+        assert_eq!(parsed, (Some(2000), Some(8000)));
+    }
 }

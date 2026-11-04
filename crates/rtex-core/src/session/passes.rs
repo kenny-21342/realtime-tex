@@ -359,7 +359,8 @@ fn run_pass(
     let stop = |ran: Duration| -> Option<String> {
         if ran >= s.cfg.pass_timeout {
             return Some(format!(
-                "LaTeX did not finish within {} s (an endless loop?); stopped",
+                "LaTeX did not finish within {} s, the time limit of a pass (an endless loop?); \
+                 stopped",
                 s.cfg.pass_timeout.as_secs()
             ));
         }
@@ -1478,6 +1479,7 @@ pub(super) fn run_export(s: &Shared, job: u64, out: PathBuf) {
         s.cfg.bib_tool,
         false,
         "",
+        Some(s.cfg.pass_timeout),
     ) {
         Ok(o) => {
             let diags = parse_log(&o.capture.log);

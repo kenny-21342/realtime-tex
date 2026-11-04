@@ -44,6 +44,7 @@ pub struct VerifyOpts {
     pub pic_cache: bool,
     /// With `pic_cache`: fail unless at least this many pictures were recorded and reused.
     pub min_cached: Option<usize>,
+    pub math_owner_attribute: Option<u16>,
 }
 
 #[derive(Serialize, Default)]
@@ -144,7 +145,8 @@ fn row_text(l: &Line) -> String {
 }
 
 pub fn run(opts: VerifyOpts) -> Result<Report> {
-    let tl = TexLive::discover()?;
+    let mut tl = TexLive::discover()?;
+    tl.math_owner_attribute = opts.math_owner_attribute;
     let project = rtex_core::paths::canonical(&opts.project)?;
     std::fs::create_dir_all(&opts.build)?;
     println!("== verify {} ({})", project.display(), opts.main);
@@ -152,6 +154,7 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
     let preamble = rtex_core::project_preamble(&project, &opts.main)?;
     let mut policy = Policy::from_preamble(&preamble, &[], &[]);
     policy.permissive = opts.permissive;
+    policy.math_owner_attribute = opts.math_owner_attribute;
     let unit_envs = policy.unit_envs_env();
     // Both builds run to aux convergence (labels, TOC, bibliography) exactly like the
     // background compiler does: a single first pass would leave every \ref as "??" while
@@ -166,6 +169,7 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
         BibTool::Auto,
         true,
         &unit_envs,
+        None,
     )?;
     let clean_pass = run_pass_with(
         &tl,
@@ -176,6 +180,7 @@ pub fn run(opts: VerifyOpts) -> Result<Report> {
         BibTool::Auto,
         false,
         "",
+        None,
     )?;
     if !cap_pass.aux_stable || !clean_pass.aux_stable {
         println!(
@@ -722,7 +727,7 @@ fn pic_cache_check(
     cache.absorb(&pics, &recorded, &[], &[], &cap.pdf)?;
     rep.hits = cache.write_manifest(&pics, &out.join("pic-manifest.json"))?;
     let cached =
-        rtex_core::capture::run_capture_with(tl, project, &opts.main, &out, true, unit_envs)?;
+        rtex_core::capture::run_capture_with(tl, project, &opts.main, &out, true, unit_envs, None)?;
     rep.wall_cached_ms = cached.wall.as_millis() as u64;
     rep.mismatched = cached.json.pic_mismatch.len();
     // units and placements

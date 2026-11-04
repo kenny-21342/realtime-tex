@@ -4,7 +4,7 @@
 use crate::capture::{capture_command, collect_capture, CaptureResult};
 use crate::texlive::TexLive;
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -39,25 +39,36 @@ impl Clone for CaptureResult {
     }
 }
 
-/// Write `files` (relative path → text) under `dir`, copying every other file from `project`
-/// (images, .bib, .cls …) so relative inputs resolve.
+/// Write `files` (relative path → text) under `dir`, and link every other file of `project`
+/// (images, .bib, .cls …) into it so relative inputs resolve.
+///
+/// Nothing is copied where the platform can link: a folder that holds none of `files` is one
+/// link to the project's folder, a file next to one of `files` a link to the project's file.
+/// A copy of the main file's folder per snapshot (a session keeps three) filled users' disks
+/// (plugin issues #13, #15).
 pub fn write_snapshot(
     project: &Path,
     files: &BTreeMap<String, String>,
     main: &str,
     dir: &Path,
 ) -> Result<()> {
+    // a snapshot written by rtex 0.0.6 or earlier holds copies: start over once
+    let marker = dir.join(".rtex-links");
+    if dir.exists() && !marker.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
     std::fs::create_dir_all(dir)?;
+    std::fs::write(&marker, "")?;
     // the PDFs built from the document's own sources (main.pdf, a subfile compiled alone):
     // outputs, not inputs. A PDF next to a .tex the document does not read (a standalone
     // figure's source, or another document such as an appendix the host has open) is an input
-    // and is copied.
+    // and is linked.
     let mut own = files
         .get(main)
         .map(|t| crate::document::transitive_inputs(t, files))
         .unwrap_or_default();
     own.insert(main.to_string());
-    let built: std::collections::HashSet<PathBuf> = own
+    let built: HashSet<PathBuf> = own
         .iter()
         .map(|rel| {
             project
@@ -65,29 +76,52 @@ pub fn write_snapshot(
                 .with_extension("pdf")
         })
         .collect();
-    copy_tree(project, dir, 0, &built)?;
+    // folders that hold one of `files` are real folders of the snapshot, so writing a source
+    // never goes through a link into the project
+    let mut real = HashSet::new();
+    for rel in files.keys() {
+        let mut p = Path::new(rel.trim_start_matches("./"));
+        while let Some(parent) = p.parent() {
+            real.insert(parent.to_path_buf());
+            p = parent;
+        }
+    }
+    let dst_canon = crate::paths::canonical(dir).unwrap_or_else(|_| dir.to_path_buf());
+    link_tree(project, dir, Path::new(""), &real, &built, &dst_canon)?;
     for (rel, text) in files {
         let p = dir.join(rel);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // a link to the project's saved file until now
+        let _ = std::fs::remove_file(&p);
         std::fs::write(&p, text)?;
     }
     Ok(())
 }
 
-fn copy_tree(
+/// Whether `p` is a symbolic link (or, on Windows, a junction).
+fn is_link(p: &Path) -> bool {
+    std::fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Fill the real snapshot folder `dst` (`rel` in the project) with links to the entries of the
+/// project folder `src`.
+fn link_tree(
     src: &Path,
     dst: &Path,
-    depth: usize,
-    built: &std::collections::HashSet<PathBuf>,
+    rel: &Path,
+    real: &HashSet<PathBuf>,
+    built: &HashSet<PathBuf>,
+    dst_canon: &Path,
 ) -> Result<()> {
-    if depth > 8 {
-        return Ok(());
+    if is_link(dst) {
+        // linked by an earlier snapshot that had none of `files` in it
+        remove_link(dst)?;
     }
-    // the snapshot's own tree, in canonical form (a host may keep its build directory inside
-    // the project under any name, given relative or absolute)
-    let dst_canon = crate::paths::canonical(dst).unwrap_or_else(|_| dst.to_path_buf());
+    std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -102,49 +136,108 @@ fn copy_tree(
         if dst_canon.starts_with(&path_canon) {
             continue;
         }
+        let target = dst.join(&name);
+        let rel = rel.join(&name);
         if path.is_dir() {
-            let sub = dst.join(&name);
-            std::fs::create_dir_all(&sub)?;
-            copy_tree(&path, &sub, depth + 1, built)?;
-        } else if !path.is_file() {
+            // a real folder stays one (it held a source, or the folder could not be linked)
+            let real_dir = real.contains(&rel) || (!is_link(&target) && target.is_dir());
+            if real_dir || (!is_link(&target) && link_dir(&path_canon, &target).is_err()) {
+                link_tree(&path, &target, &rel, real, built, dst_canon)?;
+            }
             continue;
-        } else {
-            // build outputs a pass could read in place of its own (a stale .aux, .toc, .bbl):
-            // never copied. PDFs are inputs (\includegraphics, \includepdf) and are copied; an
-            // old output PDF of the document is harmless, LaTeX never reads one implicitly.
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext == "pdf" && built.contains(&path) {
-                continue;
-            }
-            // the document's own .aux files are written by the pass; another document's
-            // (\externaldocument{appendix} reads appendix.aux) is an input
-            if ext == "aux" && built.contains(&path.with_extension("pdf")) {
-                continue;
-            }
-            if matches!(
-                ext,
-                "log"
-                    | "synctex.gz"
-                    | "fls"
-                    | "fdb_latexmk"
-                    | "out"
-                    | "toc"
-                    | "lof"
-                    | "lot"
-                    | "bbl"
-                    | "bcf"
-                    | "blg"
-                    | "run.xml"
-            ) {
-                continue;
-            }
-            let target = dst.join(&name);
-            if !target.exists()
-                || std::fs::metadata(&path)?.modified()? > std::fs::metadata(&target)?.modified()?
-            {
-                std::fs::copy(&path, &target)?;
-            }
         }
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext == "pdf" && built.contains(&path) {
+            continue;
+        }
+        // the document's own .aux files are written by the pass; another document's
+        // (\externaldocument{appendix} reads appendix.aux) is an input
+        if ext == "aux" && built.contains(&path.with_extension("pdf")) {
+            continue;
+        }
+        if matches!(
+            ext,
+            "log"
+                | "synctex.gz"
+                | "fls"
+                | "fdb_latexmk"
+                | "out"
+                | "toc"
+                | "lof"
+                | "lot"
+                | "bbl"
+                | "bcf"
+                | "blg"
+                | "run.xml"
+        ) {
+            continue;
+        }
+        if is_link(&target) {
+            continue;
+        }
+        // a hard link or copy made where symbolic links are not allowed
+        if let Ok(t) = std::fs::metadata(&target) {
+            if t.modified()? >= std::fs::metadata(&path)?.modified()? {
+                continue;
+            }
+            std::fs::remove_file(&target)?;
+        }
+        link_file(&path_canon, &target)?;
+    }
+    Ok(())
+}
+
+fn remove_link(p: &Path) -> std::io::Result<()> {
+    // a link to a folder is a directory entry on Windows
+    std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
+}
+
+#[cfg(unix)]
+fn link_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+/// A symbolic link needs Developer Mode or an elevated process; a junction needs neither and
+/// reaches other drives.
+#[cfg(windows)]
+fn link_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if std::os::windows::fs::symlink_dir(src, dst).is_ok() {
+        return Ok(());
+    }
+    let ok = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(dst)
+        .arg(src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?
+        .success();
+    if ok {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mklink /J failed"))
+    }
+}
+
+/// A symbolic link, else (no Developer Mode on Windows, a file system without links) a hard
+/// link on the same drive, else a copy of a file up to 8 MiB. A bigger file stays in the
+/// project, where `\input@path` and the graphics path still find it (texlive.rs
+/// `INPUT_PATH_HOOK`).
+fn link_file(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(src, dst).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(src, dst).is_ok();
+    if linked || std::fs::hard_link(src, dst).is_ok() {
+        return Ok(());
+    }
+    if std::fs::metadata(src)?.len() <= 8 << 20 {
+        std::fs::copy(src, dst)?;
     }
     Ok(())
 }
@@ -301,6 +394,7 @@ pub fn run_pass(
         bib,
         instrumented,
         "",
+        None,
     )
 }
 
@@ -315,9 +409,18 @@ pub fn run_pass_with(
     bib: BibTool,
     instrumented: bool,
     unit_envs: &str,
+    limit: Option<std::time::Duration>,
 ) -> Result<PassOutcome> {
     let mut runner = |_pass: u32| {
-        crate::capture::run_capture_with(tl, snapshot_dir, main, out_dir, instrumented, unit_envs)
+        crate::capture::run_capture_with(
+            tl,
+            snapshot_dir,
+            main,
+            out_dir,
+            instrumented,
+            unit_envs,
+            limit,
+        )
     };
     run_pass_with_runner(
         PassPlan {
@@ -994,7 +1097,7 @@ impl WarmEngine {
     }
 
     /// Typeset the body: refresh the snapshot texts (same preamble), release the engine and
-    /// collect the pass like a fresh run.
+    /// collect the pass like a fresh run (killed after `limit`).
     pub fn run(
         self,
         project: &Path,
@@ -1068,8 +1171,7 @@ impl WarmEngine {
             &self.out_dir,
             &self.jobname,
             self.instrumented,
-            status.success(),
-            status.code(),
+            status,
             &stdout,
             t0.elapsed(),
         )
@@ -1121,6 +1223,7 @@ mod tests {
             rtex_texdir: dir.clone(),
             project_dir: None,
             main_dir: None,
+            math_owner_attribute: None,
         };
         let mut calls = 0;
         let mut runner = |_| {
@@ -1191,6 +1294,51 @@ mod tests {
         assert!(!dir.join("snap/main.aux").exists());
         // a second snapshot (files already present) is fine too
         write_snapshot(&project, &files, "main.tex", &dir.join("snap")).unwrap();
+    }
+
+    #[test]
+    fn snapshot_links_instead_of_copying() {
+        let dir = std::env::temp_dir().join(format!("rtex-snap-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("fig")).unwrap();
+        std::fs::create_dir_all(project.join("chap")).unwrap();
+        std::fs::write(project.join("main.tex"), "saved").unwrap();
+        std::fs::write(project.join("chap/one.tex"), "saved").unwrap();
+        std::fs::write(project.join("chap/data.csv"), "1,2").unwrap();
+        std::fs::write(project.join("fig/a.png"), "v1").unwrap();
+        // a snapshot from rtex 0.0.6 (copies, no marker) is replaced
+        std::fs::create_dir_all(dir.join("src/fig")).unwrap();
+        std::fs::write(dir.join("src/fig/a.png"), "old copy").unwrap();
+        let files = BTreeMap::from([
+            ("main.tex".to_string(), "edited".to_string()),
+            ("chap/one.tex".to_string(), "edited one".to_string()),
+        ]);
+        write_snapshot(&project, &files, "main.tex", &dir.join("src")).unwrap();
+        let read = |p: &str| std::fs::read_to_string(dir.join(p)).unwrap();
+        assert_eq!(read("src/main.tex"), "edited");
+        assert_eq!(read("src/chap/one.tex"), "edited one");
+        assert_eq!(read("src/chap/data.csv"), "1,2");
+        assert_eq!(read("src/fig/a.png"), "v1");
+        // the sources were not written through into the project
+        assert_eq!(read("project/main.tex"), "saved");
+        assert_eq!(read("project/chap/one.tex"), "saved");
+        // a folder with a source is real, one without is a link (where links are allowed)
+        assert!(!is_link(&dir.join("src/chap")));
+        #[cfg(unix)]
+        assert!(is_link(&dir.join("src/fig")));
+        // a figure saved again is what the next pass reads
+        std::fs::write(project.join("fig/a.png"), "v2").unwrap();
+        write_snapshot(&project, &files, "main.tex", &dir.join("src")).unwrap();
+        assert_eq!(read("src/fig/a.png"), "v2");
+        // a folder that gets a source becomes real
+        let mut more = files.clone();
+        more.insert("fig/caption.tex".to_string(), "edited caption".to_string());
+        write_snapshot(&project, &more, "main.tex", &dir.join("src")).unwrap();
+        assert!(!is_link(&dir.join("src/fig")));
+        assert_eq!(read("src/fig/caption.tex"), "edited caption");
+        assert!(!project.join("fig/caption.tex").exists());
+        assert_eq!(read("src/fig/a.png"), "v2");
     }
 
     #[test]

@@ -22,8 +22,8 @@ fn standby_pass_matches_fresh_pass() {
     files.insert("main.tex".to_string(), main);
     // fresh run (two passes so labels exist on both sides)
     let fresh_out = root.join("fresh");
-    run_capture_with(&tl, &project, "main.tex", &fresh_out, true, "").unwrap();
-    let fresh = run_capture_with(&tl, &project, "main.tex", &fresh_out, true, "").unwrap();
+    run_capture_with(&tl, &project, "main.tex", &fresh_out, true, "", None).unwrap();
+    let fresh = run_capture_with(&tl, &project, "main.tex", &fresh_out, true, "", None).unwrap();
     // standby: spawn, wait a moment (preamble loading), release
     let warm_out = root.join("warm");
     let body_dir = root.join("src-body");

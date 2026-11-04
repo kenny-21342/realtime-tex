@@ -73,6 +73,7 @@ The integration tests in `crates/rtex-core/tests/`:
 | `ieeetran.rs` | IEEEtran's own float boxes, its run-in headings and the paragraphs after them compiled live equal the full run |
 | `piccache_live.rs` | cached pictures in the live engine |
 | `internal_error.rs` | a Lua error inside the server is answered, not swallowed |
+| `math_owners.rs` | opt-in glyph/field ownership, empty fields, output identity, live edits and export |
 | `export.rs` | export equals a clean build; errors are reported |
 
 ## Fixtures and the `rtex` command
@@ -142,3 +143,32 @@ again), and `rtex bundle anonymize DIR OUT` copies it with the document's words 
 - Commits follow Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`, …).
 - A change to what the live engine produces needs `rtex verify` to stay exact on the fixtures
   and the corpus. CI enforces it.
+
+To compare ownership-off display-list bytes with an unmodified revision on the same TeX Live
+and fonts (page JSON, page binary and raw live binary), export that revision's support files:
+
+```sh
+mkdir -p build/main-support
+git archive main tex | tar -x -C build/main-support
+RTEX_BASELINE_TEXDIR="$PWD/build/main-support/tex" cargo test --release -p rtex-core --test math_owners
+```
+
+The baseline comparison skips with a message when `RTEX_BASELINE_TEXDIR` is unset. The other
+ownership tests need LuaLaTeX; unicode-math and ctex/Fandol checks skip with a message if those
+packages/fonts are absent. To verify the tagged fixture (live/capture rows, PDF content streams and capture/clean PDF
+identity):
+
+```sh
+rtex verify --project fixtures/research/math-owners --math-owner-attribute 65000 --min-eligible 10
+```
+
+The fixture uses classic TFM math, which the optional display-list rasterizer cannot draw.
+Use a unicode-math version of the fixture for the additional `--raster` check. The integration
+tests compare PDFs byte-for-byte with observation on and off for both font setups.
+
+`fixtures/research/math-owners-unicode` pairs empty radical degrees with real `[3]` boxes
+in Latin Modern Math, including an empty radicand, scriptstyle and a larger font size.
+`math_owners.rs` compares each computed point with the real degree box's left edge and glyph
+baseline relative to its line origin (1sp tolerance for integer dimension quantization),
+checks capture/live output, and compares capture/export PDFs with observation off and clean
+builds. Verify this fixture with `--math-owner-attribute 65000 --min-eligible 8 --raster`.

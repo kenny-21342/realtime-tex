@@ -144,6 +144,9 @@ Records, until END: u8 tag, u32 payload_length, payload
   0x2D MASK        str name, u32 n, n bytes JSON (`{"width", "height", "depth", "items"}`)
                    a soft mask the page's literals set (pgf's fadings, `/pgfsmaskN gs`): the
                    items its form's box draws, relative to the box's reference point
+  0x2E MATH_OWNERS u32 n, n × { i32 owner, u32 font, u32 char, i32 left, i32 top, i32 right,
+                   i32 bottom }, u32 m, m × { i32 owner, u8 role, u8 empty, u16 reserved,
+                   i32 left, i32 top, i32 right, i32 bottom }; nothing may follow
   0xFF END
 ```
 
@@ -271,3 +274,46 @@ A host must resolve every referenced font/image and require complete native draw
 pages before displaying it. If any resource is unavailable, keep the previously displayed page
 until `LayoutUpdate`; a previous PDF cannot supply pixels at the new positions. Preview events
 and rollback rules are described in [embedding.md](embedding.md#pagepreview-and-pagepreviewreset-optional-progress-while-a-pass-runs).
+
+## Optional math ownership
+
+With `math_owner_attribute` configured, a list containing tagged nodes also has
+`math_owners` (binary record `0x2E`; upstream rtex numbers it `0x29`, which this fork's
+PICTURE record had already taken). It is metadata, not drawing instructions. Both the
+JSON field and binary record are absent when the option is unset, or no tagged nodes were
+observed. Older binary readers skip the record as they do other unknown records. In the binary
+record a field's role is a code: 1 `num`, 2 `den`, 3 `radicand`, 4 `sup`, 5 `sub`, 6 `degree`,
+7 `cell`, 8 `math`; `empty` is 0 or 1. Any other value, or trailing bytes, is malformed.
+
+```json
+"math_owners": {
+  "glyphs": [{"owner": 11, "font": 20, "char": 97, "bbox": [100, 200, 300, 400]}],
+  "fields": [{"owner": 60, "role": "num", "bbox": [250, 180, 250, 180], "empty": true}]
+}
+```
+
+`owner` is the signed integer carried by the configured LuaTeX attribute, including zero
+and negative values (LuaTeX's unset value, `-2147483647`, produces no ownership). rtex does
+not interpret it as a source offset or keep a source registry. `font` and `char` identify the
+observed glyph **before virtual-font expansion**; a virtual glyph can draw several display-list
+glyphs. A glyph box uses its advance and font height/depth, not an outline's ink bounds.
+
+Every `bbox` is `[left, top, right, bottom]` in sp, in the same coordinate space as the list's
+items. Packed math fields have roles `num`, `den`, `sub`, `sup`, `radicand` or `degree`.
+Paired math boundaries have role `cell` inside an alignment cell, otherwise `math` (including
+classic LaTeX's boxed radical degree). Their vertical bounds use the enclosing line's
+height/depth. These are observations of LuaTeX output, not a reconstruction of the source tree;
+a macro may produce several observations for an owner. The host assigns and interprets the ids.
+
+A truly empty sub-mlist gets a zero-size marker at its typeset position, reported as
+`empty: true` with a point box. Empty math boundaries (including matrix cells) also give point
+boxes. Hosts can enlarge these for hit-testing without changing typesetting. Nonempty math
+fields receive no markers: putting a marker before a character can change italic correction.
+LuaTeX discards a zero-width radical degree under unicode-math. Its `degree` point instead
+uses the converted radical box, the effective `RadicalKernBeforeDegree` and
+`RadicalDegreeBottomRaisePercent` math parameters: the leading degree kern gives x, and
+the radical delimiter's height, depth and shift give the degree baseline. Only attributes
+carry these observations through conversion; no extra degree nodes alter the output.
+The point is the degree's left edge at its baseline, within the radical glyph's horizontal
+span for Latin Modern Math, rather than necessarily left of the glyph's origin.
+See [embedding.md](embedding.md#math-source-ownership).

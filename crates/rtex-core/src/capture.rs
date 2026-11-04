@@ -6,8 +6,8 @@ use rtex_dl::{DisplayList, Sp};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 mod progress;
 pub(crate) use progress::{PageCapture, PagePreviewReader, PreviewUpdate};
@@ -322,11 +322,12 @@ pub fn run_capture(
     out_dir: &Path,
     instrumented: bool,
 ) -> Result<CaptureResult> {
-    run_capture_with(tl, src_dir, main, out_dir, instrumented, "")
+    run_capture_with(tl, src_dir, main, out_dir, instrumented, "", None)
 }
 
 /// `run_capture` with extra unit environments (comma separated, `$RTEX_UNIT_ENVS`): theorem-like
-/// environments the capture should treat as units.
+/// environments the capture should treat as units. A run that takes longer than `limit` is
+/// killed and fails.
 pub fn run_capture_with(
     tl: &TexLive,
     src_dir: &Path,
@@ -334,16 +335,22 @@ pub fn run_capture_with(
     out_dir: &Path,
     instrumented: bool,
     unit_envs: &str,
+    limit: Option<Duration>,
 ) -> Result<CaptureResult> {
-    run_capture_until(
-        tl,
-        src_dir,
-        main,
-        out_dir,
-        instrumented,
-        unit_envs,
-        &never_stop,
-    )
+    run_capture_until(tl, src_dir, main, out_dir, instrumented, unit_envs, &|t| {
+        time_limit(limit, t)
+    })
+}
+
+/// The [`StopCheck`] of a pass with an optional time limit.
+pub fn time_limit(limit: Option<Duration>, elapsed: Duration) -> Option<String> {
+    limit.filter(|l| elapsed >= *l).map(|l| {
+        format!(
+            "lualatex was stopped after {} s, the time limit of a pass (does the document loop \
+             forever?)",
+            l.as_secs_f64()
+        )
+    })
 }
 
 /// `run_capture_with` that `stop` may end early (see [`StopCheck`]).
@@ -374,8 +381,7 @@ pub fn run_capture_until(
         &out_dir,
         &jobname,
         instrumented,
-        status.success(),
-        status.code(),
+        status,
         &stdout,
         t0.elapsed(),
     )
@@ -494,11 +500,16 @@ pub fn collect_capture(
     out_dir: &Path,
     jobname: &str,
     instrumented: bool,
-    exit_ok: bool,
-    exit_code: Option<i32>,
+    status: ExitStatus,
     stdout: &[u8],
     wall: std::time::Duration,
 ) -> Result<CaptureResult> {
+    let (exit_ok, exit_code) = (status.success(), status.code());
+    // killed by a signal (a CPU limit, the OOM killer): its outputs are partial, whatever
+    // pages it wrote
+    if exit_code.is_none() {
+        bail!("lualatex was killed ({status})");
+    }
     // written at \end{document}: a pass that stopped earlier (a fatal error) leaves the file of
     // an earlier pass in the same directory, which is not this pass's capture
     let started = std::time::SystemTime::now() - wall - std::time::Duration::from_secs(1);
